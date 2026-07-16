@@ -2003,6 +2003,16 @@ void loop() {
 }
 
 // ==================== 新增：百度语音 API 功能 ====================
+
+/**
+ * 计算两点间距离（米）
+ */
+float calcDistance(float lat1, float lng1, float lat2, float lng2) {
+    const float R = 6371000; // 地球半径（米）
+    float dLat = (lat2 - lat1) * PI / 180.0;
+    float dLng = (lng2 - lng1) * PI / 180.0;
+    float a = sin(dLat/2) * sin(dLat/2) +
+              cos(lat1 * PI / 180.0) * cos(lat2 * PI / 180.0) *
               sin(dLng/2) * sin(dLng/2);
     float c = 2 * atan2(sqrt(a), sqrt(1-a));
     return R * c;
