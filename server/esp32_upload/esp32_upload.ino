@@ -28,7 +28,7 @@ WiFiClientSecure espClient;
 PubSubClient mqtt(espClient);
 
 // TTS音频接收缓冲（处理MQTT下发的音频）
-#define TTS_AUDIO_BUF_SIZE  (48 * 1024)   // 减少到48KB，避免内存不足
+#define TTS_AUDIO_BUF_SIZE  (64 * 1024)   // 恢复64KB
 volatile uint8_t tts_rx_buf[TTS_AUDIO_BUF_SIZE];
 volatile int     tts_rx_len = 0;
 volatile bool    tts_rx_ready = false;
@@ -184,7 +184,7 @@ struct TTS_Queue {
     int max_count;
 };
 
-TTS_Queue tts_queue = {NULL, NULL, 0, 1};  // 减少队列长度，节省内存
+TTS_Queue tts_queue = {NULL, NULL, 0, 3};  // 恢复队列长度
 volatile bool is_playing_audio = false;
 volatile TTS_Priority current_playing_priority = TTS_PRIORITY_LOW;
 SemaphoreHandle_t audioMutex = NULL;
@@ -268,9 +268,24 @@ bool tts_queue_enqueue(uint8_t* audio_data, int audio_len, TTS_Priority priority
             prev = curr; curr = curr->next;
         }
     }
-    TTS_QueueItem* new_item = (TTS_QueueItem*)malloc(sizeof(TTS_QueueItem));
+
+    // 使用PSRAM分配队列项
+    TTS_QueueItem* new_item = NULL;
+    if (ESP.getPsramSize() > 0) {
+        new_item = (TTS_QueueItem*)ps_malloc(sizeof(TTS_QueueItem));
+    } else {
+        new_item = (TTS_QueueItem*)malloc(sizeof(TTS_QueueItem));
+    }
+
     if (!new_item) { Serial.println("[TTS队列] 内存分配失败"); return false; }
-    new_item->audio_data = (uint8_t*)malloc(audio_len);
+
+    // 音频数据也使用PSRAM
+    if (ESP.getPsramSize() > 0) {
+        new_item->audio_data = (uint8_t*)ps_malloc(audio_len);
+    } else {
+        new_item->audio_data = (uint8_t*)malloc(audio_len);
+    }
+
     if (!new_item->audio_data) { free(new_item); return false; }
     memcpy(new_item->audio_data, audio_data, audio_len);
     new_item->audio_len = audio_len;
@@ -345,7 +360,14 @@ void TTSPlayerTask(void* pvParameters) {
 
                     Serial.printf("[TTS播放器] 实际PCM数据: %d字节\n", pcm_len);
 
-                    int16_t* temp_buffer = (int16_t*)malloc(pcm_len);
+                    // 使用PSRAM或普通内存分配临时缓冲区
+                    int16_t* temp_buffer = NULL;
+                    if (ESP.getPsramSize() > 0) {
+                        temp_buffer = (int16_t*)ps_malloc(pcm_len);
+                    } else {
+                        temp_buffer = (int16_t*)malloc(pcm_len);
+                    }
+
                     if (temp_buffer) {
                         int16_t* src_samples = (int16_t*)pcm_data;
                         int num_samples = pcm_len / 2;
@@ -413,7 +435,7 @@ bool play_tts_audio(uint8_t* audio_data, int audio_len, TTS_Priority priority) {
 }
 
 /**
- * 直接播放TTS音频（不经过队列，减少内存占用）
+ * 直接播放TTS音频（不经过队列，紧急使用）
  * @param audio_data 音频数据（函数接管所有权，会释放）
  * @param audio_len 音频长度
  * @param priority 优先级
@@ -457,7 +479,7 @@ bool playTtsAudioDirect(uint8_t* audio_data, int audio_len, TTS_Priority priorit
     // 清空I2S缓冲区
     i2s_zero_dma_buffer(I2S_PORT_OUT);
 
-    // 分块写入I2S（使用原始数据，不分配额外缓冲区）
+    // 分块写入I2S
     const int CHUNK_SIZE = 4096;
     int total_written = 0;
     size_t written = 0;
@@ -959,12 +981,21 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     }
 }
 
-// 全局变量
+    // 全局变量
 bool last_blocked = false;
 unsigned long last_alert_time = 0;
 float last_alert_dist = 0;
 #define ALERT_INTERVAL_MS 3000  // 障碍物告警间隔 3 秒
 #define ALERT_DIST_CHANGE 30    // 距离变化超过30cm才重新播报
+
+// ==================== 辅助函数：使用PSRAM或普通内存分配 ====================
+void* allocateBuffer(size_t size) {
+    if (ESP.getPsramSize() > 0) {
+        return ps_malloc(size);
+    } else {
+        return malloc(size);
+    }
+}
 
 // ==================== 障碍物语音告警 ====================
 void checkObstacleAndAlert() {
@@ -1111,8 +1142,8 @@ void processMqttTtsAudio() {
         Serial.println("[TTS处理] 优先级: 低(对话)");
     }
 
-    // 分配内存并复制
-    uint8_t* buf = (uint8_t*)malloc(tts_rx_len);
+    // 使用PSRAM分配内存并复制
+    uint8_t* buf = (uint8_t*)allocateBuffer(tts_rx_len);
     if (!buf) {
         Serial.println("[TTS处理] 内存不足，无法分配");
         tts_rx_ready = false;
@@ -1345,7 +1376,15 @@ void playStartupTestTone() {
             WiFiClient* stream = http.getStreamPtr();
             uint8_t header[44]; stream->readBytes(header, 44);
             const int CHUNK_BUF = 4096;
-            uint8_t* buf = (uint8_t*)malloc(len);
+
+            // 使用PSRAM或普通内存
+            uint8_t* buf = NULL;
+            if (ESP.getPsramSize() > 0) {
+                buf = (uint8_t*)ps_malloc(len);
+            } else {
+                buf = (uint8_t*)malloc(len);
+            }
+
             if (!buf) { http.end(); Serial.println("[启动播报] 内存不足"); return; }
             memcpy(buf, header, 44);
             int totalRead = 44;
@@ -1710,11 +1749,26 @@ void VoiceRecognitionTask(void* pvParameters) {
 String doRESTASR() {
     Serial.println("[ASR-REST] 开始录音...");
 
+    // 检查PSRAM
+    size_t psramSize = ESP.getPsramSize();
+    size_t freePsram = ESP.getFreePsram();
+    Serial.printf("[ASR-REST] PSRAM: 总共%dKB, 可用%dKB\n", psramSize/1024, freePsram/1024);
+
     // 录音2秒 (64KB)
     const int RECORD_SIZE = 16000 * 2 * 2;
-    uint8_t* buffer = (uint8_t*)malloc(RECORD_SIZE);
+    uint8_t* buffer = NULL;
+
+    // 优先使用PSRAM
+    if (psramSize > 0) {
+        buffer = (uint8_t*)ps_malloc(RECORD_SIZE);
+        Serial.println("[ASR-REST] 使用PSRAM分配录音缓冲区");
+    } else {
+        buffer = (uint8_t*)malloc(RECORD_SIZE);
+        Serial.println("[ASR-REST] 使用普通内存分配录音缓冲区");
+    }
+
     if (!buffer) {
-        Serial.println("[ASR-REST] 内存不足");
+        Serial.println("[ASR-REST] 内存分配失败");
         return "";
     }
 
@@ -1927,8 +1981,7 @@ void setup() {
 
     xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 4096, NULL, 3, &RadarTaskHandle, 0);
     xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
-    // 减少语音识别任务内存，避免内存不足
-    xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 8192, NULL, 2, &VoiceTaskHandle, 1);
+    xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 4096, NULL, 2, &VoiceTaskHandle, 1);
 
     delay(300);
 }
@@ -2069,7 +2122,7 @@ String getBaiduAccessToken() {
 }
 
 /**
- * 百度TTS语音合成并直接播放（流式接收，减少内存占用）
+ * 百度TTS语音合成并播放（使用PSRAM）
  * @param text 要合成的文本
  * @return 是否成功
  */
@@ -2085,13 +2138,10 @@ bool baiduTTSPlay(const char* text) {
         return false;
     }
 
-    // 检查可用内存
-    size_t freeMem = ESP.getFreeHeap();
-    Serial.printf("[百度TTS] 可用内存: %d 字节\n", freeMem);
-    if (freeMem < 60000) {
-        Serial.println("[百度TTS] 内存不足，使用MQTT代理...");
-        return requestTTSViaMQTT(text);
-    }
+    // 检查PSRAM
+    size_t psramSize = ESP.getPsramSize();
+    size_t freePsram = ESP.getFreePsram();
+    Serial.printf("[百度TTS] PSRAM: 总共%dKB, 可用%dKB\n", psramSize/1024, freePsram/1024);
 
     WiFiClientSecure client;
     client.setInsecure();
@@ -2136,15 +2186,18 @@ bool baiduTTSPlay(const char* text) {
             int len = http.getSize();
             Serial.printf("[百度TTS] 收到音频: %d字节\n", len);
 
-            // 限制音频大小，避免内存溢出
-            if (len > 50000) {
-                Serial.println("[百度TTS] 音频太大，使用MQTT代理...");
-                http.end();
-                return requestTTSViaMQTT(text);
+            // 使用PSRAM分配内存（如果有）
+            uint8_t* audioBuf = NULL;
+            if (psramSize > 0) {
+                // 使用PSRAM
+                audioBuf = (uint8_t*)ps_malloc(len);
+                Serial.println("[百度TTS] 使用PSRAM分配内存");
+            } else {
+                // 回退到普通内存
+                audioBuf = (uint8_t*)malloc(len);
+                Serial.println("[百度TTS] 使用普通内存分配");
             }
 
-            // 分配内存接收音频
-            uint8_t* audioBuf = (uint8_t*)malloc(len);
             if (!audioBuf) {
                 Serial.println("[百度TTS] 内存不足，使用MQTT代理...");
                 http.end();
@@ -2170,10 +2223,10 @@ bool baiduTTSPlay(const char* text) {
 
             Serial.printf("[百度TTS] 读取音频数据: %d字节\n", totalRead);
 
-            // 直接播放，不入队（节省内存）
-            bool ok = playTtsAudioDirect(audioBuf, totalRead, TTS_PRIORITY_HIGH);
+            // 播放音频（入队）
+            bool ok = play_tts_audio(audioBuf, totalRead, TTS_PRIORITY_HIGH);
             if (ok) {
-                Serial.println("[百度TTS] 开始播放");
+                Serial.println("[百度TTS] 已入队播放");
                 return true;
             } else {
                 free(audioBuf);
