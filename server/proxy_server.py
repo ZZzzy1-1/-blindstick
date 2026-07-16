@@ -269,6 +269,22 @@ def stop_navigation():
     print("[导航] 收到停止导航请求")
     return jsonify({"status": "ok", "message": "导航已停止"})
 
+# ==================== 导航路线接口（ESP32调用）====================
+@app.route('/api/nav_steps', methods=['GET', 'POST'])
+def get_nav_steps():
+    """获取导航路线步骤（ESP32用）"""
+    print("[导航] 收到路线请求")
+    # 返回示例导航步骤，实际应从请求参数获取目的地
+    return jsonify({
+        "status": "ok",
+        "steps": [
+            "前方直行100米",
+            "左转进入主干道",
+            "继续直行200米",
+            "右转到达目的地"
+        ]
+    })
+
 # ==================== TTS 分段音频接口（支持大音频分段上传）====================
 @app.route('/api/tts/segments', methods=['POST'])
 def tts_segments():
