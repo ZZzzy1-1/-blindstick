@@ -1362,7 +1362,7 @@ void i2s_out_init() {
 void playStartupTestTone() {
     if (WiFi.status() != WL_CONNECTED) return;
     HTTPClient http;
-    String url = String("https://my-blindstick.xyz") + "/api/tts";
+    String url = String("https://blindstick-2.onrender.com") + "/api/tts";
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(10000);
@@ -1486,7 +1486,7 @@ size_t record_audio(uint8_t* buffer, size_t buffer_size) {
 void fetchNavStepsFromServer() {
     if (WiFi.status() != WL_CONNECTED) return;
     HTTPClient http;
-    String url = String("https://my-blindstick.xyz") + "/api/nav_steps";
+    String url = String("https://blindstick-2.onrender.com") + "/api/nav_steps";
     http.begin(url);
     int httpCode = http.GET();
     if (httpCode == 200) {
