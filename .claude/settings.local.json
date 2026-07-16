@@ -59,7 +59,10 @@
       "Bash(taskkill /f /pid 12388)",
       "Bash(cmd.exe *)",
       "Bash(findstr \":8090\")",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(git remote *)",
+      "Bash(git branch *)",
+      "Bash(git push *)"
     ]
   }
 }
