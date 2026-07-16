@@ -16,21 +16,21 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ==================== 前端静态文件托管 ====================
-_here = os.path.dirname(os.path.abspath(__file__))
-FRONTEND_DIR = os.path.dirname(_here)   # 项目根目录（index.html 所在处）
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FRONTEND_DIR = os.path.dirname(BASE_DIR)   # 项目根目录（index.html 所在处）
 
 @app.route('/')
 def index():
-    fp = _os.path.join(FRONTEND_DIR, 'index.html')
+    fp = os.path.join(FRONTEND_DIR, 'index.html')
     with open(fp, 'r', encoding='utf-8') as f:
         return f.read()
 
 @app.route('/<path:filename>')
 def static_files(filename):
-    fp = _os.path.join(FRONTEND_DIR, filename)
-    if not _os.path.exists(fp) or _os.path.isdir(fp):
+    fp = os.path.join(FRONTEND_DIR, filename)
+    if not os.path.exists(fp) or os.path.isdir(fp):
         return "Not Found", 404
-    ext = _os.path.splitext(fp)[1].lower()
+    ext = os.path.splitext(fp)[1].lower()
     mime = {
         '.html':'text/html','.css':'text/css','.js':'application/javascript',
         '.json':'application/json','.png':'image/png','.jpg':'image/jpeg',
