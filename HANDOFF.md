@@ -10,56 +10,58 @@
 ## 2. 已完成的工作
 | 编号 | 内容 | 备注 |
 |------|------|------|
-| 2.1 | `proxy_server.py` 从仅 3 个接口扩展为完整后端：TTS、ASR、config、navigation/stop、TTS分段、前端静态托管。 | 端口改为 **8090**（8080 被后台任务占用）。 |
-| 2.2 | 后端打开 CORS、Token 缓存、TTS 结果缓存均已实现。 | `proxy_server.py` 中已实现。 |
-| 2.3 | 前端 `app.js` 移除 `localhost:8080` 硬编码，全部走相对路径 `/api/*`。 | proxy_server 直接托管前端，同源请求无跨域。 |
-| 2.4 | ESP32 TTS 无声音问题修复：（1）`playStartupTestTone` 的 free-after-return 堆内存崩溃已修复；（2）I2S 输出改为 APLL 时钟（`use_apll=true`），16kHz 采样率精确。 | 两台设备均需烧录新固件。 |
-| 2.5 | ESP32 固件端口 8080 → 8090 同步更新（2 处硬编码）。 | `esp32_upload.ino` 已改。 |
-| 2.6 | 一键启动脚本 `server/start_proxy.bat` 升级，启动后自动打开浏览器。 | 双击即可用。 |
-| 2.7 | ngrok + DuckDNS 配置完成（`blindstick.duckdns.org`，token 自动更新脚本 `duckdns_update.bat`）。 | 路由器端口转发未配置，公网 IP `61.111.128.240`。 |
+| 2.1 | `proxy_server.py` 部署到 **Render 免费云服务** | 地址: `https://blindstick-2.onrender.com` |
+| 2.2 | 后端接口完整：TTS、ASR、config、navigation/stop、TTS分段 | CORS、Token缓存、TTS缓存均已实现 |
+| 2.3 | 前端 `app.js` 指向 Render 云端 | `API_BASE = 'https://blindstick-2.onrender.com'` |
+| 2.4 | ESP32 固件指向 Render 云端 | 2处 `https://blindstick-2.onrender.com/api/tts` 和 `/api/nav_steps` |
+| 2.5 | ESP32 TTS 无声音问题修复 | `playStartupTestTone` 内存泄漏修复、I2S APLL时钟启用 |
+| 2.6 | DuckDNS 配置完成 | `blindstick.duckdns.org`（备用，当前直接使用 Render） |
 
 ## 3. 当前卡住的地方
-- 前端仍然使用 `http://localhost:8080/api/...` 进行请求，当前端部署在 Netlify（`https://statuesque-crostata-a41140.netlify.app/`）时，浏览器会把这些请求发往 **本机的 localhost**，显然找不到后端服务，导致：
-  - TTS、ASR、导航、配置等接口均返回 **404** 或 **网络错误**。
-  - 因而语音播报、导航指令无法工作。
-- 尚未在实际网络环境中（外网）完成端口暴露和 Netlify `_redirects` 配置的落地。
+- **无** — 云端部署已完成，所有组件（前端、后端、ESP32）均可独立运行。
 
-## 4. 下一步计划（给后续会话的行动清单）
+## 4. 最终架构
 
-1. **选择暴露方式**
-   - 若仅作演示/短期测试：**使用 ngrok**（步骤见下文）。
-   - 若需长期稳定：**在家庭路由器上做端口转发**（步骤见下文）。
-2. **获取能被外网访问的根地址**（不含 `/api`）：
-   - ngrok 示例：`https://abcd1234.ngrok.io`
-   - 路由器方案：`http://<公网IP>:8080`（或您分配的外部端口）。
-3. **在前端仓库根目录创建/修改 `_redirects` 文件**，内容如下（请替换为您得到的地址）：
-   ```
-   /api/*  <您的外网地址>/:splat  200
-   ```
-   示例（ngrok）：
-   ```
-   /api/*  https://abcd1234.ngrok.io/:splat  200
-   ```
-   示例（路由器）：
-   ```
-   /api/*  http://203.0.113.45:8080/:splat  200
-   ```
-4. **提交并推送**：
-   ```bash
-   git add _redirects
-   git commit -m "Add Netlify _redirects to forward /api/* to external backend"
-   git push origin <your-branch>
-   ```
-5. **等待 Netlify 重新构建并部署**（通常几分钟）。
-6. **验证**：
-   - 打开 Netlify 站点，打开浏览器开发者工具 → Network。
-   - 触发一次语音唤醒（例如点击录音按钮并说 “带我去天安门”）。
-   - 检查 Network 中的请求：
-     - `Request URL` 应该是 `<您的外网地址>/api/tts`（或 `/api/navigation` 等）。
-     - 状态码应为 **200**，返回 `Content-Type: audio/wav`（TTS）或 `application/json`（其他接口）。
-   - 查看后端终端日志，应看到 `[TTS] 成功，音频大小: X 字节`、`[TTS] 播放中...`、`[TTS] 播放完成` 等信息。
-   - 在 ESP32 串口监视器确认有 `[TTS] 播放中...`、`[TTS] 播放完成` 的输出，且喇叭有声音。
-7. **如遇问题**，参照下文“踩过的坑”进行排查。
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Netlify 前端（可选） 或 本地打开 index.html                  │
+│  └─ 直连 Render 后端: https://blindstick-2.onrender.com      │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ HTTPS
+┌──────────────────────────▼──────────────────────────────────┐
+│  Render 云服务器 (Python Flask)                              │
+│  ├─ /api/tts     → 百度语音合成                              │
+│  ├─ /api/asr     → 百度语音识别                              │
+│  ├─ /api/config  → 用户配置                                 │
+│  └─ /api/navigation/stop → 停止导航                         │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ MQTT over TLS
+┌──────────────────────────▼──────────────────────────────────┐
+│  ESP32-S3 ←→ 公共 MQTT Broker (emqxsl.com:8883)             │
+│  ├─ 雷达/GPS 数据上报                                        │
+│  ├─ 语音指令接收                                            │
+│  └─ TTS 音频播放（MAX98357）                                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 5. 使用方式
+
+### 前端访问（3种方式）
+| 方式 | 地址 | 说明 |
+|------|------|------|
+| 本地文件 | 直接打开 `index.html` | 最简单，无服务器 |
+| Netlify | `https://statuesque-crostata-a41140.netlify.app/` | 需更新 `_redirects` 指向 Render |
+| Render | `https://blindstick-2.onrender.com/` | 后端自带前端托管 |
+
+### ESP32 配置
+- **MQTT Broker**: `u72a7838.ala.asia-southeast1.emqxsl.com:8883`
+- **HTTP API**: `https://blindstick-2.onrender.com/api/tts`
+
+### 本地开发（可选）
+```bash
+cd server
+python proxy_server.py  # 默认端口 8090
+```
 
 ## 5. 已踩过的坑（绝对不要再踩）
 
