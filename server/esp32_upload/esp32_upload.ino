@@ -28,7 +28,7 @@ WiFiClientSecure espClient;
 PubSubClient mqtt(espClient);
 
 // TTS音频接收缓冲（处理MQTT下发的音频）
-#define TTS_AUDIO_BUF_SIZE  (64 * 1024)   // 恢复64KB
+#define TTS_AUDIO_BUF_SIZE  (120 * 1024)  // 增加到120KB，支持更大音频
 volatile uint8_t tts_rx_buf[TTS_AUDIO_BUF_SIZE];
 volatile int     tts_rx_len = 0;
 volatile bool    tts_rx_ready = false;
