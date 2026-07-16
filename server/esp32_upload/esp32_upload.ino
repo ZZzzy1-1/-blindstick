@@ -880,7 +880,8 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     } else if (strncmp(topic, "blindstick/tts/pcm/", 19) == 0) {
         // 收到音频分段
         int seg_idx = atoi(topic + 19);
-        Serial.printf("[TTS-分段] 收到第%d段: %d字节\n", seg_idx, length);
+        Serial.printf("[TTS-分段] 收到第%d段: %d字节，当前缓存%d/%d字节\n",
+                     seg_idx, length, tts_rx_len, TTS_AUDIO_BUF_SIZE);
 
         if (tts_rx_len + length < TTS_AUDIO_BUF_SIZE) {
             memcpy((void*)(tts_rx_buf + tts_rx_len), payload, length);
@@ -894,6 +895,12 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
             // 如果收齐所有段，开始播放
             if (tts_segments_received >= tts_segments_expected && tts_segments_expected > 0) {
                 Serial.printf("[TTS-分段] 收齐所有段，开始播放: %d字节\n", tts_rx_len);
+
+                // 检查音频格式
+                if (tts_rx_len > 44) {
+                    Serial.printf("[TTS] 音频头: %c%c%c%c\n",
+                                 tts_rx_buf[0], tts_rx_buf[1], tts_rx_buf[2], tts_rx_buf[3]);
+                }
 
                 // 暂停语音识别任务，释放内存
                 if (VoiceTaskHandle != NULL) {
@@ -946,7 +953,8 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
                 tts_rx_len = 0;
             }
         } else {
-            Serial.println("[TTS-分段] 缓冲区溢出，丢弃");
+            Serial.printf("[TTS-分段] 缓冲区溢出！当前%d + 新%d = %d > %d\n",
+                         tts_rx_len, length, tts_rx_len + length, TTS_AUDIO_BUF_SIZE);
         }
     } else if (strcmp(topic, MQTT_TOPIC_NAV_STEPS) == 0) {
         StaticJsonDocument<4096> doc;
