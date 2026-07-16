@@ -81,7 +81,7 @@ function calcDistance(lat1, lng1, lat2, lng2) {
 }
 
 // 后端代理地址（Render 云端）
-const API_BASE = 'https://blindstick-2.onrender.com';
+const API_BASE = 'https://blindstick-3.onrender.com';
 
 // ================= 语音/导航 API 配置 =================
 const API_CONFIG = {
