@@ -112,15 +112,10 @@ String urlEncode(const char* str);
 float calcDistance(float lat1, float lng1, float lat2, float lng2);
 String getBaiduAccessToken();
 bool baiduTTSPlay(const char* text);
-bool playTtsAudioDirect(uint8_t* audio_data, int audio_len, TTS_Priority priority);  // 新增：直接播放
+bool playTtsAudioDirect(uint8_t* audio_data, int audio_len, TTS_Priority priority);
 bool requestTTSViaMQTT(const char* text);
 void playStartupSuccess();
 void announceObstacle(float distance, const char* direction);
-String extractDestination(const char* text);
-bool searchNearestDestination(const char* keyword, float& outLat, float& outLng, String& outName, float& outDistance);
-bool planWalkingRoute(float destLat, float destLng, String& destName);
-void handleVoiceCommand(const char* text);
-void checkObstacleAndAlertBaidu();
 
 // 流式语音识别相关
 void VoiceRecognitionTask(void* pvParameters);
@@ -130,14 +125,6 @@ void sendAudioChunk();
 void webSocketEvent(WStype_t type, uint8_t* payload, size_t length);
 String doRESTASR();  // REST API备选方案
 String base64Encode(const uint8_t* data, size_t len);  // Base64编码
-
-// 流式语音识别全局变量
-WebSocketsClient webSocket;
-volatile bool asrConnected = false;
-volatile bool asrFinished = false;
-String asrResult = "";
-
-#define ASR_CHUNK_SIZE 5120  // 160ms PCM数据 @ 16kHz 16bit
 
 // TTS音频分段接收
 volatile int tts_segments_expected = 0;
@@ -226,8 +213,6 @@ volatile uint8_t payload_idx = 0, payload_expected = 0;
 
 TaskHandle_t RadarTaskHandle = NULL;
 TaskHandle_t NavTaskHandle = NULL;
-TaskHandle_t VoiceTaskHandle = NULL;
-TaskHandle_t TTSPlayerTaskHandle = NULL;
 
 // ==================== 五向雷达 + EMA平滑 ====================
 #define NUM_DIR     5
@@ -1981,7 +1966,6 @@ void setup() {
 
     xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 4096, NULL, 3, &RadarTaskHandle, 0);
     xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
-    xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 4096, NULL, 2, &VoiceTaskHandle, 1);
 
     delay(300);
 }
@@ -1991,37 +1975,6 @@ void loop() {
 }
 
 // ==================== 新增：百度语音 API 功能 ====================
-
-/**
- * URL编码辅助函数
- */
-String urlEncode(const char* str) {
-    String encoded = "";
-    char c;
-    for (int i = 0; str[i] != '\0'; i++) {
-        c = str[i];
-        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
-            encoded += c;
-        } else if (c == ' ') {
-            encoded += "%20";
-        } else {
-            char buf[4];
-            sprintf(buf, "%%%02X", c);
-            encoded += buf;
-        }
-    }
-    return encoded;
-}
-
-/**
- * 计算两点间距离（米）
- */
-float calcDistance(float lat1, float lng1, float lat2, float lng2) {
-    const float R = 6371000; // 地球半径（米）
-    float dLat = (lat2 - lat1) * PI / 180.0;
-    float dLng = (lng2 - lng1) * PI / 180.0;
-    float a = sin(dLat/2) * sin(dLat/2) +
-              cos(lat1 * PI / 180.0) * cos(lat2 * PI / 180.0) *
               sin(dLng/2) * sin(dLng/2);
     float c = 2 * atan2(sqrt(a), sqrt(1-a));
     return R * c;

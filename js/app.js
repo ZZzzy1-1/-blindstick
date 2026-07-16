@@ -48,8 +48,6 @@ const CATEGORY_GROUPS = [
 const AppState = {
     videoDetections: [],
     gpsHistory: [],
-    eventCount: 0,
-    chatCount: 0,
     isRunning: true,
     gpsCenter: [30.23193, 115.05791],
     reportData: {
@@ -64,10 +62,6 @@ const AppState = {
     lastGpsPos: null,          // 上一次GPS位置（用于计算里程）
     navStartTime: null,        // 导航开始时间
     navJustStarted: false,     // 导航是否刚开始（用于区分路线调整）
-    // 语音分段接收
-    voiceSegments: [],
-    voiceSegmentCount: 0,
-    voiceSegmentReceived: 0
 };
 
 // ================= 计算两点间距离（米）====================
@@ -204,124 +198,6 @@ async function baiduTTS(text) {
     return null;
 }
 
-// --- 提取导航目的地 ---
-function extractDestination(text) {
-    const triggers = ['带我去', '我要去', '我想去', '导航到', '去', '我去'];
-    let destination = '';
-    for (const trigger of triggers) {
-        if (text.includes(trigger)) {
-            const idx = text.indexOf(trigger) + trigger.length;
-            destination = text.substring(idx).trim();
-            break;
-        }
-    }
-    if (!destination) return null;
-    const filterWords = ['的', '一下', '那个', '这个', '那里', '这里', '吧', '啊', '呢', '吗'];
-    for (const word of filterWords) {
-        destination = destination.replace(word, '');
-    }
-    destination = destination.trim();
-    if (destination.length < 2 || /[，。？！.,?!]/.test(destination)) {
-        return null;
-    }
-    return destination;
-}
-
-// --- 百度地图路线规划 ---
-async function baiduRoutePlan(destination, currentLat, currentLng) {
-    try {
-        const geoUrl = `https://api.map.baidu.com/geocoding/v3/?address=${encodeURIComponent(destination)}&city=${API_CONFIG.homeCity}&ak=${API_CONFIG.baiduMapAk}&output=json`;
-        const geoRes = await fetch(geoUrl);
-        const geoData = await geoRes.json();
-        if (geoData.status !== 0 || !geoData.result || !geoData.result.location) {
-            console.error('[百度地图] 地理编码失败:', geoData);
-            return null;
-        }
-        const destLat = geoData.result.location.lat;
-        const destLng = geoData.result.location.lng;
-        const destName = geoData.result.formatted_address || destination;
-
-        const origin = currentLat && currentLng ? `${currentLat},${currentLng}` : '30.229320,115.063977';
-        const routeUrl = `https://api.map.baidu.com/directionlite/v1/walking?origin=${origin}&destination=${destLat},${destLng}&ak=${API_CONFIG.baiduMapAk}`;
-
-        const routeRes = await fetch(routeUrl);
-        const routeData = await routeRes.json();
-        if (routeData.status !== 0 || !routeData.result || !routeData.result.routes || routeData.result.routes.length === 0) {
-            console.error('[百度地图] 路线规划失败:', routeData);
-            return null;
-        }
-        const route = routeData.result.routes[0];
-        const steps = route.steps.map(s => s.instruction.replace(/<[^>]+>/g, ''));
-
-        return {
-            destination: destName,
-            steps: steps,
-            distance: route.distance,
-            duration: route.duration,
-            destLat: destLat,
-            destLng: destLng
-        };
-    } catch (e) {
-        console.error('[百度地图] 请求失败:', e);
-        return null;
-    }
-}
-
-// --- 处理语音导航（由ESP32功放播放语音）---
-async function handleVoiceNavigation(pcmBytes) {
-    console.log('[语音] 收到PCM数据', pcmBytes.length, '字节');
-    addEventLog('语音', '正在识别...');
-
-    const text = await baiduASR(pcmBytes);
-    if (!text) {
-        console.log('[语音] 识别失败');
-        addEventLog('语音', '识别失败');
-        return;
-    }
-    console.log('[语音] 识别结果:', text);
-    addEventLog('语音', `识别: ${text}`);
-
-    const destination = extractDestination(text);
-    if (!destination) {
-        console.log('[语音] 未提取到有效目的地');
-        // 发送文本给ESP32，由ESP32播放提示音
-        await baiduTTS('请说出具体地点，例如带我去天安门');
-        return;
-    }
-    console.log('[语音] 目的地:', destination);
-    addEventLog('导航', `目的地: ${destination}`);
-
-    const currentPos = AppState.lastGpsPos;
-    const route = await baiduRoutePlan(destination, currentPos?.lat, currentPos?.lng);
-    if (!route) {
-        console.log('[语音] 路线规划失败');
-        // 发送文本给ESP32，由ESP32播放提示音
-        await baiduTTS('抱歉，没有找到该地点的路线');
-        return;
-    }
-
-    const navMsg = {
-        status: 'ok',
-        destination: route.destination,
-        steps: route.steps,
-        distance: route.distance,
-        duration: route.duration,
-        ts: Date.now()
-    };
-    if (mqttClient && AppState.mqttConnected) {
-        mqttClient.publish(MQTT_CONFIG.topics.navSteps, JSON.stringify(navMsg));
-        console.log('[语音] 导航路线已发送:', route.steps.length, '步');
-        addEventLog('导航', `开始导航到 ${route.destination}，共${route.steps.length}步，${Math.round(route.distance)}米`);
-    }
-
-    // 发送导航播报文本给ESP32，由ESP32功放播放
-    const firstStep = route.steps[0] || '开始导航';
-    const ttsText = `开始导航到${route.destination}，全程${Math.round(route.distance)}米，预计${Math.round(route.duration/60)}分钟，${firstStep}`;
-    await baiduTTS(ttsText);
-
-    updateNavigationSteps(navMsg);
-    addNavHistory(route.destination, route.steps);
-}
 
 // ================= MQTT 配置 =================
 const MQTT_CONFIG = {
@@ -335,12 +211,7 @@ const MQTT_CONFIG = {
         sensors:   'blindstick/sensors',
         ttsReq:    'blindstick/tts/request',
         ttsAudio:  'blindstick/tts/audio',
-        navSteps:  'blindstick/nav/steps',
-        voiceSeg:  'blindstick/voice/segments',
-        voicePcm0: 'blindstick/voice/pcm/0',
-        voicePcm1: 'blindstick/voice/pcm/1',
-        voicePcm2: 'blindstick/voice/pcm/2',
-        voicePcm3: 'blindstick/voice/pcm/3'
+        navSteps:  'blindstick/nav/steps'
     }
 };
 
@@ -490,46 +361,6 @@ async function handleMqttMessage(topic, payload) {
             return;
         }
 
-        // --- 语音分段接收 ---
-        if (topic === MQTT_CONFIG.topics.voiceSeg) {
-            AppState.voiceSegmentCount = parseInt(payload.toString());
-            AppState.voiceSegments = [];
-            AppState.voiceSegmentReceived = 0;
-            console.log('[语音] 期待接收', AppState.voiceSegmentCount, '段音频');
-            addEventLog('语音', '开始接收4秒录音...');
-            return;
-        }
-
-        // --- 语音分段 PCM ---
-        if (topic.startsWith('blindstick/voice/pcm/')) {
-            const segIdx = parseInt(topic.split('/').pop());
-            AppState.voiceSegments[segIdx] = new Uint8Array(payload);
-            AppState.voiceSegmentReceived++;
-            console.log('[语音] 收到第', segIdx, '段，共', AppState.voiceSegmentReceived, '段，每段', payload.length, '字节');
-
-            // 如果收齐所有段
-            if (AppState.voiceSegmentReceived >= AppState.voiceSegmentCount && AppState.voiceSegmentCount > 0) {
-                // 拼接所有段
-                let totalLen = 0;
-                for (const seg of AppState.voiceSegments) {
-                    if (seg) totalLen += seg.length;
-                }
-                const fullPcm = new Uint8Array(totalLen);
-                let offset = 0;
-                for (const seg of AppState.voiceSegments) {
-                    if (seg) {
-                        fullPcm.set(seg, offset);
-                        offset += seg.length;
-                    }
-                }
-                console.log('[语音] 4秒音频拼接完成', totalLen, '字节');
-                // 使用改进的语音导航处理
-                handleVoiceNavigationAdvanced(fullPcm);
-                AppState.voiceSegmentCount = 0;
-            }
-            return;
-        }
-
         // --- TTS 音频（来自 ESP32 通过 MQTT 代理的 TTS 结果）---
         // 注意：所有语音由ESP32硬件功放播放，前端只记录日志不播放
         if (topic === MQTT_CONFIG.topics.ttsAudio) {
@@ -590,14 +421,14 @@ async function handleMqttMessage(topic, payload) {
                             mqttClient.publish(MQTT_CONFIG.topics.ttsAudio, ttsAudio);
                             console.log('[TTS-MQTT] 已发送TTS音频:', ttsAudio.length, '字节');
                         }
-                        addEventLog('语音播报', msg.text);
+                        console.log('[语音播报]', msg.text);
                     } else {
                         console.error('[TTS-MQTT] TTS合成失败');
                     }
                 } else {
                     // 障碍物告警或其他TTS请求 - 只记录日志，ESP32会自己播放
                     console.log('[TTS请求] 记录:', msg.text);
-                    addEventLog(msg.type || '语音', msg.text);
+                    console.log(msg.type || '语音', msg.text);
                 }
             } catch (e) {
                 console.error('[TTS-MQTT] 处理失败:', e);
@@ -613,7 +444,7 @@ async function handleMqttMessage(topic, payload) {
                 if (AppState.reportData.navCount > 0 && !AppState.navJustStarted) {
                     AppState.reportData.detourCount++;
                     document.getElementById('detourCount').textContent = AppState.reportData.detourCount;
-                    addEventLog('导航', `路线已调整：${msg.destination}`);
+                    console.log('导航', `路线已调整：${msg.destination}`);
                 }
                 AppState.navJustStarted = false;
                 updateNavigationSteps(msg);
@@ -744,27 +575,6 @@ function updateDetectionStats(counts) {
     });
 }
 
-function addChatMessage(userText, systemText) {
-    const container = document.getElementById('chatContainer');
-    if (!container) return;
-    const welcome = container.querySelector('.chat-welcome');
-    if (welcome) welcome.remove();
-    if (userText && userText.trim()) {
-        const u = document.createElement('div');
-        u.className = 'chat-bubble user';
-        u.innerHTML = `<div class='bubble-content'>${userText}</div>`;
-        container.appendChild(u);
-    }
-    if (systemText) {
-        const s = document.createElement('div');
-        s.className = 'chat-bubble system';
-        s.innerHTML = `<div class='bubble-content'>${systemText}</div>`;
-        container.appendChild(s);
-    }
-    container.scrollTop = container.scrollHeight;
-    AppState.chatCount++;
-}
-
 // ================= 地图 =================
 let map, pathPolyline, marker;
 function initMap() {
@@ -868,16 +678,6 @@ function updateSatellites(count) {
     }
 }
 
-function updateReportData(data) {
-    if (data.mileage)  document.getElementById('totalMileage').textContent = data.mileage.toFixed(2);
-    if (data.navs)     document.getElementById('navCount').textContent = data.navs;
-    if (data.obstacles)document.getElementById('obstacleCount').textContent = data.obstacles;
-    AppState.reportData = {
-        totalMileage: data.mileage || 0, navCount: data.navs || 0,
-        obstacleCount: data.obstacles || 0, detourCount: 12
-    };
-}
-
 // ================= 导航记录 =================
 function addNavHistory(destination, steps) {
     const el = document.getElementById('navHistoryList');
@@ -898,111 +698,6 @@ function addNavHistory(destination, steps) {
     AppState.navJustStarted = true;
 }
 
-function clearNavHistory() {
-    const el = document.getElementById('navHistoryList');
-    if (el) el.innerHTML = '<div class="nav-empty">暂无导航记录</div>';
-    AppState.reportData.navCount = 0;
-    document.getElementById('navCount').textContent = '0';
-    AppState.navJustStarted = false;
-}
-
-// ================= 事件记录 =================
-function addEventLog(type, message) {
-    const el = document.getElementById('eventList');
-    if (!el) return;
-    const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    const item = document.createElement('div');
-    item.className = 'event-item';
-    if (type === '障碍物') item.classList.add('danger');
-    else if (type === '导航') item.classList.add('success');
-    else if (type === '语音' || type === '语音播报') item.classList.add('info');
-    item.innerHTML = `<span class="event-time">${time}</span><span class="event-msg">${message}</span>`;
-    el.insertBefore(item, el.firstChild);
-    while (el.children.length > 100) el.removeChild(el.lastChild);
-    AppState.eventCount++;
-}
-
-function clearEventLog() {
-    const el = document.getElementById('eventList');
-    if (el) { el.innerHTML = ''; }
-    AppState.eventCount = 0;
-}
-
-// ================= 辅助 =================
-function showToast(msg) {
-    const t = document.createElement('div');
-    t.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.8);color:#fff;padding:8px 16px;border-radius:8px;font-size:13px;z-index:9999;transition:opacity 0.3s;';
-    t.textContent = msg;
-    document.body.appendChild(t);
-    setTimeout(() => t.remove(), 3000);
-}
-
-function initClock() { /* 不再更新时间显示 */ }
-
-// ================= 停止导航 =================
-async function stopNavigation() {
-    try {
-        const r = await fetch('/api/navigation/stop', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
-        const d = await r.json();
-        if (d.status === 'ok') {
-            showToast('导航已停止');
-            updateRealtimeNav({ nav_active: false, nav_destination: '', nav_step: '等待导航开始...', current_step: 0, nav_steps: [] });
-            document.getElementById('navStepsList').innerHTML = '';
-        } else showToast('停止失败');
-    } catch (e) { showToast('停止失败'); }
-}
-
-// ================= 设置功能 =================
-async function loadConfig() {
-    try {
-        const r = await fetch('/api/config');
-        const d = await r.json();
-        if (d.status === 'ok') {
-            AppState.config.homeCity = d.home_city;
-            updateHomeCityDisplay();
-        }
-    } catch (e) { console.error('[配置] 加载失败', e); }
-}
-
-function updateHomeCityDisplay() {
-    const el = document.getElementById('currentHomeCity');
-    if (el) el.textContent = AppState.config.homeCity || '未设置';
-    const inp = document.getElementById('homeCityInput');
-    if (inp && AppState.config.homeCity) inp.placeholder = `例如：${AppState.config.homeCity}`;
-}
-
-function openSettings() {
-    const modal = document.getElementById('settingsModal');
-    if (modal) {
-        document.getElementById('homeCityInput').value = AppState.config.homeCity || '';
-        updateHomeCityDisplay();
-        modal.classList.add('show');
-    }
-}
-function closeSettings() {
-    document.getElementById('settingsModal').classList.remove('show');
-}
-async function saveSettings() {
-    const homeCity = (document.getElementById('homeCityInput').value || '').trim();
-    if (!homeCity) { showToast('请输入常住地城市'); return; }
-    try {
-        const r = await fetch('/api/config', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ home_city: homeCity })
-        });
-        const d = await r.json();
-        if (d.status === 'ok') {
-            AppState.config.homeCity = d.home_city;
-            updateHomeCityDisplay(); closeSettings(); showToast(d.message);
-        } else showToast('保存失败');
-    } catch (e) { showToast('保存失败'); }
-}
-function initModal() {
-    document.getElementById('settingsModal').addEventListener('click', (e) => {
-        if (e.target.id === 'settingsModal') closeSettings();
-    });
-}
-
 // ================= 初始化 =================
 function init() {
     initClock();
@@ -1021,180 +716,6 @@ function init() {
 }
 
 document.addEventListener('DOMContentLoaded', init);
-
-// ================= 新增：百度实时语音识别 WebSocket 功能 =================
-
-/**
- * 初始化百度实时语音识别 WebSocket
- * @param {Function} onResult - 识别结果回调函数
- * @returns {WebSocket|null}
- */
-function initBaiduASRWebSocket(onResult) {
-    const sn = 'blindstick-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
-    const wsUrl = `wss://vop.baidu.com/realtime_asr?sn=${sn}`;
-
-    const ws = new WebSocket(wsUrl);
-    asrCallback = onResult;
-
-    ws.onopen = function() {
-        console.log('[百度ASR-WS] WebSocket已连接');
-        // 发送开始参数帧
-        const startFrame = {
-            type: 'START',
-            data: {
-                appid: parseInt(API_CONFIG.baiduAppId),
-                appkey: API_CONFIG.baiduApiKey,
-                dev_pid: 15372,  // 中文普通话，加强标点
-                cuid: 'blindstick-web-' + Date.now(),
-                format: 'pcm',
-                sample: 16000
-            }
-        };
-        ws.send(JSON.stringify(startFrame));
-        console.log('[百度ASR-WS] 发送开始帧');
-    };
-
-    ws.onmessage = function(event) {
-        const data = JSON.parse(event.data);
-        console.log('[百度ASR-WS] 收到消息:', data);
-
-        if (data.type === 'MID_TEXT') {
-            // 临时识别结果
-            console.log('[百度ASR-WS] 临时结果:', data.result);
-        } else if (data.type === 'FIN_TEXT') {
-            // 最终识别结果
-            if (data.err_no === 0 && data.result) {
-                console.log('[百度ASR-WS] 最终结果:', data.result);
-                if (asrCallback) {
-                    asrCallback(data.result.trim());
-                }
-            } else {
-                console.error('[百度ASR-WS] 识别错误:', data.err_msg);
-            }
-        } else if (data.type === 'HEARTBEAT') {
-            // 心跳帧，忽略
-        }
-    };
-
-    ws.onerror = function(error) {
-        console.error('[百度ASR-WS] WebSocket错误:', error);
-    };
-
-    ws.onclose = function() {
-        console.log('[百度ASR-WS] WebSocket已关闭');
-        isRecording = false;
-    };
-
-    return ws;
-}
-
-/**
- * 开始语音识别（使用麦克风）
- * @param {Function} onResult - 识别结果回调
- */
-async function startVoiceRecognition(onResult) {
-    if (isRecording) {
-        console.log('[语音识别] 已经在录音中');
-        return;
-    }
-
-    try {
-        // 获取麦克风权限
-        mediaStream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-                sampleRate: 16000,
-                channelCount: 1,
-                echoCancellation: true,
-                noiseSuppression: true
-            }
-        });
-
-        // 初始化WebSocket
-        baiduASRWS = initBaiduASRWebSocket(onResult);
-
-        // 等待WebSocket连接成功
-        await new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => reject(new Error('WebSocket连接超时')), 5000);
-            baiduASRWS.onopen = function() {
-                clearTimeout(timeout);
-                resolve();
-            };
-            baiduASRWS.onerror = function(e) {
-                clearTimeout(timeout);
-                reject(e);
-            };
-        });
-
-        // 初始化音频上下文
-        audioContext = new (window.AudioContext || window.webkitAudioContext)({
-            sampleRate: 16000
-        });
-
-        const source = audioContext.createMediaStreamSource(mediaStream);
-        const processor = audioContext.createScriptProcessor(4096, 1, 1);
-
-        processor.onaudioprocess = function(e) {
-            if (!isRecording || !baiduASRWS || baiduASRWS.readyState !== WebSocket.OPEN) {
-                return;
-            }
-
-            const inputData = e.inputBuffer.getChannelData(0);
-            // 转换为16位PCM
-            const pcmData = new Int16Array(inputData.length);
-            for (let i = 0; i < inputData.length; i++) {
-                const s = Math.max(-1, Math.min(1, inputData[i]));
-                pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-            }
-
-            // 发送音频数据帧（二进制）
-            baiduASRWS.send(pcmData.buffer);
-        };
-
-        source.connect(processor);
-        processor.connect(audioContext.destination);
-        audioProcessor = processor;
-
-        isRecording = true;
-        console.log('[语音识别] 开始录音');
-        addEventLog('语音', '开始语音识别...');
-
-    } catch (err) {
-        console.error('[语音识别] 启动失败:', err);
-        addEventLog('语音', '语音识别启动失败: ' + err.message);
-        stopVoiceRecognition();
-    }
-}
-
-/**
- * 停止语音识别
- */
-function stopVoiceRecognition() {
-    isRecording = false;
-
-    // 发送结束帧
-    if (baiduASRWS && baiduASRWS.readyState === WebSocket.OPEN) {
-        const finishFrame = { type: 'FINISH' };
-        baiduASRWS.send(JSON.stringify(finishFrame));
-        baiduASRWS.close();
-    }
-
-    // 清理音频资源
-    if (audioProcessor) {
-        audioProcessor.disconnect();
-        audioProcessor = null;
-    }
-    if (audioContext) {
-        audioContext.close();
-        audioContext = null;
-    }
-    if (mediaStream) {
-        mediaStream.getTracks().forEach(track => track.stop());
-        mediaStream = null;
-    }
-
-    baiduASRWS = null;
-    console.log('[语音识别] 已停止');
-}
 
 // ================= 新增：改进的目的地提取功能 =================
 
@@ -1413,7 +934,7 @@ async function planRouteToNearest(destination, currentLat, currentLng) {
  */
 async function playStartupSound() {
     console.log('[开机播报] 发送启动文本给ESP32');
-    addEventLog('系统', '设备启动成功');
+    console.log('系统', '设备启动成功');
 
     const startupText = '导盲杖系统启动成功，欢迎使用';
     // 通过MQTT发送文本给ESP32，让ESP32自己合成语音并由功放播放
@@ -1493,7 +1014,7 @@ async function announceObstacleWithDistance(distance, direction = '前方') {
         alertText = `${direction}${Math.round(distance / 100)}米处有障碍物`;
     }
 
-    addEventLog('障碍物', alertText);
+    console.log('障碍物', alertText);
 
     // 通过MQTT发送文本给ESP32，让ESP32自己合成语音并由功放播放
     if (mqttClient && AppState.mqttConnected) {
@@ -1518,7 +1039,7 @@ async function announceObstacleWithDistance(distance, direction = '前方') {
  */
 async function handleVoiceNavigationAdvanced(text) {
     console.log('[语音导航] 收到文本:', text);
-    addEventLog('语音', `识别: ${text}`);
+    console.log('语音', `识别: ${text}`);
 
     // 提取目的地
     const destination = extractDestinationAdvanced(text);
@@ -1531,7 +1052,7 @@ async function handleVoiceNavigationAdvanced(text) {
     }
 
     console.log('[语音导航] 目的地:', destination);
-    addEventLog('导航', `目的地: ${destination}`);
+    console.log('导航', `目的地: ${destination}`);
 
     const currentPos = AppState.lastGpsPos;
 
@@ -1550,7 +1071,7 @@ async function handleVoiceNavigationAdvanced(text) {
         console.log('[语音导航]', route.message);
         // 发送文本给ESP32，由ESP32播放提示音
         await baiduTTS(route.message + '，请重新选择较近的地点');
-        addEventLog('导航', route.message);
+        console.log('导航', route.message);
         return;
     }
 
@@ -1567,7 +1088,7 @@ async function handleVoiceNavigationAdvanced(text) {
     if (mqttClient && AppState.mqttConnected) {
         mqttClient.publish(MQTT_CONFIG.topics.navSteps, JSON.stringify(navMsg));
         console.log('[语音导航] 导航路线已发送:', route.steps.length, '步');
-        addEventLog('导航', `开始导航到 ${route.destination}，共${route.steps.length}步，${Math.round(route.distance)}米`);
+        console.log('导航', `开始导航到 ${route.destination}，共${route.steps.length}步，${Math.round(route.distance)}米`);
     }
 
     // 发送导航播报文本给ESP32，由ESP32功放播放
@@ -1581,13 +1102,8 @@ async function handleVoiceNavigationAdvanced(text) {
 
 // ================= 新增：初始化时播放开机播报 =================
 
-// 在MQTT连接成功后播放开机播报
-const originalOnConnect = mqttClient ? mqttClient.onconnect : null;
-
 // 导出函数供外部使用（如果需要）
 if (typeof window !== 'undefined') {
-    window.startVoiceRecognition = startVoiceRecognition;
-    window.stopVoiceRecognition = stopVoiceRecognition;
     window.extractDestinationAdvanced = extractDestinationAdvanced;
     window.planRouteToNearest = planRouteToNearest;
     window.playStartupSound = playStartupSound;
