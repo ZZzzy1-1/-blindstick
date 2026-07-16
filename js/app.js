@@ -223,6 +223,50 @@ function writeString(view, offset, string) {
     }
 }
 
+// --- 播放通过 MQTT 接收的 TTS 音频 ---
+function playMqttAudio(audioData) {
+    if (!audioData || audioData.length < 44) {
+        console.error('[TTS播放] 音频数据太短:', audioData?.length);
+        return;
+    }
+
+    // 检测 WAV 格式（RIFF 头）
+    const isWav = audioData[0] === 0x52 && audioData[1] === 0x49 &&  // "RI"
+                  audioData[2] === 0x46 && audioData[3] === 0x46;    // "FF"
+
+    let pcmData, sampleRate;
+
+    if (isWav) {
+        // WAV 格式：跳过 44 字节头
+        // 解析采样率（偏移 24 处，小端 4 字节）
+        sampleRate = new DataView(audioData.buffer, audioData.byteOffset + 24, 4).getUint32(0, true);
+        const offset = 44;
+        pcmData = new Int16Array(audioData.buffer, audioData.byteOffset + offset, (audioData.length - offset) / 2);
+        console.log('[TTS播放] WAV格式, 采样率:', sampleRate, 'PCM样本:', pcmData.length);
+    } else {
+        // 纯 PCM 16kHz 16bit
+        sampleRate = 16000;
+        pcmData = new Int16Array(audioData.buffer, audioData.byteOffset, audioData.length / 2);
+        console.log('[TTS播放] PCM格式, 采样率:', sampleRate, 'PCM样本:', pcmData.length);
+    }
+
+    // 播放
+    const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
+    const buffer = ctx.createBuffer(1, pcmData.length, sampleRate);
+    buffer.getChannelData(0).set(pcmData);
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(ctx.destination);
+    source.start(0);
+    console.log('[TTS播放] 开始播放, 时长:', (pcmData.length / sampleRate).toFixed(1), '秒');
+
+    source.onended = () => {
+        console.log('[TTS播放] 播放完成');
+        ctx.close();
+    };
+}
+
+
 // --- 百度 TTS（通过本地代理服务器）---
 async function baiduTTSWeb(text) {
     console.log('[百度TTS-Web] 开始请求 TTS，文本:', text);
@@ -599,6 +643,14 @@ async function handleMqttMessage(topic, payload) {
                 handleVoiceNavigationAdvanced(fullPcm);
                 AppState.voiceSegmentCount = 0;
             }
+            return;
+        }
+
+        // --- TTS 音频（来自 ESP32 通过 MQTT 代理的 TTS 结果）---
+        if (topic === MQTT_CONFIG.topics.ttsAudio) {
+            const audioData = new Uint8Array(payload);
+            console.log('[TTS] 收到MQTT音频:', audioData.length, '字节');
+            playMqttAudio(audioData);
             return;
         }
 
