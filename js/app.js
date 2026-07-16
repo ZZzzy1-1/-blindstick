@@ -82,6 +82,9 @@ function calcDistance(lat1, lng1, lat2, lng2) {
     return R * c;
 }
 
+// 后端代理地址（Render 云端）
+const API_BASE = 'https://blindstick-2.onrender.com';
+
 // ================= 语音/导航 API 配置 =================
 const API_CONFIG = {
     baiduAppId: '123607377',
@@ -226,7 +229,7 @@ async function baiduTTSWeb(text) {
 
     try {
         // 直接走同源代理（proxy_server.py 托管前端 + API）
-        const response = await fetch('/api/tts', {
+        const response = await fetch(`${API_BASE}/api/tts`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text })
