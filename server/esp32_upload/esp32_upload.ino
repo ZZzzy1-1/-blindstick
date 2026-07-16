@@ -28,7 +28,7 @@ WiFiClientSecure espClient;
 PubSubClient mqtt(espClient);
 
 // TTS音频接收缓冲（处理MQTT下发的音频）
-#define TTS_AUDIO_BUF_SIZE  (64 * 1024)   // 64KB，平衡内存和音频大小
+#define TTS_AUDIO_BUF_SIZE  (48 * 1024)   // 减少到48KB，避免内存不足
 volatile uint8_t tts_rx_buf[TTS_AUDIO_BUF_SIZE];
 volatile int     tts_rx_len = 0;
 volatile bool    tts_rx_ready = false;
@@ -112,6 +112,7 @@ String urlEncode(const char* str);
 float calcDistance(float lat1, float lng1, float lat2, float lng2);
 String getBaiduAccessToken();
 bool baiduTTSPlay(const char* text);
+bool playTtsAudioDirect(uint8_t* audio_data, int audio_len, TTS_Priority priority);  // 新增：直接播放
 bool requestTTSViaMQTT(const char* text);
 void playStartupSuccess();
 void announceObstacle(float distance, const char* direction);
@@ -183,7 +184,7 @@ struct TTS_Queue {
     int max_count;
 };
 
-TTS_Queue tts_queue = {NULL, NULL, 0, 2};
+TTS_Queue tts_queue = {NULL, NULL, 0, 1};  // 减少队列长度，节省内存
 volatile bool is_playing_audio = false;
 volatile TTS_Priority current_playing_priority = TTS_PRIORITY_LOW;
 SemaphoreHandle_t audioMutex = NULL;
@@ -409,6 +410,92 @@ bool play_tts_audio(uint8_t* audio_data, int audio_len, TTS_Priority priority) {
         delay(50);
     }
     return tts_queue_enqueue(audio_data, audio_len, priority);
+}
+
+/**
+ * 直接播放TTS音频（不经过队列，减少内存占用）
+ * @param audio_data 音频数据（函数接管所有权，会释放）
+ * @param audio_len 音频长度
+ * @param priority 优先级
+ * @return 是否成功
+ */
+bool playTtsAudioDirect(uint8_t* audio_data, int audio_len, TTS_Priority priority) {
+    if (!audio_data || audio_len < 100) {
+        Serial.println("[TTS直接播放] 音频数据无效");
+        return false;
+    }
+
+    Serial.printf("[TTS直接播放] 开始播放，大小=%d字节\n", audio_len);
+
+    // 检查是否是WAV格式（有44字节头）
+    int data_offset = 0;
+    if (audio_len > 44 &&
+        audio_data[0] == 'R' && audio_data[1] == 'I' &&
+        audio_data[2] == 'F' && audio_data[3] == 'F') {
+        data_offset = 44;
+        Serial.println("[TTS直接播放] 检测到WAV格式，跳过44字节头");
+    } else {
+        Serial.println("[TTS直接播放] 原始PCM数据，无WAV头");
+    }
+
+    int pcm_len = audio_len - data_offset;
+    if (pcm_len <= 0) {
+        Serial.println("[TTS直接播放] 音频数据太短");
+        free(audio_data);
+        return false;
+    }
+
+    uint8_t* pcm_data = audio_data + data_offset;
+
+    // 暂停语音识别任务，释放内存
+    if (VoiceTaskHandle != NULL) {
+        vTaskSuspend(VoiceTaskHandle);
+        webSocket.disconnect();
+        Serial.println("[TTS直接播放] 语音识别已暂停");
+    }
+
+    // 清空I2S缓冲区
+    i2s_zero_dma_buffer(I2S_PORT_OUT);
+
+    // 分块写入I2S（使用原始数据，不分配额外缓冲区）
+    const int CHUNK_SIZE = 4096;
+    int total_written = 0;
+    size_t written = 0;
+
+    Serial.println("[TTS直接播放] 开始I2S写入...");
+    while (total_written < pcm_len) {
+        int to_write = min(CHUNK_SIZE, pcm_len - total_written);
+        i2s_write(I2S_PORT_OUT, pcm_data + total_written, to_write, &written, portMAX_DELAY);
+        if (written > 0) {
+            total_written += written;
+        } else {
+            Serial.println("[TTS直接播放] I2S写入失败");
+            break;
+        }
+        vTaskDelay(1);
+    }
+
+    Serial.printf("[TTS直接播放] I2S写入完成: %d字节\n", total_written);
+
+    // 等待播放完成
+    int audio_duration_ms = (pcm_len / 32000.0) * 1000;
+    Serial.printf("[TTS直接播放] 等待 %d ms...\n", audio_duration_ms);
+    delay(audio_duration_ms + 200);
+    Serial.println("[TTS直接播放] 播放完成");
+
+    // 清空I2S缓冲区
+    i2s_zero_dma_buffer(I2S_PORT_OUT);
+
+    // 释放音频数据
+    free(audio_data);
+
+    // 恢复语音识别任务
+    if (VoiceTaskHandle != NULL) {
+        vTaskResume(VoiceTaskHandle);
+        Serial.println("[TTS直接播放] 语音识别已恢复");
+    }
+
+    return true;
 }
 
 // ==================== 电机控制 ====================
@@ -1840,7 +1927,8 @@ void setup() {
 
     xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 4096, NULL, 3, &RadarTaskHandle, 0);
     xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
-    xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 4096, NULL, 2, &VoiceTaskHandle, 1);
+    // 减少语音识别任务内存，避免内存不足
+    xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 8192, NULL, 2, &VoiceTaskHandle, 1);
 
     delay(300);
 }
@@ -1981,7 +2069,7 @@ String getBaiduAccessToken() {
 }
 
 /**
- * 百度TTS语音合成并直接播放（POST方式，与官方示例一致）
+ * 百度TTS语音合成并直接播放（流式接收，减少内存占用）
  * @param text 要合成的文本
  * @return 是否成功
  */
@@ -1989,13 +2077,20 @@ bool baiduTTSPlay(const char* text) {
     String token = getBaiduAccessToken();
     if (token.length() == 0) {
         Serial.println("[百度TTS] 无法获取Token，尝试MQTT代理...");
-        // 直接连接失败，通过MQTT让网页端代为合成
         return requestTTSViaMQTT(text);
     }
 
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("[百度TTS] WiFi未连接");
         return false;
+    }
+
+    // 检查可用内存
+    size_t freeMem = ESP.getFreeHeap();
+    Serial.printf("[百度TTS] 可用内存: %d 字节\n", freeMem);
+    if (freeMem < 60000) {
+        Serial.println("[百度TTS] 内存不足，使用MQTT代理...");
+        return requestTTSViaMQTT(text);
     }
 
     WiFiClientSecure client;
@@ -2041,16 +2136,24 @@ bool baiduTTSPlay(const char* text) {
             int len = http.getSize();
             Serial.printf("[百度TTS] 收到音频: %d字节\n", len);
 
+            // 限制音频大小，避免内存溢出
+            if (len > 50000) {
+                Serial.println("[百度TTS] 音频太大，使用MQTT代理...");
+                http.end();
+                return requestTTSViaMQTT(text);
+            }
+
+            // 分配内存接收音频
+            uint8_t* audioBuf = (uint8_t*)malloc(len);
+            if (!audioBuf) {
+                Serial.println("[百度TTS] 内存不足，使用MQTT代理...");
+                http.end();
+                return requestTTSViaMQTT(text);
+            }
+
             WiFiClient* stream = http.getStreamPtr();
 
             // 读取音频数据
-            uint8_t* audioBuf = (uint8_t*)malloc(len);
-            if (!audioBuf) {
-                Serial.println("[百度TTS] 内存不足");
-                http.end();
-                return false;
-            }
-
             int totalRead = 0;
             while (totalRead < len) {
                 int available = stream->available();
@@ -2067,10 +2170,10 @@ bool baiduTTSPlay(const char* text) {
 
             Serial.printf("[百度TTS] 读取音频数据: %d字节\n", totalRead);
 
-            // 播放音频（入队）
-            bool ok = play_tts_audio(audioBuf, totalRead, TTS_PRIORITY_HIGH);
+            // 直接播放，不入队（节省内存）
+            bool ok = playTtsAudioDirect(audioBuf, totalRead, TTS_PRIORITY_HIGH);
             if (ok) {
-                Serial.println("[百度TTS] 已入队播放");
+                Serial.println("[百度TTS] 开始播放");
                 return true;
             } else {
                 free(audioBuf);
