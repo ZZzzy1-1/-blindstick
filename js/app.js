@@ -62,6 +62,10 @@ const AppState = {
     lastGpsPos: null,          // 上一次GPS位置（用于计算里程）
     navStartTime: null,        // 导航开始时间
     navJustStarted: false,     // 导航是否刚开始（用于区分路线调整）
+    // 语音分段接收
+    voiceSegments: [],
+    voiceSegmentCount: 0,
+    voiceSegmentReceived: 0
 };
 
 // ================= 计算两点间距离（米）====================
@@ -198,6 +202,96 @@ async function baiduTTS(text) {
     return null;
 }
 
+// --- 处理语音导航（接收ESP32录音，识别，规划，发送TTS音频回ESP32播放）---
+async function handleVoiceNavigation(pcmBytes) {
+    console.log('[语音] 收到PCM数据', pcmBytes.length, '字节');
+    console.log('语音', '正在识别...');
+
+    // 1. 语音识别
+    const text = await baiduASR(pcmBytes);
+    if (!text) {
+        console.log('[语音] 识别失败');
+        await baiduTTS('语音识别失败，请重新说出目的地');
+        return;
+    }
+    console.log('[语音] 识别结果:', text);
+    console.log('语音', `识别: ${text}`);
+
+    // 2. 提取目的地
+    const destination = extractDestinationAdvanced(text);
+    if (!destination) {
+        console.log('[语音] 未提取到有效目的地');
+        await baiduTTS('请说出具体地点，例如带我去天安门');
+        return;
+    }
+    console.log('[语音] 目的地:', destination);
+    console.log('导航', `目的地: ${destination}`);
+
+    // 3. 规划到最近的目的地（带10公里限制）
+    const currentPos = AppState.lastGpsPos;
+    const route = await planRouteToNearest(destination, currentPos?.lat, currentPos?.lng);
+
+    if (!route) {
+        console.log('[语音] 路线规划失败');
+        await baiduTTS('抱歉，没有找到该地点的路线');
+        return;
+    }
+
+    // 4. 检查距离是否超过10公里
+    if (route.tooFar) {
+        console.log('[语音]', route.message);
+        await baiduTTS(route.message + '，请重新选择较近的地点');
+        console.log('导航', route.message);
+        return;
+    }
+
+    // 5. 发送导航路线给ESP32
+    const navMsg = {
+        status: 'ok',
+        destination: route.destination,
+        steps: route.steps,
+        distance: route.distance,
+        duration: route.duration,
+        ts: Date.now()
+    };
+
+    if (mqttClient && AppState.mqttConnected) {
+        mqttClient.publish(MQTT_CONFIG.topics.navSteps, JSON.stringify(navMsg));
+        console.log('[语音] 导航路线已发送:', route.steps.length, '步');
+        console.log('导航', `开始导航到 ${route.destination}，共${route.steps.length}步，${Math.round(route.distance)}米`);
+    }
+
+    // 6. 合成TTS音频并发送给ESP32播放
+    const firstStep = route.steps[0] || '开始导航';
+    const ttsText = `开始导航到${route.destination}，全程${Math.round(route.distance)}米，预计${Math.round(route.duration / 60)}分钟，${firstStep}`;
+
+    // 通过代理服务器合成TTS
+    const ttsAudio = await baiduTTSWeb(ttsText);
+    if (ttsAudio && mqttClient) {
+        // 如果音频太大，分段发送
+        const MAX_MQTT_SIZE = 60000;
+        if (ttsAudio.length > MAX_MQTT_SIZE) {
+            const segments = Math.ceil(ttsAudio.length / MAX_MQTT_SIZE);
+            mqttClient.publish('blindstick/tts/segments', JSON.stringify({
+                segments: segments,
+                totalSize: ttsAudio.length
+            }));
+            for (let i = 0; i < segments; i++) {
+                const start = i * MAX_MQTT_SIZE;
+                const end = Math.min(start + MAX_MQTT_SIZE, ttsAudio.length);
+                const segment = ttsAudio.slice(start, end);
+                mqttClient.publish(`blindstick/tts/pcm/${i}`, segment);
+                await new Promise(r => setTimeout(r, 100));
+            }
+        } else {
+            mqttClient.publish(MQTT_CONFIG.topics.ttsAudio, ttsAudio);
+        }
+        console.log('[语音] TTS音频已发送给ESP32');
+    }
+
+    updateNavigationSteps(navMsg);
+    addNavHistory(route.destination, route.steps);
+}
 
 // ================= MQTT 配置 =================
 const MQTT_CONFIG = {
@@ -211,7 +305,12 @@ const MQTT_CONFIG = {
         sensors:   'blindstick/sensors',
         ttsReq:    'blindstick/tts/request',
         ttsAudio:  'blindstick/tts/audio',
-        navSteps:  'blindstick/nav/steps'
+        navSteps:  'blindstick/nav/steps',
+        voiceSeg:  'blindstick/voice/segments',
+        voicePcm0: 'blindstick/voice/pcm/0',
+        voicePcm1: 'blindstick/voice/pcm/1',
+        voicePcm2: 'blindstick/voice/pcm/2',
+        voicePcm3: 'blindstick/voice/pcm/3'
     }
 };
 
@@ -358,6 +457,45 @@ async function handleMqttMessage(topic, payload) {
                 nav_active:      msg.nav !== undefined ? msg.nav : msg.nav_active
             };
             updateRealtimeNav(navData);
+            return;
+        }
+
+        // --- 语音分段接收 ---
+        if (topic === MQTT_CONFIG.topics.voiceSeg) {
+            AppState.voiceSegmentCount = parseInt(payload.toString());
+            AppState.voiceSegments = [];
+            AppState.voiceSegmentReceived = 0;
+            console.log('[语音] 期待接收', AppState.voiceSegmentCount, '段音频');
+            return;
+        }
+
+        // --- 语音分段 PCM ---
+        if (topic.startsWith('blindstick/voice/pcm/')) {
+            const segIdx = parseInt(topic.split('/').pop());
+            AppState.voiceSegments[segIdx] = new Uint8Array(payload);
+            AppState.voiceSegmentReceived++;
+            console.log('[语音] 收到第', segIdx, '段，共', AppState.voiceSegmentReceived, '段');
+
+            // 如果收齐所有段
+            if (AppState.voiceSegmentReceived >= AppState.voiceSegmentCount && AppState.voiceSegmentCount > 0) {
+                // 拼接所有段
+                let totalLen = 0;
+                for (const seg of AppState.voiceSegments) {
+                    if (seg) totalLen += seg.length;
+                }
+                const fullPcm = new Uint8Array(totalLen);
+                let offset = 0;
+                for (const seg of AppState.voiceSegments) {
+                    if (seg) {
+                        fullPcm.set(seg, offset);
+                        offset += seg.length;
+                    }
+                }
+                console.log('[语音] 音频拼接完成', totalLen, '字节');
+                // 识别并导航
+                handleVoiceNavigation(fullPcm);
+                AppState.voiceSegmentCount = 0;
+            }
             return;
         }
 

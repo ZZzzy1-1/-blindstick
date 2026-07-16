@@ -132,6 +132,14 @@ volatile int tts_segments_received = 0;
 volatile int tts_total_size = 0;
 volatile int tts_received_size = 0;
 
+// 流式语音识别全局变量
+WebSocketsClient webSocket;
+volatile bool asrConnected = false;
+volatile bool asrFinished = false;
+String asrResult = "";
+
+#define ASR_CHUNK_SIZE 5120  // 160ms PCM数据 @ 16kHz 16bit
+
 // ==================== 避障阈值 ====================
 #define ALERT_DIST_CM       180.0
 #define FRONT_CRITICAL_CM   150.0
@@ -213,6 +221,8 @@ volatile uint8_t payload_idx = 0, payload_expected = 0;
 
 TaskHandle_t RadarTaskHandle = NULL;
 TaskHandle_t NavTaskHandle = NULL;
+TaskHandle_t VoiceTaskHandle = NULL;
+TaskHandle_t TTSPlayerTaskHandle = NULL;
 
 // ==================== 五向雷达 + EMA平滑 ====================
 #define NUM_DIR     5
@@ -1966,6 +1976,7 @@ void setup() {
 
     xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 4096, NULL, 3, &RadarTaskHandle, 0);
     xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
+    xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 8192, NULL, 2, &VoiceTaskHandle, 1);
 
     delay(300);
 }
