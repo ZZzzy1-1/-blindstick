@@ -841,6 +841,25 @@ function initClock() {
     // 时钟功能已移除，保留空函数避免报错
 }
 
+function initModal() {
+    // 弹窗初始化
+    const modal = document.getElementById('settingsModal');
+    if (modal) {
+        modal.addEventListener('click', (e) => {
+            if (e.target.id === 'settingsModal') closeSettings();
+        });
+    }
+}
+
+function showToast(msg) {
+    // 显示提示消息
+    const t = document.createElement('div');
+    t.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,0.8);color:#fff;padding:8px 16px;border-radius:8px;font-size:13px;z-index:9999;transition:opacity 0.3s;';
+    t.textContent = msg;
+    document.body.appendChild(t);
+    setTimeout(() => t.remove(), 3000);
+}
+
 function init() {
     initClock();
     initMap();
