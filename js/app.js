@@ -158,158 +158,48 @@ async function baiduASR(pcmBytes) {
     return null;
 }
 
-// --- 生成本地蜂鸣音频 (PCM格式) ---
-function generateBeepAudio(text) {
-    // 采样率 16kHz，16bit PCM
-    const sampleRate = 16000;
-    const duration = 0.8; // 0.8秒，简短清晰
-    const numSamples = Math.floor(sampleRate * duration);
-    const buffer = new Int16Array(numSamples);
-
-    // 根据紧急程度决定蜂鸣模式
-    const hasAlert = text.includes('注意') || text.includes('立即') || text.includes('避让');
-    const freq1 = hasAlert ? 1000 : 800;
-    const freq2 = hasAlert ? 1500 : 1200;
-
-    // 生成双音调蜂鸣（有节奏感）
-    for (let i = 0; i < numSamples; i++) {
-        const t = i / sampleRate;
-        // 0.1秒一个周期，产生"哔-哔-哔"的节奏
-        const cycle = (t * 10) % 1;
-        if (cycle < 0.5) {
-            // 有声部分
-            const sample = Math.sin(2 * Math.PI * freq1 * t) * 0.6 +
-                          Math.sin(2 * Math.PI * freq2 * t) * 0.4;
-            // 淡入淡出避免爆音
-            let envelope = 1;
-            const fade = 0.01 * sampleRate;
-            if (i < fade) envelope = i / fade;
-            if (i > numSamples - fade) envelope = (numSamples - i) / fade;
-            buffer[i] = Math.floor(sample * 12000 * envelope);
-        } else {
-            // 无声部分（节奏间隔）
-            buffer[i] = 0;
-        }
-    }
-
-    // 添加 WAV 头（ESP32 需要识别格式）
-    const wavHeader = new ArrayBuffer(44);
-    const view = new DataView(wavHeader);
-
-    writeString(view, 0, 'RIFF');
-    view.setUint32(4, 36 + numSamples * 2, true);
-    writeString(view, 8, 'WAVE');
-    writeString(view, 12, 'fmt ');
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, 1, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, sampleRate * 2, true);
-    view.setUint16(32, 2, true);
-    view.setUint16(34, 16, true);
-    writeString(view, 36, 'data');
-    view.setUint32(40, numSamples * 2, true);
-
-    const wavBuffer = new Uint8Array(44 + numSamples * 2);
-    wavBuffer.set(new Uint8Array(wavHeader), 0);
-    wavBuffer.set(new Uint8Array(buffer.buffer), 44);
-
-    return wavBuffer;
-}
-
-function writeString(view, offset, string) {
-    for (let i = 0; i < string.length; i++) {
-        view.setUint8(offset + i, string.charCodeAt(i));
-    }
-}
-
-// --- 播放通过 MQTT 接收的 TTS 音频 ---
-function playMqttAudio(audioData) {
-    if (!audioData || audioData.length < 44) {
-        console.error('[TTS播放] 音频数据太短:', audioData?.length);
-        return;
-    }
-
-    // 检测 WAV 格式（RIFF 头）
-    const isWav = audioData[0] === 0x52 && audioData[1] === 0x49 &&  // "RI"
-                  audioData[2] === 0x46 && audioData[3] === 0x46;    // "FF"
-
-    let pcmData, sampleRate;
-
-    if (isWav) {
-        // WAV 格式：跳过 44 字节头
-        // 解析采样率（偏移 24 处，小端 4 字节）
-        sampleRate = new DataView(audioData.buffer, audioData.byteOffset + 24, 4).getUint32(0, true);
-        const offset = 44;
-        pcmData = new Int16Array(audioData.buffer, audioData.byteOffset + offset, (audioData.length - offset) / 2);
-        console.log('[TTS播放] WAV格式, 采样率:', sampleRate, 'PCM样本:', pcmData.length);
-    } else {
-        // 纯 PCM 16kHz 16bit
-        sampleRate = 16000;
-        pcmData = new Int16Array(audioData.buffer, audioData.byteOffset, audioData.length / 2);
-        console.log('[TTS播放] PCM格式, 采样率:', sampleRate, 'PCM样本:', pcmData.length);
-    }
-
-    // 播放
-    const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
-    const buffer = ctx.createBuffer(1, pcmData.length, sampleRate);
-    buffer.getChannelData(0).set(pcmData);
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(ctx.destination);
-    source.start(0);
-    console.log('[TTS播放] 开始播放, 时长:', (pcmData.length / sampleRate).toFixed(1), '秒');
-
-    source.onended = () => {
-        console.log('[TTS播放] 播放完成');
-        ctx.close();
-    };
-}
+// 注意：所有语音播放由ESP32硬件功放完成，前端不播放任何声音
 
 
-// --- 百度 TTS（通过本地代理服务器）---
+// --- 百度 TTS（请求代理服务器合成，但只发送给ESP32播放，前端不播放）---
 async function baiduTTSWeb(text) {
-    console.log('[百度TTS-Web] 开始请求 TTS，文本:', text);
+    console.log('[百度TTS] 请求合成:', text);
 
     try {
-        // 直接走同源代理（proxy_server.py 托管前端 + API）
         const response = await fetch(`${API_BASE}/api/tts`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text })
         });
 
-        console.log('[百度TTS-Web] 响应状态:', response.status);
-
         if (response.ok) {
             const audioData = await response.arrayBuffer();
-            console.log('[百度TTS-Web] 音频数据:', audioData.byteLength, '字节');
+            console.log('[百度TTS] 合成成功:', audioData.byteLength, '字节');
+            // 返回音频数据，供MQTT发送给ESP32
             return new Uint8Array(audioData);
         } else {
             const error = await response.json();
-            console.error('[百度TTS-Web] 错误:', error);
+            console.error('[百度TTS] 错误:', error);
             return null;
         }
     } catch (e) {
-        console.error('[百度TTS-Web] 请求异常:', e.message);
-        console.log('[百度TTS-Web] 请确保代理服务器已启动: python server/proxy_server.py');
+        console.error('[百度TTS] 请求异常:', e.message);
         return null;
     }
 }
 
-// --- 百度 TTS（ESP32直接调用，网页端作为备选）---
-// 注意：现在所有TTS优先由ESP32直接调用百度API完成
-// 当ESP32无法连接百度时，通过MQTT请求网页端代为合成
+// --- 百度 TTS（ESP32直接调用，网页端只负责转发音频数据给ESP32）---
+// 注意：ESP32优先直接调用百度API，当ESP32无法连接百度时，网页端代为合成并通过MQTT发送音频
 async function baiduTTS(text) {
-    console.log('[百度TTS] 功能已迁移到ESP32，发送文本:', text);
-    // 通过MQTT发送文本给ESP32，让ESP32自己合成
+    console.log('[百度TTS] 合成文本:', text);
+    // 通过MQTT发送文本给ESP32，让ESP32自己合成并播放
     if (mqttClient && AppState.mqttConnected) {
         const msg = JSON.stringify({
             type: 'tts_request',
             text: text
         });
         mqttClient.publish(MQTT_CONFIG.topics.ttsReq, msg);
-        console.log('[百度TTS] 已发送文本给ESP32合成:', text);
+        console.log('[百度TTS] 已发送文本给ESP32:', text);
     }
     return null;
 }
@@ -377,7 +267,7 @@ async function baiduRoutePlan(destination, currentLat, currentLng) {
     }
 }
 
-// --- 处理语音导航 ---
+// --- 处理语音导航（由ESP32功放播放语音）---
 async function handleVoiceNavigation(pcmBytes) {
     console.log('[语音] 收到PCM数据', pcmBytes.length, '字节');
     addEventLog('语音', '正在识别...');
@@ -394,10 +284,8 @@ async function handleVoiceNavigation(pcmBytes) {
     const destination = extractDestination(text);
     if (!destination) {
         console.log('[语音] 未提取到有效目的地');
-        const tts = await baiduTTS('请说出具体地点，例如带我去天安门');
-        if (tts && mqttClient) {
-            mqttClient.publish(MQTT_CONFIG.topics.ttsAudio, tts);
-        }
+        // 发送文本给ESP32，由ESP32播放提示音
+        await baiduTTS('请说出具体地点，例如带我去天安门');
         return;
     }
     console.log('[语音] 目的地:', destination);
@@ -407,10 +295,8 @@ async function handleVoiceNavigation(pcmBytes) {
     const route = await baiduRoutePlan(destination, currentPos?.lat, currentPos?.lng);
     if (!route) {
         console.log('[语音] 路线规划失败');
-        const tts = await baiduTTS('抱歉，没有找到该地点的路线');
-        if (tts && mqttClient) {
-            mqttClient.publish(MQTT_CONFIG.topics.ttsAudio, tts);
-        }
+        // 发送文本给ESP32，由ESP32播放提示音
+        await baiduTTS('抱歉，没有找到该地点的路线');
         return;
     }
 
@@ -428,12 +314,10 @@ async function handleVoiceNavigation(pcmBytes) {
         addEventLog('导航', `开始导航到 ${route.destination}，共${route.steps.length}步，${Math.round(route.distance)}米`);
     }
 
+    // 发送导航播报文本给ESP32，由ESP32功放播放
     const firstStep = route.steps[0] || '开始导航';
     const ttsText = `开始导航到${route.destination}，全程${Math.round(route.distance)}米，预计${Math.round(route.duration/60)}分钟，${firstStep}`;
-    const tts = await baiduTTS(ttsText);
-    if (tts && mqttClient) {
-        mqttClient.publish(MQTT_CONFIG.topics.ttsAudio, tts);
-    }
+    await baiduTTS(ttsText);
 
     updateNavigationSteps(navMsg);
     addNavHistory(route.destination, route.steps);
@@ -647,10 +531,11 @@ async function handleMqttMessage(topic, payload) {
         }
 
         // --- TTS 音频（来自 ESP32 通过 MQTT 代理的 TTS 结果）---
+        // 注意：所有语音由ESP32硬件功放播放，前端只记录日志不播放
         if (topic === MQTT_CONFIG.topics.ttsAudio) {
-            const audioData = new Uint8Array(payload);
-            console.log('[TTS] 收到MQTT音频:', audioData.length, '字节');
-            playMqttAudio(audioData);
+            const audioLen = payload.length;
+            console.log('[TTS] ESP32播放完成通知，音频大小:', audioLen, '字节');
+            // 前端不播放声音，只做记录
             return;
         }
 
@@ -710,13 +595,9 @@ async function handleMqttMessage(topic, payload) {
                         console.error('[TTS-MQTT] TTS合成失败');
                     }
                 } else {
-                    // 原有的障碍物告警处理
-                    console.log('[TTS请求] 障碍物告警:', msg.text);
-                    addEventLog('障碍物', msg.text);
-                    const beepAudio = generateBeepAudio(msg.text);
-                    if (mqttClient) {
-                        mqttClient.publish(MQTT_CONFIG.topics.ttsAudio, beepAudio);
-                    }
+                    // 障碍物告警或其他TTS请求 - 只记录日志，ESP32会自己播放
+                    console.log('[TTS请求] 记录:', msg.text);
+                    addEventLog(msg.type || '语音', msg.text);
                 }
             } catch (e) {
                 console.error('[TTS-MQTT] 处理失败:', e);
@@ -1525,71 +1406,33 @@ async function planRouteToNearest(destination, currentLat, currentLng) {
     }
 }
 
-// ================= 新增：开机播报功能 =================
+// ================= 新增：开机播报（发送文本给ESP32功放播放）====================
 
 /**
- * 播放开机播报（启动成功）- ESP32直接合成
+ * 开机播报 - 发送文本给ESP32，由ESP32功放播放
  */
 async function playStartupSound() {
-    console.log('[开机播报] 播放启动成功提示');
+    console.log('[开机播报] 发送启动文本给ESP32');
     addEventLog('系统', '设备启动成功');
 
     const startupText = '导盲杖系统启动成功，欢迎使用';
-    // 通过MQTT发送文本给ESP32，让ESP32自己合成语音
+    // 通过MQTT发送文本给ESP32，让ESP32自己合成语音并由功放播放
     if (mqttClient && AppState.mqttConnected) {
         const msg = JSON.stringify({
             type: 'tts_request',
             text: startupText
         });
         mqttClient.publish(MQTT_CONFIG.topics.ttsReq, msg);
-        console.log('[开机播报] 已发送文本给ESP32合成:', startupText);
+        console.log('[开机播报] 已发送文本给ESP32:', startupText);
     } else {
         console.error('[开机播报] MQTT未连接');
     }
 }
 
-// ================= 新增：障碍物语音播报功能 =================
+// ================= 新增：障碍物检测（只发送文本给ESP32播放）====================
 
 /**
- * 播报障碍物告警（带距离）- 通过MQTT让ESP32合成语音
- * @param {number} distance - 障碍物距离（厘米）
- * @param {string} direction - 方向（如'前方'、'左前方'等）
- */
-async function announceObstacleWithDistance(distance, direction = '前方') {
-    console.log('[障碍物播报] 播报障碍物:', direction, distance, 'cm');
-
-    let alertText = '';
-
-    // 根据距离生成不同的告警文本
-    if (distance < 50) {
-        alertText = `${direction}${distance}厘米有障碍物，请立即避让！`;
-    } else if (distance < 100) {
-        alertText = `${direction}${distance}厘米有障碍物，请注意避让`;
-    } else if (distance < 200) {
-        alertText = `${direction}${distance}厘米有障碍物`;
-    } else {
-        alertText = `${direction}${Math.round(distance / 100)}米处有障碍物`;
-    }
-
-    addEventLog('障碍物', alertText);
-
-    // 通过MQTT发送文本给ESP32，让ESP32自己合成语音
-    if (mqttClient && AppState.mqttConnected) {
-        const msg = JSON.stringify({
-            type: 'obstacle_alert',
-            text: alertText,
-            distance: distance,
-            direction: direction
-        });
-        mqttClient.publish(MQTT_CONFIG.topics.ttsReq, msg);
-        console.log('[障碍物播报] 已发送文本给ESP32:', alertText);
-    } else {
-        console.error('[障碍物播报] MQTT未连接');
-    }
-}
-
-/**
- * 处理五向雷达障碍物检测和播报
+ * 处理五向雷达障碍物检测 - 只发送文本，由ESP32功放播放
  * @param {Object} radarData - 雷达数据 {front, frontLeft, frontRight, left, right}
  */
 async function handleObstacleDetection(radarData) {
@@ -1615,13 +1458,13 @@ async function handleObstacleDetection(radarData) {
         }
     }
 
-    // 如果最近障碍物在阈值内，且状态变化，则播报
+    // 如果最近障碍物在阈值内，且状态变化，则发送播报请求给ESP32
     if (minDist < OBSTACLE_THRESHOLD && !AppState.lastObstacleState) {
         AppState.reportData.obstacleCount++;
         document.getElementById('obstacleCount').textContent = AppState.reportData.obstacleCount;
         AppState.lastObstacleState = true;
 
-        // 播报障碍物
+        // 发送文本给ESP32，由ESP32自己合成并播放
         await announceObstacleWithDistance(Math.round(minDist), minDir);
 
     } else if (minDist >= 200) {
@@ -1629,10 +1472,48 @@ async function handleObstacleDetection(radarData) {
     }
 }
 
-// ================= 新增：语音导航处理（使用改进的功能）====================
+/**
+ * 发送障碍物告警文本给ESP32（由ESP32功放播放）
+ * @param {number} distance - 障碍物距离（厘米）
+ * @param {string} direction - 方向（如'前方'、'左前方'等）
+ */
+async function announceObstacleWithDistance(distance, direction = '前方') {
+    console.log('[障碍物告警] 发送文本给ESP32:', direction, distance, 'cm');
+
+    let alertText = '';
+
+    // 根据距离生成不同的告警文本
+    if (distance < 50) {
+        alertText = `${direction}${distance}厘米有障碍物，请立即避让！`;
+    } else if (distance < 100) {
+        alertText = `${direction}${distance}厘米有障碍物，请注意避让`;
+    } else if (distance < 200) {
+        alertText = `${direction}${distance}厘米有障碍物`;
+    } else {
+        alertText = `${direction}${Math.round(distance / 100)}米处有障碍物`;
+    }
+
+    addEventLog('障碍物', alertText);
+
+    // 通过MQTT发送文本给ESP32，让ESP32自己合成语音并由功放播放
+    if (mqttClient && AppState.mqttConnected) {
+        const msg = JSON.stringify({
+            type: 'obstacle_alert',
+            text: alertText,
+            distance: distance,
+            direction: direction
+        });
+        mqttClient.publish(MQTT_CONFIG.topics.ttsReq, msg);
+        console.log('[障碍物告警] 已发送文本给ESP32:', alertText);
+    } else {
+        console.error('[障碍物告警] MQTT未连接');
+    }
+}
+
+// ================= 新增：语音导航处理（改进版 - ESP32播放）====================
 
 /**
- * 处理语音导航指令（改进版）
+ * 处理语音导航指令（改进版）- 由ESP32功放播放语音
  * @param {string} text - 识别的语音文本
  */
 async function handleVoiceNavigationAdvanced(text) {
@@ -1644,10 +1525,8 @@ async function handleVoiceNavigationAdvanced(text) {
 
     if (!destination) {
         console.log('[语音导航] 未提取到有效目的地');
-        const tts = await baiduTTS('请说出具体地点，例如带我去天安门');
-        if (tts && mqttClient) {
-            mqttClient.publish(MQTT_CONFIG.topics.ttsAudio, tts);
-        }
+        // 发送文本给ESP32，由ESP32播放提示音
+        await baiduTTS('请说出具体地点，例如带我去天安门');
         return;
     }
 
@@ -1661,20 +1540,16 @@ async function handleVoiceNavigationAdvanced(text) {
 
     if (!route) {
         console.log('[语音导航] 路线规划失败');
-        const tts = await baiduTTS('抱歉，没有找到该地点的路线');
-        if (tts && mqttClient) {
-            mqttClient.publish(MQTT_CONFIG.topics.ttsAudio, tts);
-        }
+        // 发送文本给ESP32，由ESP32播放提示音
+        await baiduTTS('抱歉，没有找到该地点的路线');
         return;
     }
 
     // 检查距离是否太远
     if (route.tooFar) {
         console.log('[语音导航]', route.message);
-        const tts = await baiduTTS(route.message + '，请重新选择较近的地点');
-        if (tts && mqttClient) {
-            mqttClient.publish(MQTT_CONFIG.topics.ttsAudio, tts);
-        }
+        // 发送文本给ESP32，由ESP32播放提示音
+        await baiduTTS(route.message + '，请重新选择较近的地点');
         addEventLog('导航', route.message);
         return;
     }
@@ -1695,13 +1570,10 @@ async function handleVoiceNavigationAdvanced(text) {
         addEventLog('导航', `开始导航到 ${route.destination}，共${route.steps.length}步，${Math.round(route.distance)}米`);
     }
 
-    // 播报导航开始
+    // 发送导航播报文本给ESP32，由ESP32功放播放
     const firstStep = route.steps[0] || '开始导航';
     const ttsText = `开始导航到${route.destination}，全程${Math.round(route.distance)}米，预计${Math.round(route.duration / 60)}分钟，${firstStep}`;
-    const tts = await baiduTTS(ttsText);
-    if (tts && mqttClient) {
-        mqttClient.publish(MQTT_CONFIG.topics.ttsAudio, tts);
-    }
+    await baiduTTS(ttsText);
 
     updateNavigationSteps(navMsg);
     addNavHistory(route.destination, route.steps);
