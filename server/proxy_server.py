@@ -148,13 +148,16 @@ def text_to_speech():
             "spd": 5,
             "pit": 5,
             "vol": 9,
-            "per": 0,  # 基础音库：度小美
+            "per": 1,  # 改为度小宇（也可能是per=0权限问题）
             "aue": 6   # wav格式
         }
 
         resp = requests.post(url, data=payload, timeout=15, verify=False)
 
         content_type = resp.headers.get('Content-Type', '')
+        print(f"[TTS] 百度响应 Content-Type: {content_type}")
+        print(f"[TTS] 百度响应状态: {resp.status_code}")
+
         if 'audio' in content_type:
             print(f"[TTS] 成功，音频大小: {len(resp.content)} 字节")
             # 缓存结果
@@ -164,7 +167,7 @@ def text_to_speech():
             }
             return Response(resp.content, mimetype='audio/wav')
         else:
-            print(f"[TTS] 错误: {resp.text[:200]}")
+            print(f"[TTS] 错误: {resp.text[:500]}")
             return jsonify({"error": "TTS失败", "detail": resp.text}), 500
 
     except Exception as e:
