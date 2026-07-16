@@ -4,7 +4,7 @@
 运行: python proxy_server.py
 """
 
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_from_directory
 from flask_cors import CORS
 import requests
 import json
@@ -14,6 +14,33 @@ import hashlib
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
+
+# ==================== 前端静态文件托管 ====================
+_here = os.path.dirname(os.path.abspath(__file__))
+FRONTEND_DIR = os.path.dirname(_here)   # 项目根目录（index.html 所在处）
+
+@app.route('/')
+def index():
+    fp = _os.path.join(FRONTEND_DIR, 'index.html')
+    with open(fp, 'r', encoding='utf-8') as f:
+        return f.read()
+
+@app.route('/<path:filename>')
+def static_files(filename):
+    fp = _os.path.join(FRONTEND_DIR, filename)
+    if not _os.path.exists(fp) or _os.path.isdir(fp):
+        return "Not Found", 404
+    ext = _os.path.splitext(fp)[1].lower()
+    mime = {
+        '.html':'text/html','.css':'text/css','.js':'application/javascript',
+        '.json':'application/json','.png':'image/png','.jpg':'image/jpeg',
+        '.gif':'image/gif','.svg':'image/svg+xml','.ico':'image/x-icon',
+        '.woff':'font/woff','.woff2':'font/woff2','.ttf':'font/ttf',
+        '.eot':'application/vnd.ms-fontobject'
+    }
+    mt = mime.get(ext, 'application/octet-stream')
+    with open(fp, 'rb') as f:
+        return f.read(), 200, {'Content-Type': mt}
 
 # 百度API配置
 BAIDU_API_KEY = "Xbxnhkwb2sxtB6HbH5BUTlUG"
@@ -280,10 +307,13 @@ if __name__ == '__main__':
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+    # Render 通过 PORT 环境变量指定端口，本地默认 8090
+    port = int(os.environ.get('PORT', 8090))
+
     print("=" * 50)
-    print("百度API代理服务器")
+    print("百度API代理服务器 + 导盲杖大屏")
     print("=" * 50)
-    print("接口:")
+    print("API接口:")
     print("  POST /api/tts            - 文本转语音")
     print("  POST /api/tts/segment/:i - TTS音频分段上传")
     print("  POST /api/tts/segments   - TTS分段元数据")
@@ -292,8 +322,10 @@ if __name__ == '__main__':
     print("  POST /api/config         - 保存用户配置")
     print("  POST /api/navigation/stop- 停止导航")
     print("  GET  /health             - 健康检查")
+    print("  GET  /                   - 前端大屏首页")
     print("=" * 50)
-    print("运行在: http://0.0.0.0:8080")
+    print(f"运行在: http://0.0.0.0:{port}")
+    print(f"大屏地址: http://localhost:{port}")
     print("=" * 50)
 
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=False)

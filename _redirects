@@ -1,1 +1,1 @@
-/api/*  http://blindstick.duckdns.org:8080/:splat  200
+/api/*  http://localhost:8090/:splat  200

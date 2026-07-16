@@ -10,12 +10,13 @@
 ## 2. 已完成的工作
 | 编号 | 内容 | 备注 |
 |------|------|------|
-| 2.1 | 查看并确认 `proxy_server.py` 已经绑定到 `0.0.0.0:8080`，能够在本机返回 `{"status":"ok"}`。 | 已通过 `curl -v http://127.0.0.1:8080/health` 验证。 |
-| 2.2 | 后端代理已打开 CORS（`origins: "*"`）并加入了 **Token 缓存** 与 **TTS 结果缓存**（减少重复请求）。 | 已在 `proxy_server.py` 中实现。 |
-| 2.3 | 前端代码 (`js/app.js`) 中的 HTTP 请求使用了硬编码的 `http://localhost:8080/api/...`，需要改为能指向外网后端的地址。 | 识别为主要阻塞点。 |
-| 2.4 | 已调研两种让本机服务对外可见的方式：<br>• 路由器端口转发（长期）<br>• ngrok 隧道（快速验证） | 已给出详细步骤。 |
-| 2.5 | 已提出两种在 Netlify 上把前端请求代理到外网后端的方案：<br>• `_redirects` 文件（无需改前端代码）<br>• 环境变量 `API_BASE`（需改 JS） | 推荐使用 `_redirects` 因为零代码改动。 |
-| 2.6 | 已确认 ESP32 端的 MQTT 配置已指向公开的 EMQX broker（`u72a7838.ala.asia-southeast1.emqxsl.com:8883`），因此硬件与前端的 WebSocket 通信已经跨网络可行。 | 仅剩下 HTTP 部分需要打通。 |
+| 2.1 | `proxy_server.py` 从仅 3 个接口扩展为完整后端：TTS、ASR、config、navigation/stop、TTS分段、前端静态托管。 | 端口改为 **8090**（8080 被后台任务占用）。 |
+| 2.2 | 后端打开 CORS、Token 缓存、TTS 结果缓存均已实现。 | `proxy_server.py` 中已实现。 |
+| 2.3 | 前端 `app.js` 移除 `localhost:8080` 硬编码，全部走相对路径 `/api/*`。 | proxy_server 直接托管前端，同源请求无跨域。 |
+| 2.4 | ESP32 TTS 无声音问题修复：（1）`playStartupTestTone` 的 free-after-return 堆内存崩溃已修复；（2）I2S 输出改为 APLL 时钟（`use_apll=true`），16kHz 采样率精确。 | 两台设备均需烧录新固件。 |
+| 2.5 | ESP32 固件端口 8080 → 8090 同步更新（2 处硬编码）。 | `esp32_upload.ino` 已改。 |
+| 2.6 | 一键启动脚本 `server/start_proxy.bat` 升级，启动后自动打开浏览器。 | 双击即可用。 |
+| 2.7 | ngrok + DuckDNS 配置完成（`blindstick.duckdns.org`，token 自动更新脚本 `duckdns_update.bat`）。 | 路由器端口转发未配置，公网 IP `61.111.128.240`。 |
 
 ## 3. 当前卡住的地方
 - 前端仍然使用 `http://localhost:8080/api/...` 进行请求，当前端部署在 Netlify（`https://statuesque-crostata-a41140.netlify.app/`）时，浏览器会把这些请求发往 **本机的 localhost**，显然找不到后端服务，导致：

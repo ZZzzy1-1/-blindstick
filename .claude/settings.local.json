@@ -46,7 +46,20 @@
       "Bash(powershell -Command \"Start-Process powershell -Verb RunAs -ArgumentList '-Command Test-NetConnection -ComputerName 61.111.128.240 -Port 8080' -Wait\" 2>&1)",
       "Bash(ipconfig)",
       "Bash(findstr \"IPv4\\\\|子网\\\\|默认网关\")",
-      "Bash(findstr /i \"Address\")"
+      "Bash(findstr /i \"Address\")",
+      "Bash(taskkill /f /pid 15112)",
+      "Bash(taskkill /f /im python.exe)",
+      "Read(//c/Users/20610/Desktop/1/server/**)",
+      "Bash(taskkill /f /pid 8824)",
+      "Bash(taskkill /f /pid 27512 /pid 15112 /pid 2916 /pid 17068 /pid 22232 /pid 12388)",
+      "Bash(taskkill /f /pid 27512)",
+      "Bash(taskkill /f /pid 2916)",
+      "Bash(taskkill /f /pid 17068)",
+      "Bash(taskkill /f /pid 22232)",
+      "Bash(taskkill /f /pid 12388)",
+      "Bash(cmd.exe *)",
+      "Bash(findstr \":8090\")",
+      "Bash(git commit *)"
     ]
   }
 }

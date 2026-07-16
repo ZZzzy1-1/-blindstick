@@ -92,21 +92,6 @@ const API_CONFIG = {
     homeCity: '黄石市'
 };
 
-// 后端代理地址（根据部署环境自动推断）
-// 本地开发: http://localhost:8080
-// Netlify: 需配合 _redirects 将 /api/* 代理到后端
-const API_BASE = (() => {
-    const proto = window.location.protocol;
-    const host = window.location.hostname;
-    const port = window.location.port;
-    // 如果页面和后端同源，直接使用当前 origin
-    if (host === 'localhost' || host === '127.0.0.1') {
-        return 'http://localhost:8080';
-    }
-    // Netlify 等静态托管：同源请求（依赖 _redirects 或环境变量代理）
-    return ''; // 空字符串 = 相对路径，Netlify _redirects 会转发到后端
-})();
-
 // ================= 百度实时语音识别 WebSocket 配置 =================
 let baiduASRWS = null;
 let isRecording = false;
@@ -240,9 +225,8 @@ async function baiduTTSWeb(text) {
     console.log('[百度TTS-Web] 开始请求 TTS，文本:', text);
 
     try {
-        // 使用代理服务器（支持本地和Netlify部署）
-        const apiUrl = API_BASE ? `${API_BASE}/api/tts` : '/api/tts';
-        const response = await fetch(apiUrl, {
+        // 直接走同源代理（proxy_server.py 托管前端 + API）
+        const response = await fetch('/api/tts', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ text })
