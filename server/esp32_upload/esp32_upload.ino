@@ -8,6 +8,7 @@
 #include <WebSocketsClient.h>  // 流式语音识别需要
 #include <freertos/FreeRTOS.h>  // FreeRTOS任务控制
 #include <freertos/task.h>
+#include <esp_heap_caps.h>      // PSRAM内存分配
 
 // ==================== 网络参数 ====================
 const char* WIFI_SSID     = "ZZY";
@@ -272,21 +273,18 @@ bool tts_queue_enqueue(uint8_t* audio_data, int audio_len, TTS_Priority priority
         new_item = (TTS_QueueItem*)malloc(sizeof(TTS_QueueItem));
     }
 
-    if (!new_item) { Serial.println("[TTS队列] 内存分配失败"); return false; }
-
-    // 音频数据也使用PSRAM
-    if (ESP.getPsramSize() > 0) {
-        new_item->audio_data = (uint8_t*)ps_malloc(audio_len);
-    } else {
-        new_item->audio_data = (uint8_t*)malloc(audio_len);
+    if (!new_item) {
+        Serial.println("[TTS队列] 队列项内存分配失败");
+        return false;
     }
 
-    if (!new_item->audio_data) { free(new_item); return false; }
-    memcpy(new_item->audio_data, audio_data, audio_len);
+    // 音频数据直接使用传入的指针（所有权转移）
+    new_item->audio_data = audio_data;
     new_item->audio_len = audio_len;
     new_item->priority = priority;
     new_item->timestamp = millis();
     new_item->next = NULL;
+
     TTS_QueueItem* prev = NULL;
     TTS_QueueItem* curr = tts_queue.head;
     while (curr != NULL && curr->priority >= priority) { prev = curr; curr = curr->next; }
@@ -1881,6 +1879,17 @@ String base64Encode(const uint8_t* data, size_t len) {
 void setup() {
     Serial.begin(115200);
     randomSeed(millis());  // 初始化随机数种子
+
+    // ===== PSRAM 初始化（必须在内存分配前完成）=====
+    Serial.println("[系统] 初始化PSRAM...");
+    if (psramInit()) {
+        size_t psram_total = ESP.getPsramSize();
+        size_t psram_free = ESP.getFreePsram();
+        Serial.printf("[PSRAM] 初始化成功！总计:%dKB, 可用:%dKB\n",
+                     psram_total/1024, psram_free/1024);
+    } else {
+        Serial.println("[PSRAM] 初始化失败或未安装PSRAM");
+    }
 
     pinMode(MOTOR_IN1, OUTPUT); pinMode(MOTOR_IN2, OUTPUT); pinMode(MOTOR_PWM, OUTPUT);
     motorControl(0);
