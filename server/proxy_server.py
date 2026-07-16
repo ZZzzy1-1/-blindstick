@@ -270,6 +270,7 @@ def stop_navigation():
     return jsonify({"status": "ok", "message": "导航已停止"})
 
 # ==================== 导航路线接口（ESP32调用）====================
+# 2025-07-16: 新增此接口供ESP32获取导航路线
 @app.route('/api/nav_steps', methods=['GET', 'POST'])
 def get_nav_steps():
     """获取导航路线步骤（ESP32用）"""
