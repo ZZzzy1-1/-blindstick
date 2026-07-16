@@ -837,6 +837,10 @@ function addNavHistory(destination, steps) {
 }
 
 // ================= 初始化 =================
+function initClock() {
+    // 时钟功能已移除，保留空函数避免报错
+}
+
 function init() {
     initClock();
     initMap();
