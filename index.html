@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- 禁用缓存 -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>导盲杖随行助手</title>
+    <link rel="stylesheet" href="css/leaflet.css" />
+    <script src="js/echarts.min.js"></script>
+    <script src="js/leaflet.js"></script>
+    <link rel="stylesheet" href="css/style.css">
+    <!-- MQTT.js (用于 MQTT over WebSocket) -->
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+</head>
+<body>
+    <header class="header">
+        <div class="header-left">
+            <div class="logo"></div>
+            <div class="header-titles">
+                <h1>导盲杖随行助手</h1>
+                <p>设备状态与行程看护</p>
+            </div>
+        </div>
+        <div class="header-center">
+            <div class="status-bar">
+                <span class="status-item online"><i></i>主控</span>
+                <span class="status-item online"><i></i>视觉</span>
+                <span class="status-item online"><i></i>雷达</span>
+                <span class="status-item warn"><i></i>GPS</span>
+                <span class="status-item online"><i></i>语音</span>
+            </div>
+        </div>
+        <div class="header-right">
+            <button class="settings-btn" onclick="openSettings()" title="设置">⚙️</button>
+        </div>
+    </header>
+
+    <main class="dashboard">
+        <!-- 左侧面板 -->
+        <aside class="panel panel-left">
+            <section class="panel-section">
+                <div class="section-title">
+                    <h3>实时导航</h3>
+                    <span class="badge active" id="navStatusBadge">导航中</span>
+                </div>
+                <div class="section-content">
+                    <div class="nav-current-step" id="currentNavStep">
+                        <div class="nav-dest">目的地: <span id="navDestination">--</span></div>
+                        <div class="nav-step-text" id="navStepText">等待导航开始...</div>
+                        <div class="nav-progress">
+                            <div class="nav-progress-bar" id="navProgressBar"></div>
+                        </div>
+                        <div class="nav-step-count">第 <span id="currentStepNum">0</span> / <span id="totalStepNum">0</span> 步</div>
+                    </div>
+                    <div class="nav-steps-list" id="navStepsList">
+                        <!-- 导航步骤列表 -->
+                    </div>
+                    <button class="btn-stop-nav" id="stopNavBtn" onclick="stopNavigation()" style="display:none;">停止导航</button>
+                </div>
+            </section>
+
+            <section class="panel-section">
+                <div class="section-title">
+                    <h3>周围环境</h3>
+                    <span class="badge" id="blockBadge">导航中</span>
+                </div>
+                <div class="section-content">
+                    <div class="radar-dists">
+                        <div class="dist-row">
+                            <span class="dist-label">正前</span>
+                            <div class="dist-bar-wrap">
+                                <div class="dist-bar" id="barFront"></div>
+                            </div>
+                            <span class="dist-val" id="valFront">400cm</span>
+                        </div>
+                        <div class="dist-row">
+                            <span class="dist-label">前左</span>
+                            <div class="dist-bar-wrap">
+                                <div class="dist-bar" id="barFrontLeft"></div>
+                            </div>
+                            <span class="dist-val" id="valFrontLeft">400cm</span>
+                        </div>
+                        <div class="dist-row">
+                            <span class="dist-label">前右</span>
+                            <div class="dist-bar-wrap">
+                                <div class="dist-bar" id="barFrontRight"></div>
+                            </div>
+                            <span class="dist-val" id="valFrontRight">400cm</span>
+                        </div>
+                        <div class="dist-row">
+                            <span class="dist-label">左侧</span>
+                            <div class="dist-bar-wrap">
+                                <div class="dist-bar" id="barLeft"></div>
+                            </div>
+                            <span class="dist-val" id="valLeft">400cm</span>
+                        </div>
+                        <div class="dist-row">
+                            <span class="dist-label">右侧</span>
+                            <div class="dist-bar-wrap">
+                                <div class="dist-bar" id="barRight"></div>
+                            </div>
+                            <span class="dist-val" id="valRight">400cm</span>
+                        </div>
+                    </div>
+
+                </div>
+            </section>
+
+            <section class="panel-section">
+                <div class="section-title">
+                    <h3>今日出行</h3>
+                </div>
+                <div class="section-content">
+                    <div class="report-grid">
+                        <div class="report-item">
+                            <div class="report-value" id="totalMileage">0</div>
+                            <div class="report-label">总里程 (m)</div>
+                        </div>
+                        <div class="report-item">
+                            <div class="report-value" id="navCount">0</div>
+                            <div class="report-label">导航次数</div>
+                        </div>
+                        <div class="report-item">
+                            <div class="report-value" id="obstacleCount">0</div>
+                            <div class="report-label">障碍物提醒</div>
+                        </div>
+                        <div class="report-item">
+                            <div class="report-value" id="detourCount">0</div>
+                            <div class="report-label">路线调整</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </aside>
+
+        <!-- 中间面板 -->
+        <section class="panel panel-center">
+            <section class="panel-section section-video">
+                <div class="section-title">
+                    <h3>视觉识别</h3>
+                    <span class="tag tag-fps" id="fpsDisplay">-- FPS</span>
+                </div>
+                <div class="section-content video-container" id="videoContainer">
+                    <canvas id="videoCanvas" width="800" height="320"></canvas>
+                    <div class="video-overlay">
+                        <div class="detection-stats" id="detectionStats">
+                            <!-- 由 JS 动态生成 22 类统计 -->
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="panel-section">
+                <div class="section-title">
+                    <h3>位置</h3>
+                    <div class="title-meta">
+                        <span>经度 <b id="lng">116.3974</b></span>
+                        <span>纬度 <b id="lat">39.9093</b></span>
+                        <span>速度 <b id="speed">0.8</b> m/s</span>
+                        <span>方位 <b id="heading">NE</b></span>
+                        <span class="tag" id="gpsStatus">GPS信号弱</span>
+                        <span class="tag" id="satelliteCount">卫星 4</span>
+                    </div>
+                </div>
+                <div class="section-content">
+                    <div id="map"></div>
+                </div>
+            </section>
+        </section>
+
+        <!-- 右侧面板 -->
+        <aside class="panel panel-right">
+            <section class="panel-section">
+                <div class="section-title">
+                    <h3>事件记录</h3>
+                    <button class="btn-clear" onclick="clearEventLog()">清空</button>
+                </div>
+                <div class="section-content">
+                    <div class="event-list" id="eventList"></div>
+                </div>
+            </section>
+
+            <section class="panel-section">
+                <div class="section-title">
+                    <h3>语音对话</h3>
+                    <button class="btn-clear" onclick="clearChatHistory()">清空</button>
+                </div>
+                <div class="section-content">
+                    <div class="chat-container" id="chatContainer">
+                        <div class="chat-welcome">语音对话功能暂不可用</div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="panel-section">
+                <div class="section-title">
+                    <h3>导航记录</h3>
+                    <button class="btn-clear" onclick="clearNavHistory()">清空</button>
+                </div>
+                <div class="section-content">
+                    <div class="nav-history-list" id="navHistoryList">
+                        <div class="nav-empty">暂无导航记录</div>
+                    </div>
+                </div>
+            </section>
+        </aside>
+    </main>
+
+    <script src="js/app.js"></script>
+
+    <!-- 设置弹窗 -->
+    <div class="modal" id="settingsModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>⚙️ 设置</h3>
+                <button class="modal-close" onclick="closeSettings()">×</button>
+            </div>
+            <div class="modal-body">
+                <div class="setting-item">
+                    <label>常住地城市</label>
+                    <div class="setting-desc">设置后，导航搜索会优先在该城市范围内查找目的地</div>
+                    <input type="text" id="homeCityInput" placeholder="例如：黄石市" value="">
+                </div>
+                <div class="setting-item">
+                    <label>当前常住地</label>
+                    <div class="current-home-city" id="currentHomeCity">加载中...</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" onclick="closeSettings()">取消</button>
+                <button class="btn-primary" onclick="saveSettings()">保存</button>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
