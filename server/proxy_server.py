@@ -434,6 +434,17 @@ def tts_push():
         if not text:
             return jsonify({"error": "缺少text参数"}), 400
 
+        # 频率限制：检查最近是否发送过相同的文本
+        current_time = time.time()
+        cache_key = f"{text}_{priority}"
+        if hasattr(tts_manager, 'last_request_time') and hasattr(tts_manager, 'last_request_text'):
+            if tts_manager.last_request_text == cache_key and current_time - tts_manager.last_request_time < 3.0:
+                print(f"[API] 忽略重复请求 (3秒内): '{text[:30]}...'")
+                return jsonify({"status": "ignored", "message": "请求过于频繁"})
+
+        tts_manager.last_request_time = current_time
+        tts_manager.last_request_text = cache_key
+
         print(f"[API] 推送TTS: '{text[:30]}...' 优先级={priority}")
 
         # 确保MQTT已连接
@@ -459,9 +470,13 @@ def tts_push():
         chunk_count = 0
         while not completed.is_set() or chunk_count < len(audio_chunks):
             while chunk_count < len(audio_chunks):
-                mqtt_sender.send_audio_stream([audio_chunks[chunk_count]], priority)
+                chunk = audio_chunks[chunk_count]
+                print(f"[TTS] 发送音频块 {chunk_count+1}/{len(audio_chunks)}, 大小={len(chunk)}字节")
+                mqtt_sender.send_audio_stream([chunk], priority)
                 chunk_count += 1
             time.sleep(0.01)
+
+        print(f"[API] TTS完成: 成功={success[0]}, 共发送{chunk_count}块")
 
         return jsonify({
             "status": "ok" if success[0] else "error",
