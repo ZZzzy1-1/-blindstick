@@ -1216,6 +1216,9 @@ void VoiceRecognitionTask(void* pvParameters) {
             if (result.length() > 0) {
                 Serial.printf("[语音识别] REST API识别结果: %s\n", result.c_str());
                 handleVoiceCommand(result.c_str());
+                // 等待TTS播报完成
+                Serial.println("[语音识别] 等待TTS播报完成...");
+                vTaskDelay(5000 / portTICK_PERIOD_MS);
             }
             vTaskDelay(3000 / portTICK_PERIOD_MS);
             continue;
@@ -1249,6 +1252,11 @@ void VoiceRecognitionTask(void* pvParameters) {
         if (asrResult.length() > 0) {
             Serial.printf("[语音识别] 识别结果: %s\n", asrResult.c_str());
             handleVoiceCommand(asrResult.c_str());
+            asrResult = "";  // 清空结果，避免重复处理
+
+            // 导航触发后，等待5秒让TTS播报完成，再开始下一次识别
+            Serial.println("[语音识别] 等待TTS播报完成...");
+            vTaskDelay(5000 / portTICK_PERIOD_MS);
         } else {
             Serial.println("[语音识别] 未识别到语音");
         }
