@@ -1751,6 +1751,16 @@ void handleVoiceCommand(const char* text) {
     // 提取目的地
     String destination = extractDestination(text);
 
+    // 如果没有触发词，尝试直接使用识别文本作为目的地
+    if (destination.length() < 2) {
+        Serial.println("[语音识别] 无触发词，尝试直接搜索...");
+        destination = String(text);
+        // 去除标点
+        destination.replace("。", "");
+        destination.replace("，", "");
+        destination.trim();
+    }
+
     if (destination.length() < 2) {
         Serial.println("[语音识别] 未提取到有效目的地");
         return;
