@@ -279,6 +279,10 @@ class MQTTAudioSender:
                 if rc == 0:
                     self.connected = True
                     print(f"[MQTT] 已连接到 {self.broker}")
+                    # 连接成功后订阅测试主题
+                    global test_handler
+                    if test_handler:
+                        test_handler.subscribe_topics()
                 else:
                     print(f"[MQTT] 连接失败，错误码: {rc}")
 
@@ -399,13 +403,24 @@ class TestModeHandler:
         self.received_chunks = 0
         self.total_chunks = 0
         self.is_recording = False
+        self.subscribed = False
 
-        # 启动MQTT订阅（如果可用）
+        # 延迟订阅，等待连接成功
         if MQTT_AVAILABLE and mqtt_sender.client:
             mqtt_sender.client.on_message = self._on_mqtt_message
-            mqtt_sender.client.subscribe("blindstick/test/audio")
-            mqtt_sender.client.subscribe("blindstick/test/audio/chunk/+")
-            print("[测试模式] 已订阅测试主题")
+            # 订阅会在on_connect中执行
+            print("[测试模式] 处理器已初始化，等待MQTT连接...")
+
+    def subscribe_topics(self):
+        """订阅测试主题（在MQTT连接成功后调用）"""
+        if not self.subscribed and self.mqtt_sender.client:
+            try:
+                self.mqtt_sender.client.subscribe("blindstick/test/audio")
+                self.mqtt_sender.client.subscribe("blindstick/test/audio/chunk/+")
+                self.subscribed = True
+                print("[测试模式] 已订阅测试主题")
+            except Exception as e:
+                print(f"[测试模式] 订阅失败: {e}")
 
     def _on_mqtt_message(self, client, userdata, msg):
         """处理MQTT消息"""
