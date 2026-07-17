@@ -647,6 +647,13 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
             }
             playPcmData(audio_buf + offset, length - offset);
             free(audio_buf);
+            Serial.println("[TTS] 播放完成");
+
+            // 恢复语音识别
+            if (VoiceTaskHandle != NULL) {
+                vTaskResume(VoiceTaskHandle);
+                Serial.println("[TTS] 语音识别已恢复");
+            }
         }
 
     } else if (strcmp(topic, MQTT_TOPIC_NAV_STEPS) == 0) {
@@ -1777,6 +1784,9 @@ void playPcmData(uint8_t* data, int len) {
         size_t bytes_written = 0;
         i2s_write(I2S_PORT_OUT, temp_buffer, chunk_samples * 2, &bytes_written, portMAX_DELAY);
     }
+    // 等待播放完成
+    int audio_duration_ms = (len / 32000.0) * 1000;
+    delay(audio_duration_ms + 100);
 }
 
 void stopCurrentPlayback() {
