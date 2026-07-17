@@ -152,12 +152,8 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length);
 String doRESTASR();  // REST API备选方案
 String base64Encode(const uint8_t* data, size_t len);  // Base64编码
 
-// 测试模式相关函数
-void testRecordAndPlaybackTask(void* pvParameters);
-void handleTestAudio(const char* topic, byte* payload, unsigned int length);
-
-// 流式语音识别全局变量
-WebSocketsClient webSocket;
+// 流式语音识别相关
+void VoiceRecognitionTask(void* pvParameters);
 volatile bool asrConnected = false;
 volatile bool asrFinished = false;
 String asrResult = "";
@@ -601,12 +597,6 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     // ===== 流式TTS音频数据处理 =====
     if (strncmp(topic, "blindstick/tts/stream/", 22) == 0) {
         handleStreamAudio(topic, payload, length);
-        return;
-    }
-
-    // ===== 测试模式：接收TTS返回音频 =====
-    if (strncmp(topic, "blindstick/test/tts/", 20) == 0) {
-        handleTestAudio(topic, payload, length);
         return;
     }
 
@@ -1534,12 +1524,7 @@ void setup() {
 
     // xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 8192, NULL, 3, &RadarTaskHandle, 0);
     // xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
-    // xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 8192, NULL, 2, &VoiceTaskHandle, 1);
-
-    // ===== 测试模式：录音回环 =====
-    Serial.println("\n[系统] 启动测试模式：录音回环");
-    xTaskCreatePinnedToCore(testRecordAndPlaybackTask, "TestRecTask", 8192, NULL, 2, &VoiceTaskHandle, 1);
-    Serial.println("[系统] 按 BOOT 键开始录音测试\n");
+    xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 8192, NULL, 2, &VoiceTaskHandle, 1);
 
     delay(300);
 }
@@ -1962,102 +1947,4 @@ void announceObstacleStreaming(float distance, const char* direction) {
     mqtt.publish("blindstick/tts/request", buf, len);
 }
 
-// ==================== 测试模式：录音回环 ====================
-// 临时测试：录音 -> MQTT发送 -> 后端ASR+TTS -> MQTT返回 -> 播放
-
-#define TEST_RECORD_TIME_MS 2000  // 录音2秒
-#define TEST_AUDIO_CHUNK_SIZE 512 // 每次发送512字节
-
-void testRecordAndPlaybackTask(void* pvParameters) {
-    Serial.println("\n========================================");
-    Serial.println("  测试模式：录音回环");
-    Serial.println("  按 BOOT 键开始录音...");
-    Serial.println("========================================\n");
-
-    const int bufferSize = SAMPLE_RATE * 2 * (TEST_RECORD_TIME_MS / 1000); // 64KB
-
-    while (true) {
-        // 等待按键（GPIO 0 通常是BOOT键）
-        if (digitalRead(0) == LOW) {
-            delay(50); // 消抖
-            if (digitalRead(0) == LOW) {
-                Serial.println("[测试] 开始录音...");
-
-                // 分配缓冲区
-                uint8_t* audioBuffer = (uint8_t*)ps_malloc(bufferSize);
-                if (!audioBuffer) {
-                    audioBuffer = (uint8_t*)malloc(bufferSize);
-                }
-                if (!audioBuffer) {
-                    Serial.println("[测试] 内存分配失败");
-                    continue;
-                }
-
-                // 录音
-                size_t totalRead = 0;
-                unsigned long startTime = millis();
-                while (millis() - startTime < TEST_RECORD_TIME_MS && totalRead < bufferSize) {
-                    size_t bytesRead = 0;
-                    i2s_read(I2S_PORT, audioBuffer + totalRead, bufferSize - totalRead, &bytesRead, 50);
-                    totalRead += bytesRead;
-                }
-                Serial.printf("[测试] 录音完成: %d 字节\n", totalRead);
-
-                // 等待按键释放
-                while (digitalRead(0) == LOW) delay(10);
-
-                // 通过MQTT发送音频数据（分块发送）
-                if (mqtt.connected()) {
-                    // 1. 发送开始标记
-                    StaticJsonDocument<256> startDoc;
-                    startDoc["type"] = "test_record_start";
-                    startDoc["size"] = totalRead;
-                    startDoc["rate"] = SAMPLE_RATE;
-                    char startBuf[256];
-                    size_t startLen = serializeJson(startDoc, startBuf, sizeof(startBuf));
-                    mqtt.publish("blindstick/test/audio", startBuf, startLen);
-                    Serial.println("[测试] 发送开始标记");
-
-                    // 2. 分块发送音频数据
-                    int chunks = 0;
-                    for (int offset = 0; offset < totalRead; offset += TEST_AUDIO_CHUNK_SIZE) {
-                        int chunkSize = min(TEST_AUDIO_CHUNK_SIZE, (int)(totalRead - offset));
-                        char topic[64];
-                        snprintf(topic, sizeof(topic), "blindstick/test/audio/chunk/%d", chunks);
-                        mqtt.publish(topic, audioBuffer + offset, chunkSize);
-                        chunks++;
-                        delay(10); // 避免发送太快
-                    }
-                    Serial.printf("[测试] 发送完成，共%d块\n", chunks);
-
-                    // 3. 发送结束标记
-                    StaticJsonDocument<256> endDoc;
-                    endDoc["type"] = "test_record_end";
-                    endDoc["chunks"] = chunks;
-                    char endBuf[256];
-                    size_t endLen = serializeJson(endDoc, endBuf, sizeof(endBuf));
-                    mqtt.publish("blindstick/test/audio", endBuf, endLen);
-                    Serial.println("[测试] 等待后端处理...");
-                } else {
-                    Serial.println("[测试] MQTT未连接");
-                }
-
-                free(audioBuffer);
-
-                // 等待播放完成（后端会通过MQTT返回音频）
-                Serial.println("[测试] 等待播放...\n");
-            }
-        }
-        vTaskDelay(50 / portTICK_PERIOD_MS);
-    }
-}
-
-// 播放接收到的测试音频
-void handleTestAudio(const char* topic, byte* payload, unsigned int length) {
-    // 主题格式: blindstick/test/tts/chunk/N
-    if (strncmp(topic, "blindstick/test/tts/chunk/", 26) == 0) {
-        Serial.printf("[测试] 收到TTS音频块: %d字节\n", length);
-        playPcmData(payload, length);
-    }
-}
 
