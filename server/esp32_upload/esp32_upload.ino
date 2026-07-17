@@ -1844,6 +1844,15 @@ void handleTTSUrl(const char* payload, int length) {
         return;
     }
 
+    // 去重：检查是否和上次播放的URL相同
+    static String lastUrl = "";
+    String currentUrl = String(url);
+    if (currentUrl == lastUrl) {
+        Serial.println("[TTS-URL] 重复URL，跳过播放");
+        return;
+    }
+    lastUrl = currentUrl;
+
     Serial.printf("[TTS-URL] 收到URL: %s\n", url);
 
     // 暂停语音识别
