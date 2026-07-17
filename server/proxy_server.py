@@ -356,8 +356,212 @@ class MQTTAudioSender:
             self.client.publish(self.topic_control, json.dumps(msg))
             print(f"[MQTT] 发送打断信号，新优先级={new_priority}")
 
-# 全局MQTT发送器
+    def send_test_tts(self, audio_data):
+        """测试模式：发送TTS音频给ESP32"""
+        if not self.connected or not self.client:
+            print("[MQTT] 未连接，无法发送测试音频")
+            return False
+
+        try:
+            # 直接发送完整音频
+            chunk_size = 512
+            chunks = 0
+            for i in range(0, len(audio_data), chunk_size):
+                chunk = audio_data[i:i+chunk_size]
+                topic = f"blindstick/test/tts/chunk/{chunks}"
+                self.client.publish(topic, chunk)
+                chunks += 1
+                time.sleep(0.01)  # 避免发送太快
+
+            print(f"[MQTT] 测试音频发送完成，共{chunks}块")
+            return True
+        except Exception as e:
+            print(f"[MQTT] 发送测试音频失败: {e}")
+            return False
+
+
+# 全局MQTT发送器实例
 mqtt_sender = MQTTAudioSender()
+
+# 全局测试模式处理器（在启动时初始化）
+test_handler = None
+
+
+# ==================== 测试模式：录音回环处理 ====================
+
+class TestModeHandler:
+    """处理ESP32测试模式的音频接收、ASR和TTS回环"""
+
+    def __init__(self, mqtt_sender):
+        self.mqtt_sender = mqtt_sender
+        self.audio_buffer = b''
+        self.expected_size = 0
+        self.received_chunks = 0
+        self.total_chunks = 0
+        self.is_recording = False
+
+        # 启动MQTT订阅（如果可用）
+        if MQTT_AVAILABLE and mqtt_sender.client:
+            mqtt_sender.client.on_message = self._on_mqtt_message
+            mqtt_sender.client.subscribe("blindstick/test/audio")
+            mqtt_sender.client.subscribe("blindstick/test/audio/chunk/+")
+            print("[测试模式] 已订阅测试主题")
+
+    def _on_mqtt_message(self, client, userdata, msg):
+        """处理MQTT消息"""
+        topic = msg.topic
+
+        try:
+            # 控制消息（开始/结束）
+            if topic == "blindstick/test/audio":
+                data = json.loads(msg.payload)
+                msg_type = data.get('type', '')
+
+                if msg_type == 'test_record_start':
+                    self._handle_start(data)
+                elif msg_type == 'test_record_end':
+                    self._handle_end(data)
+
+            # 音频数据块
+            elif topic.startswith("blindstick/test/audio/chunk/"):
+                self._handle_chunk(msg.payload)
+
+        except Exception as e:
+            print(f"[测试模式] 处理消息失败: {e}")
+
+    def _handle_start(self, data):
+        """开始录音"""
+        self.audio_buffer = b''
+        self.expected_size = data.get('size', 0)
+        self.received_chunks = 0
+        self.total_chunks = 0
+        self.is_recording = True
+        print(f"\n[测试模式] 开始接收音频，预期大小: {self.expected_size} 字节")
+
+    def _handle_chunk(self, payload):
+        """接收音频块"""
+        if not self.is_recording:
+            return
+
+        self.audio_buffer += payload
+        self.received_chunks += 1
+        print(f"[测试模式] 接收块 #{self.received_chunks}: +{len(payload)} 字节 (总计: {len(self.audio_buffer)})")
+
+    def _handle_end(self, data):
+        """结束录音，开始处理"""
+        if not self.is_recording:
+            return
+
+        self.is_recording = False
+        self.total_chunks = data.get('chunks', 0)
+        print(f"[测试模式] 接收完成，共{self.received_chunks}块，{len(self.audio_buffer)} 字节")
+
+        # 启动处理线程
+        threading.Thread(target=self._process_audio).start()
+
+    def _process_audio(self):
+        """处理音频：ASR -> TTS -> 回传"""
+        try:
+            # 1. ASR语音识别
+            print("[测试模式] 开始ASR识别...")
+            recognized_text = self._do_asr(self.audio_buffer)
+
+            if not recognized_text:
+                print("[测试模式] ASR识别失败")
+                return
+
+            print(f"[测试模式] ASR结果: {recognized_text}")
+
+            # 2. TTS合成
+            print("[测试模式] 开始TTS合成...")
+            tts_audio = self._do_tts(f"你说的是：{recognized_text}")
+
+            if not tts_audio:
+                print("[测试模式] TTS合成失败")
+                return
+
+            print(f"[测试模式] TTS合成完成: {len(tts_audio)} 字节")
+
+            # 3. 通过MQTT发送回ESP32
+            print("[测试模式] 发送音频回ESP32...")
+            self.mqtt_sender.send_test_tts(tts_audio)
+            print("[测试模式] 处理完成！\n")
+
+        except Exception as e:
+            print(f"[测试模式] 处理失败: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _do_asr(self, pcm_data):
+        """调用百度ASR"""
+        try:
+            import base64
+
+            token = get_baidu_token()
+            if not token:
+                return None
+
+            url = "https://vop.baidu.com/server_api"
+            payload = {
+                "format": "pcm",
+                "rate": 16000,
+                "channel": 1,
+                "cuid": "blindstick_test",
+                "token": token,
+                "dev_pid": 1537,
+                "speech": base64.b64encode(pcm_data).decode('utf-8'),
+                "len": len(pcm_data)
+            }
+
+            resp = requests.post(url, json=payload, timeout=30, verify=False)
+            result = resp.json()
+
+            if result.get("err_no") == 0:
+                return result.get("result", [""])[0]
+            else:
+                print(f"[ASR] 错误: {result.get('err_msg')}")
+                return None
+
+        except Exception as e:
+            print(f"[ASR] 异常: {e}")
+            return None
+
+    def _do_tts(self, text):
+        """调用百度TTS"""
+        try:
+            token = get_baidu_token()
+            if not token:
+                return None
+
+            url = "https://tsn.baidu.com/text2audio"
+            payload = {
+                "tex": text,
+                "tok": token,
+                "cuid": "blindstick_test",
+                "ctp": 1,
+                "lan": "zh",
+                "spd": 5,
+                "pit": 5,
+                "vol": 9,
+                "per": 0,
+                "aue": 6  # WAV格式
+            }
+
+            resp = requests.post(url, data=payload, timeout=15, verify=False)
+
+            if 'audio' in resp.headers.get('Content-Type', ''):
+                return resp.content
+            else:
+                print(f"[TTS] 合成失败: {resp.text[:200]}")
+                return None
+
+        except Exception as e:
+            print(f"[TTS] 异常: {e}")
+            return None
+
+
+# 全局测试模式处理器
+test_handler = None
 
 # ==================== 公共函数 ====================
 
@@ -622,6 +826,11 @@ if __name__ == '__main__':
     mqtt_sender.connect()
     time.sleep(1)
 
+    # 启动测试模式处理器
+    if MQTT_AVAILABLE:
+        print("[启动] 启动测试模式处理器...")
+        test_handler = TestModeHandler(mqtt_sender)
+
     port = int(os.environ.get('PORT', 8090))
 
     print("=" * 50)
@@ -633,6 +842,9 @@ if __name__ == '__main__':
     print("  POST /api/tts/interrupt   - 打断当前播放")
     print("  POST /api/asr             - 语音识别")
     print("  GET  /health              - 健康检查")
+    print("=" * 50)
+    print("测试模式:")
+    print("  ESP32按BOOT键录音 -> ASR -> TTS -> MQTT返回")
     print("=" * 50)
     print(f"运行在: http://0.0.0.0:{port}")
     print("=" * 50)
