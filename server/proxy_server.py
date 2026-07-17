@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-百度API代理服务�?- 流式TTS版本
+百度API代理服务秒- 流式TTS版本
 支持边合成边通过MQTT发送音频给ESP32
 运行: python proxy_server.py
 """
@@ -57,14 +57,14 @@ def static_files(filename):
 # ==================== 百度API配置 ====================
 BAIDU_API_KEY = "Xbxnhkwb2sxtB6HbH5BUTlUG"
 BAIDU_SECRET_KEY = "Tw485P2BFGpPu8WeOVP6hy4S1BHqG4ON"
-BAIDU_TTS_PER = "4146"  # 发音�?
+BAIDU_TTS_PER = "4146"  # 发音秒
 cached_token = {
     "access_token": None,
     "expires_at": 0
 }
 
 def get_baidu_token():
-    """获取百度Access Token（带缓存�?""
+    """获取百度Access Token（带缓存秒""
     if cached_token["access_token"] and time.time() < cached_token["expires_at"] - 300:
         return cached_token["access_token"]
 
@@ -82,35 +82,37 @@ def get_baidu_token():
         if "access_token" in data:
             cached_token["access_token"] = data["access_token"]
             cached_token["expires_at"] = time.time() + data.get("expires_in", 2592000)
-            print(f"[Token] 获取成功，有效期{data.get('expires_in')}�?)
+            print(f"[Token] 获取成功，有效期{data.get('expires_in')}秒")
             return data["access_token"]
     except Exception as e:
         print(f"[Token] 获取失败: {e}")
 
     return None
 
-# ==================== 流式TTS管理�?====================
+# ==================== 流式TTS管理器 ====================
 class StreamingTTSManager:
     """
-    流式TTS管理�?    - 维护与百度TTS的WebSocket连接
-    - 边合成边通过回调发送音频数�?    - 支持高优先级打断
+    流式TTS管理器
+    - 维护与百度TTS的WebSocket连接
+    - 边合成边通过回调发送音频数据
+    - 支持高优先级打断
     """
     def __init__(self):
         self.current_task = None
         self.session_id = None
         self.is_synthesizing = False
         self.audio_queue = queue.Queue()
-        self.priority = 0  # 0=�?导航), 1=�?雷达告警)
+        self.priority = 0  # 0=低(导航), 1=中(对话), 2=高(雷达告警)
         self.lock = threading.Lock()
 
     def get_priority_name(self, p):
-        return "�?雷达)" if p == 2 else "�?对话)" if p == 1 else "�?导航)"
+        return "秒雷达)" if p == 2 else "秒对话)" if p == 1 else "秒导航)"
 
     async def synthesize_streaming(self, text, priority=0, on_audio_chunk=None, on_complete=None):
         """
         流式合成语音
         :param text: 要合成的文本
-        :param priority: 优先�?0=�?导航) 1=�?对话) 2=�?雷达告警)
+        :param priority: 优先秒0=秒导航) 1=秒对话) 2=秒雷达告警)
         :param on_audio_chunk: 回调函数(chunk_data, is_last)
         :param on_complete: 完成回调(success, error_msg)
         """
@@ -119,11 +121,11 @@ class StreamingTTSManager:
             if self.is_synthesizing:
                 if priority >= self.priority:
                     print(f"[TTS] 打断当前{self.get_priority_name(self.priority)}优先级，开始{self.get_priority_name(priority)}")
-                    # 标记打断，让当前任务退�?                    self.current_task = None
+                    # 标记打断，让当前任务退秒                    self.current_task = None
                 else:
                     print(f"[TTS] 低优先级{self.get_priority_name(priority)}被忽略，当前正在播放{self.get_priority_name(self.priority)}")
                     if on_complete:
-                        on_complete(False, "被高优先级打�?)
+                        on_complete(False, "被高优先级打秒)
                     return
 
             self.current_task = threading.current_thread().ident
@@ -145,7 +147,7 @@ class StreamingTTSManager:
             async with websockets.connect(ws_url) as ws:
                 my_task = self.current_task
 
-                # 1. 发送开始合成请�?                start_msg = {
+                # 1. 发送开始合成请秒                start_msg = {
                     "type": "system.start",
                     "payload": {
                         "spd": 5,
@@ -157,15 +159,15 @@ class StreamingTTSManager:
                 }
                 await ws.send(json.dumps(start_msg))
 
-                # 等待开始响�?                response = await ws.recv()
+                # 等待开始响秒                response = await ws.recv()
                 resp_data = json.loads(response)
                 if resp_data.get("code", -1) != 0:
-                    raise Exception(f"开始合成失�? {resp_data.get('message')}")
+                    raise Exception(f"开始合成失秒 {resp_data.get('message')}")
 
                 self.session_id = resp_data.get("headers", {}).get("session_id")
-                print(f"[TTS] 开始合�? '{text[:30]}...' 优先�?{self.get_priority_name(priority)} session={self.session_id}")
+                print(f"[TTS] 开始合秒 '{text[:30]}...' 优先秒{self.get_priority_name(priority)} session={self.session_id}")
 
-                # 2. 发送文�?                text_msg = {
+                # 2. 发送文秒                text_msg = {
                     "type": "text",
                     "payload": {"text": text}
                 }
@@ -179,10 +181,10 @@ class StreamingTTSManager:
                     # 检查是否被打断
                     with self.lock:
                         if self.current_task != my_task:
-                            print(f"[TTS] 合成被打断，退�?)
+                            print(f"[TTS] 合成被打断，退秒)
                             await ws.close()
                             if on_complete:
-                                on_complete(False, "被打�?)
+                                on_complete(False, "被打秒)
                             return
 
                     try:
@@ -192,7 +194,7 @@ class StreamingTTSManager:
                         break
 
                     if isinstance(data, bytes):
-                        # 音频数据�?                        chunk_count += 1
+                        # 音频数据秒                        chunk_count += 1
                         total_bytes += len(data)
                         if on_audio_chunk:
                             on_audio_chunk(data, False)
@@ -214,9 +216,9 @@ class StreamingTTSManager:
                         except:
                             pass
 
-                # 4. 发送结束请�?                try:
+                # 4. 发送结束请秒                try:
                     await ws.send(json.dumps({"type": "system.finish"}))
-                    # 等待最终响�?                    final_resp = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                    # 等待最终响秒                    final_resp = await asyncio.wait_for(ws.recv(), timeout=5.0)
                     final_data = json.loads(final_resp)
                     if final_data.get("code", -1) != 0:
                         print(f"[TTS] 结束响应错误: {final_data}")
@@ -239,9 +241,9 @@ class StreamingTTSManager:
             if on_complete:
                 on_complete(False, str(e))
 
-# 全局TTS管理�?tts_manager = StreamingTTSManager()
+# 全局TTS管理秒tts_manager = StreamingTTSManager()
 
-# ==================== MQTT客户端（用于发送音频给ESP32�?===================
+# ==================== MQTT客户端（用于发送音频给ESP32秒===================
 try:
     import paho.mqtt.client as mqtt
     MQTT_AVAILABLE = True
@@ -275,7 +277,7 @@ class MQTTAudioSender:
                 if rc == 0:
                     self.connected = True
                     print(f"[MQTT] 已连接到 {self.broker}")
-                    # 连接成功后订阅测试主�?                    global test_handler
+                    # 连接成功后订阅测试主秒                    global test_handler
                     if test_handler:
                         test_handler.subscribe_topics()
                 else:
@@ -298,48 +300,48 @@ class MQTTAudioSender:
     def send_audio_stream(self, audio_chunks, priority=0, session_id=None):
         """
         发送音频流给ESP32
-        :param audio_chunks: 音频数据块列表或生成�?        :param priority: 优先�?        :param session_id: 会话ID
+        :param audio_chunks: 音频数据块列表或生成秒        :param priority: 优先秒        :param session_id: 会话ID
         """
         if not self.connected or not self.client:
-            print("[MQTT] 未连接，无法发送音�?)
+            print("[MQTT] 未连接，无法发送音秒)
             return False
 
         try:
-            # 发送开始标�?            control_msg = {
+            # 发送开始标秒            control_msg = {
                 "type": "stream_start",
                 "priority": priority,
                 "session_id": session_id or f"tts_{int(time.time())}",
                 "format": "pcm_16k"  # PCM 16kHz 16bit
             }
             self.client.publish(self.topic_control, json.dumps(control_msg))
-            print(f"[MQTT] 发�?stream_start 优先�?{priority}")
+            print(f"[MQTT] 发秒stream_start 优先秒{priority}")
 
-            # 发送音频分�?            segment_idx = 0
+            # 发送音频分秒            segment_idx = 0
             for chunk in audio_chunks:
                 if not chunk:
                     break
 
-                # 将大块分成小段发�?                for i in range(0, len(chunk), self.segment_size):
+                # 将大块分成小段发秒                for i in range(0, len(chunk), self.segment_size):
                     segment = chunk[i:i+self.segment_size]
                     topic = f"{self.topic_audio}/{segment_idx}"
                     self.client.publish(topic, segment)
                     segment_idx += 1
 
-            # 发送结束标�?            control_msg = {
+            # 发送结束标秒            control_msg = {
                 "type": "stream_end",
                 "segments": segment_idx,
                 "session_id": session_id
             }
             self.client.publish(self.topic_control, json.dumps(control_msg))
-            print(f"[MQTT] 发�?stream_end，共{segment_idx}�?)
+            print(f"[MQTT] 发秒stream_end，共{segment_idx}秒)
             return True
 
         except Exception as e:
-            print(f"[MQTT] 发送音频失�? {e}")
+            print(f"[MQTT] 发送音频失秒 {e}")
             return False
 
     def send_interrupt(self, new_priority):
-        """发送打断信�?""
+        """发送打断信秒""
         if self.connected and self.client:
             msg = {
                 "type": "interrupt",
@@ -358,7 +360,7 @@ mqtt_sender = MQTTAudioSender()
 test_handler = None
 
 
-# ==================== 测试模式：录音回环处�?====================
+# ==================== 测试模式：录音回环处秒====================
 
 class TestModeHandler:
     """处理ESP32测试模式的音频接收、ASR和TTS回环"""
@@ -372,9 +374,9 @@ class TestModeHandler:
         self.is_recording = False
         self.subscribed = False
 
-        # 延迟订阅，等待连接成�?        if MQTT_AVAILABLE and mqtt_sender.client:
+        # 延迟订阅，等待连接成秒        if MQTT_AVAILABLE and mqtt_sender.client:
             mqtt_sender.client.on_message = self._on_mqtt_message
-            # 订阅会在on_connect中执�?            print("[测试模式] 处理器已初始化，等待MQTT连接...")
+            # 订阅会在on_connect中执秒            print("[测试模式] 处理器已初始化，等待MQTT连接...")
 
     def subscribe_topics(self):
         """订阅测试主题（在MQTT连接成功后调用）"""
@@ -383,7 +385,7 @@ class TestModeHandler:
                 self.mqtt_sender.client.subscribe("blindstick/test/audio")
                 self.mqtt_sender.client.subscribe("blindstick/test/audio/chunk/+")
                 self.subscribed = True
-                print("[测试模式] 已订阅测试主�?)
+                print("[测试模式] 已订阅测试主秒)
             except Exception as e:
                 print(f"[测试模式] 订阅失败: {e}")
 
@@ -395,7 +397,7 @@ class TestModeHandler:
         print(f"[MQTT调试] 收到消息: {topic}, 长度: {len(msg.payload)}")
 
         try:
-            # 控制消息（开�?结束�?            if topic == "blindstick/test/audio":
+            # 控制消息（开秒结束秒            if topic == "blindstick/test/audio":
                 print(f"[测试模式] 收到控制消息: {msg.payload}")
                 data = json.loads(msg.payload)
                 msg_type = data.get('type', '')
@@ -405,7 +407,7 @@ class TestModeHandler:
                 elif msg_type == 'test_record_end':
                     self._handle_end(data)
 
-            # 音频数据�?            elif topic.startswith("blindstick/test/audio/chunk/"):
+            # 音频数据秒            elif topic.startswith("blindstick/test/audio/chunk/"):
                 self._handle_chunk(msg.payload)
 
         except Exception as e:
@@ -414,7 +416,7 @@ class TestModeHandler:
             traceback.print_exc()
 
     def _handle_start(self, data):
-        """开始录�?""
+        """开始录秒""
         self.audio_buffer = b''
         self.expected_size = data.get('size', 0)
         self.received_chunks = 0
@@ -423,16 +425,16 @@ class TestModeHandler:
         print(f"\n[测试模式] 开始接收音频，预期大小: {self.expected_size} 字节")
 
     def _handle_chunk(self, payload):
-        """接收音频�?""
+        """接收音频秒""
         if not self.is_recording:
             return
 
         self.audio_buffer += payload
         self.received_chunks += 1
-        print(f"[测试模式] 接收�?#{self.received_chunks}: +{len(payload)} 字节 (总计: {len(self.audio_buffer)})")
+        print(f"[测试模式] 接收秒#{self.received_chunks}: +{len(payload)} 字节 (总计: {len(self.audio_buffer)})")
 
     def _handle_end(self, data):
-        """结束录音，开始处�?""
+        """结束录音，开始处秒""
         if not self.is_recording:
             return
 
@@ -544,7 +546,7 @@ class TestModeHandler:
             return None
 
 
-# 全局测试模式处理�?test_handler = None
+# 全局测试模式处理秒test_handler = None
 
 # ==================== 公共函数 ====================
 
@@ -552,8 +554,8 @@ def run_tts_synthesis(text, priority, on_chunk_callback, on_complete_callback):
     """
     运行TTS流式合成（公共函数）
     :param text: 要合成的文本
-    :param priority: 优先�?    :param on_chunk_callback: 音频块回调函�?    :param on_complete_callback: 完成回调函数 (success, error)
-    :return: 启动的线程对�?    """
+    :param priority: 优先秒    :param on_chunk_callback: 音频块回调函秒    :param on_complete_callback: 完成回调函数 (success, error)
+    :return: 启动的线程对秒    """
     def run_tts():
         asyncio.run(tts_manager.synthesize_streaming(
             text, priority, on_chunk_callback, on_complete_callback
@@ -580,7 +582,7 @@ def tts_stream():
         if not text:
             return jsonify({"error": "缺少text参数"}), 400
 
-        print(f"[API] 流式TTS: '{text[:30]}...' 优先�?{priority}")
+        print(f"[API] 流式TTS: '{text[:30]}...' 优先秒{priority}")
 
         audio_buffer = []
         audio_ready = threading.Event()
@@ -607,7 +609,7 @@ def tts_stream():
 @app.route('/api/tts/push', methods=['POST'])
 def tts_push():
     """
-    推送TTS到ESP32播放（流式合�?+ MQTT推送）
+    推送TTS到ESP32播放（流式合秒+ MQTT推送）
     请求: {"text": "要合成的文本", "priority": 0}
     """
     try:
@@ -618,13 +620,13 @@ def tts_push():
         if not text:
             return jsonify({"error": "缺少text参数"}), 400
 
-        print(f"[API] 推送TTS: '{text[:30]}...' 优先�?{priority}")
+        print(f"[API] 推送TTS: '{text[:30]}...' 优先秒{priority}")
 
-        # 确保MQTT已连�?        if not mqtt_sender.connected:
+        # 确保MQTT已连秒        if not mqtt_sender.connected:
             mqtt_sender.connect()
             time.sleep(0.5)
 
-        # 同步方式直接调用百度短文本TTS（更稳定�?        token = get_baidu_token()
+        # 同步方式直接调用百度短文本TTS（更稳定秒        token = get_baidu_token()
         if not token:
             return jsonify({"error": "无法获取Token"}), 500
 
@@ -720,7 +722,7 @@ def serve_audio(filename):
 
 @app.route('/api/tts', methods=['POST'])
 def text_to_speech():
-    """兼容旧版短文本合成接口（改为流式实现�?""
+    """兼容旧版短文本合成接口（改为流式实现秒""
     return tts_stream()
 
 
@@ -770,7 +772,7 @@ def speech_to_text():
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """健康检�?""
+    """健康检秒""
     return jsonify({
         "status": "ok",
         "mqtt_connected": mqtt_sender.connected,
@@ -786,7 +788,7 @@ def _load_config():
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     except Exception:
-        return {"home_city": "黄石�?}
+        return {"home_city": "黄石秒}
 
 def _save_config(data):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
@@ -796,7 +798,7 @@ def _save_config(data):
 def get_config():
     try:
         cfg = _load_config()
-        return jsonify({"status": "ok", "home_city": cfg.get("home_city", "黄石�?)})
+        return jsonify({"status": "ok", "home_city": cfg.get("home_city", "黄石秒)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -808,15 +810,15 @@ def set_config():
         if "home_city" in data:
             cfg["home_city"] = data["home_city"]
         _save_config(cfg)
-        print(f"[配置] 已保�? home_city={cfg['home_city']}")
-        return jsonify({"status": "ok", "message": "配置已保�?, "home_city": cfg["home_city"]})
+        print(f"[配置] 已保秒 home_city={cfg['home_city']}")
+        return jsonify({"status": "ok", "message": "配置已保秒, "home_city": cfg["home_city"]})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/navigation/stop', methods=['POST'])
 def stop_navigation():
     print("[导航] 收到停止导航请求")
-    return jsonify({"status": "ok", "message": "导航已停�?})
+    return jsonify({"status": "ok", "message": "导航已停秒})
 
 @app.route('/api/nav_steps', methods=['GET', 'POST'])
 def get_nav_steps():
@@ -824,10 +826,10 @@ def get_nav_steps():
     return jsonify({
         "status": "ok",
         "steps": [
-            "前方直行100�?,
-            "左转进入主干�?,
-            "继续直行200�?,
-            "右转到达目的�?
+            "前方直行100秒,
+            "左转进入主干秒,
+            "继续直行200秒,
+            "右转到达目的秒
         ]
     })
 
@@ -842,26 +844,26 @@ if __name__ == '__main__':
     mqtt_sender.connect()
     time.sleep(1)
 
-    # 启动测试模式处理�?    if MQTT_AVAILABLE:
-        print("[启动] 启动测试模式处理�?..")
+    # 启动测试模式处理秒    if MQTT_AVAILABLE:
+        print("[启动] 启动测试模式处理秒..")
         test_handler = TestModeHandler(mqtt_sender)
 
     port = int(os.environ.get('PORT', 8090))
 
     print("=" * 50)
-    print("百度API代理服务�?- 流式TTS版本")
+    print("百度API代理服务秒- 流式TTS版本")
     print("=" * 50)
     print("API接口:")
     print("  POST /api/tts/stream      - 流式TTS（返回音频）")
     print("  POST /api/tts/push        - 推送TTS到ESP32")
     print("  POST /api/tts/interrupt   - 打断当前播放")
     print("  POST /api/asr             - 语音识别")
-    print("  GET  /health              - 健康检�?)
+    print("  GET  /health              - 健康检秒)
     print("=" * 50)
     print("测试模式:")
-    print("  ESP32按BOOT键录�?-> ASR -> TTS -> MQTT返回")
+    print("  ESP32按BOOT键录秒-> ASR -> TTS -> MQTT返回")
     print("=" * 50)
-    print(f"运行�? http://0.0.0.0:{port}")
+    print(f"运行秒 http://0.0.0.0:{port}")
     print("=" * 50)
 
     app.run(host='0.0.0.0', port=port, debug=False)

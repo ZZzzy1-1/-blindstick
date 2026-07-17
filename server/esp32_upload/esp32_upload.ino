@@ -158,6 +158,7 @@ void VoiceRecognitionTask(void* pvParameters);
 volatile bool asrConnected = false;
 volatile bool asrFinished = false;
 String asrResult = "";
+WebSocketsClient webSocket;  // WebSocket客户端（用于流式语音识别）
 
 #define ASR_CHUNK_SIZE 5120  // 160ms PCM数据 @ 16kHz 16bit
 
