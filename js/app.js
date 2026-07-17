@@ -298,116 +298,19 @@ async function announceNavigation(text) {
     await streamTTS(text, TTS_PRIORITY.LOW);
 }
 
-// --- 处理语音导航（接收ESP32录音，识别，规划，发送TTS音频回ESP32播放）---
+// --- 处理语音导航（简化版 - 调用改进版）---
 async function handleVoiceNavigation(pcmBytes) {
     console.log('[语音] 收到PCM数据', pcmBytes.length, '字节');
-    console.log('语音', '正在识别...');
 
-    // 1. 语音识别
+    // 语音识别
     const text = await baiduASR(pcmBytes);
     if (!text) {
-        console.log('[语音] 识别失败');
-        await baiduTTS('语音识别失败，请重新说出目的地');
-        return;
-    }
-    console.log('[语音] 识别结果:', text);
-    console.log('语音', `识别: ${text}`);
-
-    // 2. 提取目的地
-    const destination = extractDestinationAdvanced(text);
-    if (!destination) {
-        console.log('[语音] 未提取到有效目的地');
-        await baiduTTS('请说出具体地点，例如带我去天安门');
-        return;
-    }
-    console.log('[语音] 目的地:', destination);
-    console.log('导航', `目的地: ${destination}`);
-
-    // 3. 规划到最近的目的地（带10公里限制）
-    const currentPos = AppState.lastGpsPos;
-    const route = await planRouteToNearest(destination, currentPos?.lat, currentPos?.lng);
-
-    if (!route) {
-        console.log('[语音] 路线规划失败');
-        await baiduTTS('抱歉，没有找到该地点的路线');
+        await streamTTS('语音识别失败，请重新说出目的地', TTS_PRIORITY.NORMAL);
         return;
     }
 
-    // 4. 检查距离是否超过10公里
-    if (route.tooFar) {
-        console.log('[语音]', route.message);
-        await baiduTTS(route.message + '，请重新选择较近的地点');
-        console.log('导航', route.message);
-        return;
-    }
-
-    // 5. 发送导航路线给ESP32
-    const navMsg = {
-        status: 'ok',
-        destination: route.destination,
-        steps: route.steps,
-        distance: route.distance,
-        duration: route.duration,
-        ts: Date.now()
-    };
-
-    if (mqttClient && AppState.mqttConnected) {
-        mqttClient.publish(MQTT_CONFIG.topics.navSteps, JSON.stringify(navMsg));
-        console.log('[语音] 导航路线已发送:', route.steps.length, '步');
-        console.log('导航', `开始导航到 ${route.destination}，共${route.steps.length}步，${Math.round(route.distance)}米`);
-    }
-
-    // 6. 合成TTS音频并发送给ESP32播放
-    const firstStep = route.steps[0] || '开始导航';
-    const ttsText = `开始导航到${route.destination}，全程${Math.round(route.distance)}米，预计${Math.round(route.duration / 60)}分钟，${firstStep}`;
-
-    // 通过代理服务器合成TTS
-    const ttsAudio = await baiduTTSWeb(ttsText);
-    if (ttsAudio && mqttClient && AppState.mqttConnected) {
-        // 【调试】强制分段发送，测试是否是大消息问题
-        const FORCE_SEGMENT = true;  // 设为 true 强制分段
-        const MAX_MQTT_SIZE = 30000; // 每段30KB，更安全
-
-        console.log('[语音] TTS音频大小:', ttsAudio.length, '字节');
-
-        // 如果音频太大或强制分段
-        if (ttsAudio.length > MAX_MQTT_SIZE || FORCE_SEGMENT) {
-            const segments = Math.ceil(ttsAudio.length / MAX_MQTT_SIZE);
-            console.log('[语音] 分段发送:', segments, '段, 每段最大', MAX_MQTT_SIZE, '字节');
-
-            // 发送段数通知
-            mqttClient.publish('blindstick/tts/segments', JSON.stringify({
-                segments: segments,
-                totalSize: ttsAudio.length
-            }), { qos: 1 });
-
-            // 分段发送
-            for (let i = 0; i < segments; i++) {
-                const start = i * MAX_MQTT_SIZE;
-                const end = Math.min(start + MAX_MQTT_SIZE, ttsAudio.length);
-                const segment = ttsAudio.slice(start, end);
-                const topic = `blindstick/tts/pcm/${i}`;
-
-                await new Promise((resolve) => {
-                    mqttClient.publish(topic, segment, { qos: 1 }, (err) => {
-                        if (err) console.error(`[语音] 第${i+1}段发送失败:`, err);
-                        else console.log(`[语音] 第${i+1}/${segments}段发送成功`);
-                        resolve();
-                    });
-                });
-                await new Promise(r => setTimeout(r, 150)); // 增加延迟
-            }
-        } else {
-            // 小音频直接发送
-            mqttClient.publish(MQTT_CONFIG.topics.ttsAudio, ttsAudio, { qos: 1 });
-            console.log('[语音] TTS音频已发送给ESP32:', ttsAudio.length, '字节');
-        }
-    } else {
-        console.error('[语音] 无法发送TTS音频: mqttClient=', !!mqttClient, 'connected=', AppState.mqttConnected);
-    }
-
-    updateNavigationSteps(navMsg);
-    addNavHistory(route.destination, route.steps);
+    // 调用改进版处理函数
+    await handleVoiceNavigationAdvanced(text);
 }
 
 // ================= MQTT 配置 =================
@@ -632,66 +535,9 @@ async function handleMqttMessage(topic, payload) {
                 console.log('[TTS-MQTT] 收到TTS请求:', msg.text);
 
                 if (msg.type === 'tts_request' && msg.text) {
-                    // ESP32无法连接百度，网页端代为合成
-                    const ttsAudio = await baiduTTSWeb(msg.text);
-                    console.log('[TTS-MQTT] TTS音频类型:', typeof ttsAudio, '长度:', ttsAudio?.length, '字节数:', ttsAudio?.byteLength);
-                    if (ttsAudio && mqttClient) {
-                        // 如果音频太大，分段发送（ESP32缓冲区64KB）
-                        const MAX_MQTT_SIZE = 60000; // 60KB每段，留有余量
-                        const audioLen = ttsAudio.length || ttsAudio.byteLength || 0;
-                        console.log('[TTS-MQTT] 检查分段条件:', audioLen, '>', MAX_MQTT_SIZE, '=', audioLen > MAX_MQTT_SIZE);
-                        if (audioLen > MAX_MQTT_SIZE) {
-                            console.log('[TTS-MQTT] 音频太大，分段发送:', ttsAudio.length, '字节');
-                            const segments = Math.ceil(ttsAudio.length / MAX_MQTT_SIZE);
-
-                            // 发送段数通知
-                            await new Promise((resolve) => {
-                                mqttClient.publish('blindstick/tts/segments', JSON.stringify({
-                                    segments: segments,
-                                    totalSize: ttsAudio.length
-                                }), { qos: 1 }, (err) => {
-                                    if (err) console.error('[TTS-MQTT] segments发送失败:', err);
-                                    else console.log('[TTS-MQTT] segments通知已发送');
-                                    resolve();
-                                });
-                            });
-
-                            // 分段发送
-                            for (let i = 0; i < segments; i++) {
-                                const start = i * MAX_MQTT_SIZE;
-                                const end = Math.min(start + MAX_MQTT_SIZE, ttsAudio.length);
-                                const segment = ttsAudio.slice(start, end);
-                                const topic = `blindstick/tts/pcm/${i}`;
-                                await new Promise((resolve) => {
-                                    mqttClient.publish(topic, segment, { qos: 1 }, (err) => {
-                                        if (err) console.error(`[TTS-MQTT] 第${i+1}段发送失败:`, err);
-                                        else console.log(`[TTS-MQTT] 第${i+1}/${segments}段发送成功`);
-                                        resolve();
-                                    });
-                                });
-                                console.log(`[TTS-MQTT] 发送第${i + 1}/${segments}段: ${segment.length}字节到${topic}`);
-                                await new Promise(r => setTimeout(r, 100)); // 避免过快
-                            }
-                        } else {
-                            // 小音频直接发送 - 明确指定为二进制
-                            console.log('[TTS-MQTT] 准备发送音频...');
-                            console.log('[TTS-MQTT] 音频类型:', ttsAudio.constructor.name);
-                            console.log('[TTS-MQTT] 音频长度:', ttsAudio.length);
-                            console.log('[TTS-MQTT] 前4字节:', ttsAudio[0], ttsAudio[1], ttsAudio[2], ttsAudio[3], '(应该是 82,73,70,70 = RIFF)');
-
-                            mqttClient.publish(MQTT_CONFIG.topics.ttsAudio, ttsAudio, { qos: 1 }, (err) => {
-                                if (err) {
-                                    console.error('[TTS-MQTT] 发送失败:', err);
-                                } else {
-                                    console.log('[TTS-MQTT] 发送成功确认');
-                                }
-                            });
-                            console.log('[TTS-MQTT] 已发送TTS音频:', ttsAudio.length, '字节');
-                        }
-                        console.log('[语音播报]', msg.text);
-                    } else {
-                        console.error('[TTS-MQTT] TTS合成失败');
-                    }
+                    // ESP32无法连接百度，使用流式TTS推送给ESP32
+                    const priority = msg.priority || TTS_PRIORITY.NORMAL;
+                    await streamTTS(msg.text, priority);
                 } else {
                     // 障碍物告警或其他TTS请求 - 只记录日志，ESP32会自己播放
                     console.log('[TTS请求] 记录:', msg.text);

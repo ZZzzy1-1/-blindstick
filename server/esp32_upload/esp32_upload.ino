@@ -156,12 +156,6 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length);
 String doRESTASR();  // REST API备选方案
 String base64Encode(const uint8_t* data, size_t len);  // Base64编码
 
-// TTS音频分段接收
-volatile int tts_segments_expected = 0;
-volatile int tts_segments_received = 0;
-volatile int tts_total_size = 0;
-volatile int tts_received_size = 0;
-
 // 流式语音识别全局变量
 WebSocketsClient webSocket;
 volatile bool asrConnected = false;
@@ -876,19 +870,15 @@ void mqtt_reconnect() {
 
         if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
             Serial.println("[MQTT] 已连接！");
-            mqtt.subscribe(MQTT_TOPIC_TTS_AUDIO);
-            mqtt.subscribe("blindstick/tts/segments");
-            mqtt.subscribe("blindstick/tts/pcm/+");  // 使用通配符订阅所有分段
+            mqtt.subscribe(MQTT_TOPIC_TTS_AUDIO);       // 完整音频（备用）
             mqtt.subscribe("blindstick/tts/control");   // 流式TTS控制
             mqtt.subscribe("blindstick/tts/stream/+");  // 流式TTS音频
             mqtt.subscribe(MQTT_TOPIC_NAV_STEPS);
             mqtt.subscribe(MQTT_TOPIC_TTS_REQ);
             Serial.printf("[MQTT] 已订阅主题:\n");
-            Serial.printf("  - %s (TTS音频-旧版)\n", MQTT_TOPIC_TTS_AUDIO);
-            Serial.printf("  - blindstick/tts/control (流式TTS控制-新版)\n");
-            Serial.printf("  - blindstick/tts/stream/+ (流式TTS音频-新版)\n");
-            Serial.printf("  - blindstick/tts/segments (分段通知)\n");
-            Serial.printf("  - blindstick/tts/pcm/+ (分段音频)\n");
+            Serial.printf("  - %s (完整音频-备用)\n", MQTT_TOPIC_TTS_AUDIO);
+            Serial.printf("  - blindstick/tts/control (流式TTS控制)\n");
+            Serial.printf("  - blindstick/tts/stream/+ (流式TTS音频)\n");
             Serial.printf("  - %s (导航步骤)\n", MQTT_TOPIC_NAV_STEPS);
             Serial.printf("  - %s (TTS请求)\n", MQTT_TOPIC_TTS_REQ);
             retryCount = 0;
@@ -1001,76 +991,6 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
                 Serial.println("[TTS] 队列已满，无法入队");
                 free(audio_buf);
             }
-        }
-
-    } else if (strncmp(topic, "blindstick/tts/segments", 23) == 0) {
-        // 收到分段音频通知
-        StaticJsonDocument<256> doc;
-        DeserializationError err = deserializeJson(doc, payload, length);
-        if (!err) {
-            tts_segments_expected = doc["segments"] | 0;
-            tts_total_size = doc["totalSize"] | 0;
-            tts_segments_received = 0;
-            tts_received_size = 0;
-            tts_rx_len = 0;
-            Serial.printf("[TTS-分段] 准备接收%d段音频，总大小%d字节\n", tts_segments_expected, tts_total_size);
-        }
-
-    } else if (strncmp(topic, "blindstick/tts/pcm/", 19) == 0) {
-        // 收到音频分段
-        int seg_idx = atoi(topic + 19);
-        Serial.printf("[TTS-分段] 收到第%d段: %d字节，当前缓存%d/%d字节\n",
-                     seg_idx, length, tts_rx_len, TTS_AUDIO_BUF_SIZE);
-
-        if (tts_rx_len + length < TTS_AUDIO_BUF_SIZE) {
-            // 使用互斥锁保护缓冲区
-            if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                memcpy((void*)(tts_rx_buf + tts_rx_len), payload, length);
-                tts_rx_len += length;
-                tts_segments_received++;
-                tts_received_size += length;
-                xSemaphoreGive(audioMutex);
-
-                Serial.printf("[TTS-分段] 已接收%d/%d段，累计%d字节\n",
-                             tts_segments_received, tts_segments_expected, tts_rx_len);
-
-                // 如果收齐所有段，将完整音频入队
-                if (tts_segments_received >= tts_segments_expected && tts_segments_expected > 0) {
-                    Serial.printf("[TTS-分段] 收齐所有段，将%d字节音频入队\n", tts_rx_len);
-
-                    // 暂停语音识别
-                    if (VoiceTaskHandle != NULL) {
-                        vTaskSuspend(VoiceTaskHandle);
-                        webSocket.disconnect();
-                        Serial.println("[TTS] 语音识别已暂停");
-                    }
-
-                    // 分配新缓冲区复制完整音频
-                    uint8_t* audio_buf = (uint8_t*)allocateBuffer(tts_rx_len);
-                    if (audio_buf != NULL) {
-                        memcpy(audio_buf, (const void*)tts_rx_buf, tts_rx_len);
-
-                        if (play_tts_audio(audio_buf, tts_rx_len, TTS_PRIORITY_HIGH)) {
-                            Serial.println("[TTS] 分段音频已入队");
-                        } else {
-                            Serial.println("[TTS] 队列已满，丢弃音频");
-                            free(audio_buf);
-                        }
-                    } else {
-                        Serial.println("[TTS] 内存分配失败");
-                    }
-
-                    // 重置接收状态
-                    tts_segments_expected = 0;
-                    tts_segments_received = 0;
-                    tts_rx_len = 0;
-                }
-            } else {
-                Serial.println("[TTS-分段] 获取互斥锁失败");
-            }
-        } else {
-            Serial.printf("[TTS-分段] 缓冲区溢出！当前%d + 新%d = %d > %d\n",
-                         tts_rx_len, length, tts_rx_len + length, TTS_AUDIO_BUF_SIZE);
         }
 
     } else if (strcmp(topic, MQTT_TOPIC_NAV_STEPS) == 0) {

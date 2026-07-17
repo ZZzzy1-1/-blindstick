@@ -359,14 +359,34 @@ class MQTTAudioSender:
 # 全局MQTT发送器
 mqtt_sender = MQTTAudioSender()
 
+# ==================== 公共函数 ====================
+
+def run_tts_synthesis(text, priority, on_chunk_callback, on_complete_callback):
+    """
+    运行TTS流式合成（公共函数）
+    :param text: 要合成的文本
+    :param priority: 优先级
+    :param on_chunk_callback: 音频块回调函数
+    :param on_complete_callback: 完成回调函数 (success, error)
+    :return: 启动的线程对象
+    """
+    def run_tts():
+        asyncio.run(tts_manager.synthesize_streaming(
+            text, priority, on_chunk_callback, on_complete_callback
+        ))
+
+    tts_thread = threading.Thread(target=run_tts)
+    tts_thread.start()
+    return tts_thread
+
+
 # ==================== API接口 ====================
 
 @app.route('/api/tts/stream', methods=['POST'])
 def tts_stream():
     """
-    流式TTS接口
+    流式TTS接口 - 返回音频数据
     请求: {"text": "要合成的文本", "priority": 0}
-    priority: 0=低(导航), 1=中(对话), 2=高(雷达告警)
     """
     try:
         data = request.get_json(force=True, silent=True) or {}
@@ -376,37 +396,24 @@ def tts_stream():
         if not text:
             return jsonify({"error": "缺少text参数"}), 400
 
-        print(f"[API] 流式TTS请求: '{text[:30]}...' 优先级={priority}")
+        print(f"[API] 流式TTS: '{text[:30]}...' 优先级={priority}")
 
-        # 收集音频数据（用于返回给前端）
         audio_buffer = []
         audio_ready = threading.Event()
 
-        def on_audio_chunk(chunk, is_last):
+        def on_chunk(chunk, is_last):
             if not is_last and chunk:
                 audio_buffer.append(chunk)
 
         def on_complete(success, error):
             audio_ready.set()
 
-        # 启动流式合成（异步）
-        def run_tts():
-            asyncio.run(tts_manager.synthesize_streaming(
-                text, priority, on_audio_chunk, on_complete
-            ))
-
-        tts_thread = threading.Thread(target=run_tts)
-        tts_thread.start()
-
-        # 等待完成（最多30秒）
+        run_tts_synthesis(text, priority, on_chunk, on_complete)
         audio_ready.wait(timeout=30)
 
-        # 合并音频数据返回
         if audio_buffer:
-            full_audio = b''.join(audio_buffer)
-            return Response(full_audio, mimetype='audio/pcm')
-        else:
-            return jsonify({"error": "合成失败或无音频数据"}), 500
+            return Response(b''.join(audio_buffer), mimetype='audio/pcm')
+        return jsonify({"error": "合成失败"}), 500
 
     except Exception as e:
         print(f"[TTS Stream] 异常: {e}")
@@ -427,19 +434,18 @@ def tts_push():
         if not text:
             return jsonify({"error": "缺少text参数"}), 400
 
-        print(f"[API] 推送TTS到ESP32: '{text[:30]}...' 优先级={priority}")
+        print(f"[API] 推送TTS: '{text[:30]}...' 优先级={priority}")
 
         # 确保MQTT已连接
         if not mqtt_sender.connected:
             mqtt_sender.connect()
-            time.sleep(0.5)  # 等待连接
+            time.sleep(0.5)
 
-        # 收集音频数据
         audio_chunks = []
         completed = threading.Event()
         success = [False]
 
-        def on_audio_chunk(chunk, is_last):
+        def on_chunk(chunk, is_last):
             if not is_last and chunk:
                 audio_chunks.append(chunk)
 
@@ -447,28 +453,19 @@ def tts_push():
             success[0] = ok
             completed.set()
 
-        # 启动流式合成
-        def run_tts():
-            asyncio.run(tts_manager.synthesize_streaming(
-                text, priority, on_audio_chunk, on_complete
-            ))
+        run_tts_synthesis(text, priority, on_chunk, on_complete)
 
-        tts_thread = threading.Thread(target=run_tts)
-        tts_thread.start()
-
-        # 等待有足够数据或完成
+        # 边合成边发送
         chunk_count = 0
         while not completed.is_set() or chunk_count < len(audio_chunks):
-            # 有新数据就立即发送
             while chunk_count < len(audio_chunks):
-                chunk = audio_chunks[chunk_count]
-                mqtt_sender.send_audio_stream([chunk], priority)
+                mqtt_sender.send_audio_stream([audio_chunks[chunk_count]], priority)
                 chunk_count += 1
-            time.sleep(0.01)  # 10ms检查一次
+            time.sleep(0.01)
 
         return jsonify({
             "status": "ok" if success[0] else "error",
-            "message": "已推送到ESP32" if success[0] else "合成失败"
+            "message": "已推送" if success[0] else "合成失败"
         })
 
     except Exception as e:
