@@ -434,17 +434,6 @@ def tts_push():
         if not text:
             return jsonify({"error": "缺少text参数"}), 400
 
-        # 频率限制：检查最近是否发送过相同的文本
-        current_time = time.time()
-        cache_key = f"{text}_{priority}"
-        if hasattr(tts_manager, 'last_request_time') and hasattr(tts_manager, 'last_request_text'):
-            if tts_manager.last_request_text == cache_key and current_time - tts_manager.last_request_time < 3.0:
-                print(f"[API] 忽略重复请求 (3秒内): '{text[:30]}...'")
-                return jsonify({"status": "ignored", "message": "请求过于频繁"})
-
-        tts_manager.last_request_time = current_time
-        tts_manager.last_request_text = cache_key
-
         print(f"[API] 推送TTS: '{text[:30]}...' 优先级={priority}")
 
         # 确保MQTT已连接
@@ -452,39 +441,44 @@ def tts_push():
             mqtt_sender.connect()
             time.sleep(0.5)
 
-        audio_chunks = []
-        completed = threading.Event()
-        success = [False]
+        # 同步方式直接调用百度短文本TTS（更稳定）
+        token = get_baidu_token()
+        if not token:
+            return jsonify({"error": "无法获取Token"}), 500
 
-        def on_chunk(chunk, is_last):
-            if not is_last and chunk:
-                audio_chunks.append(chunk)
+        url = "https://tsn.baidu.com/text2audio"
+        payload = {
+            "tex": text,
+            "tok": token,
+            "cuid": "blindstick_proxy",
+            "ctp": 1,
+            "lan": "zh",
+            "spd": 5,
+            "pit": 5,
+            "vol": 9,
+            "per": 1,
+            "aue": 6
+        }
 
-        def on_complete(ok, error):
-            success[0] = ok
-            completed.set()
+        resp = requests.post(url, data=payload, timeout=15, verify=False)
 
-        run_tts_synthesis(text, priority, on_chunk, on_complete)
+        if 'audio' in resp.headers.get('Content-Type', ''):
+            audio_data = resp.content
+            print(f"[TTS] 合成成功: {len(audio_data)} 字节")
 
-        # 边合成边发送
-        chunk_count = 0
-        while not completed.is_set() or chunk_count < len(audio_chunks):
-            while chunk_count < len(audio_chunks):
-                chunk = audio_chunks[chunk_count]
-                print(f"[TTS] 发送音频块 {chunk_count+1}/{len(audio_chunks)}, 大小={len(chunk)}字节")
-                mqtt_sender.send_audio_stream([chunk], priority)
-                chunk_count += 1
-            time.sleep(0.01)
+            # 直接通过MQTT发送完整音频
+            mqtt_sender.client.publish("blindstick/tts/audio", audio_data)
+            print(f"[MQTT] 已发送音频到 blindstick/tts/audio")
 
-        print(f"[API] TTS完成: 成功={success[0]}, 共发送{chunk_count}块")
-
-        return jsonify({
-            "status": "ok" if success[0] else "error",
-            "message": "已推送" if success[0] else "合成失败"
-        })
+            return jsonify({"status": "ok", "message": "已推送"})
+        else:
+            print(f"[TTS] 合成失败: {resp.text[:200]}")
+            return jsonify({"error": "TTS合成失败"}), 500
 
     except Exception as e:
         print(f"[TTS Push] 异常: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
