@@ -534,14 +534,19 @@ async function handleMqttMessage(topic, payload) {
                 const msg = JSON.parse(payload.toString());
                 console.log('[TTS-MQTT] 收到TTS请求:', msg.text);
 
-                if ((msg.type === 'tts_request' || msg.type === 'obstacle_alert') && msg.text) {
-                    // ESP32无法连接百度，使用流式TTS推送给ESP32
-                    const priority = msg.priority || (msg.type === 'obstacle_alert' ? TTS_PRIORITY.HIGH : TTS_PRIORITY.NORMAL);
+                // 只要有text字段就调用TTS（ESP32发送的消息可能没有type字段）
+                if (msg.text) {
+                    // 根据type确定优先级，默认NORMAL(1)
+                    let priority = msg.priority !== undefined ? msg.priority : TTS_PRIORITY.NORMAL;
+                    if (msg.type === 'obstacle_alert' || msg.type === 'radar_alert') {
+                        priority = TTS_PRIORITY.HIGH;
+                    } else if (msg.type === 'navigation') {
+                        priority = TTS_PRIORITY.LOW;
+                    }
+                    console.log(`[TTS-MQTT] 调用streamTTS: "${msg.text.substring(0, 30)}..." 优先级=${priority}`);
                     await streamTTS(msg.text, priority);
                 } else {
-                    // 障碍物告警或其他TTS请求 - 只记录日志，ESP32会自己播放
-                    console.log('[TTS请求] 记录:', msg.text);
-                    console.log(msg.type || '语音', msg.text);
+                    console.log('[TTS-MQTT] 消息无text字段，忽略');
                 }
             } catch (e) {
                 console.error('[TTS-MQTT] 处理失败:', e);

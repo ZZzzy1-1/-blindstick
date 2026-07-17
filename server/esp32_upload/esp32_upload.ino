@@ -15,8 +15,11 @@ const char* WIFI_SSID     = "ZZY";
 const char* WIFI_PASSWORD = "zzy060630";
 
 // ==================== MQTT 参数（EMQX Cloud） ====================
+// 如果8883端口(TLS)一直连不上，可以尝试以下端口：
+// 1883 - MQTT over TCP（明文，不需要证书，但不是所有EMQX实例都开放）
+// 8883 - MQTT over TLS（需要证书处理）
 const char* MQTT_BROKER   = "u72a7838.ala.asia-southeast1.emqxsl.com";
-const int   MQTT_PORT     = 8883;  // MQTT over TLS（PubSubClient 不支持 WebSocket）
+const int   MQTT_PORT     = 8883;  // 如果8883不行，尝试改成1883
 const char* MQTT_USER     = "blindstick";
 const char* MQTT_PASSWORD = "2026";
 const char* MQTT_CLIENT_ID = "blindstick_esp32_001";
@@ -203,8 +206,8 @@ const char* getPrioName(int p) {
 
 // ==================== 避障阈值 ====================
 #define ALERT_DIST_CM       180.0
-#define FRONT_CRITICAL_CM   150.0
-#define SIDE_WARNING_CM     70.0
+#define FRONT_CRITICAL_CM   180.0
+#define SIDE_WARNING_CM     180.0
 #define AVOID_TURN_HOLD_MS 2000
 
 // ==================== 雷达角度扇区 ====================
@@ -504,23 +507,32 @@ void mqtt_reconnect() {
         network_tested = true;
     }
 
-    // 配置MQTT客户端
-    mqtt.setSocketTimeout(5);
-    mqtt.setKeepAlive(30);
+    // 配置MQTT客户端参数（TLS已在setup中配置）
+    mqtt.setSocketTimeout(10);  // 增加socket超时到10秒
+    mqtt.setKeepAlive(60);      // 增加keepalive到60秒
     mqtt.setBufferSize(131072);  // 增加到128KB，支持更大音频+MQTT开销
-    mqtt.setCallback(mqtt_callback);
+    // 注意：callback已在setup中设置，这里不需要重复设置
 
-    // 【关键】打印缓冲区大小，确认设置生效
-    Serial.printf("[MQTT] 配置完成: SocketTimeout=5s, KeepAlive=30s\n");
-    Serial.printf("[MQTT] 缓冲区大小: %d 字节 (应该为 131072)\n", 131072);
+    // 【关键】打印配置信息
+    Serial.printf("[MQTT] 配置: broker=%s:%d, SocketTimeout=10s, KeepAlive=60s\n",
+                  MQTT_BROKER, MQTT_PORT);
+    Serial.printf("[MQTT] 缓冲区大小: %d 字节\n", 131072);
 
     int retryCount = 0;
     while (!mqtt.connected()) {
         Serial.printf("[MQTT] 尝试连接 #%d broker=%s:%d...\n", retryCount + 1, MQTT_BROKER, MQTT_PORT);
         Serial.printf("[MQTT] ClientID=%s, User=%s\n", MQTT_CLIENT_ID, MQTT_USER);
 
-        // 设置TLS客户端超时
-        espClient.setTimeout(5000); // 5秒TLS握手超时
+        // 【重要】每次重试前重新配置TLS（测试显示第一次可以成功，重试需要重新设置）
+        espClient.setInsecure();
+        espClient.setHandshakeTimeout(12);  // 12秒握手超时
+
+        // 确保WiFi连接状态正常
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("[MQTT] WiFi断开，等待重连...");
+            delay(1000);
+            continue;
+        }
 
         if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
             Serial.println("[MQTT] 已连接！");
@@ -551,7 +563,12 @@ void mqtt_reconnect() {
                 case 5:  Serial.print("(未授权)"); break;
                 default: Serial.print("(未知错误)"); break;
             }
-            Serial.println("，3秒后重试...");
+            Serial.println("，5秒后重试...");
+
+            // 断开现有连接，清理状态
+            mqtt.disconnect();
+            espClient.stop();
+
             retryCount++;
             // 每5次重试重置网络测试标志
             if (retryCount >= 5) {
@@ -559,7 +576,7 @@ void mqtt_reconnect() {
                 network_tested = false;
                 retryCount = 0;
             }
-            delay(3000);
+            delay(5000);  // 增加重试间隔到5秒
         }
     }
 }
@@ -746,8 +763,8 @@ void publishSensorData() {
     }
 
     bool ok = mqtt.publish(MQTT_TOPIC_SENSORS, json_buffer, n);
-    if (ok) Serial.printf("[MQTT] 已发布 %d bytes\n", n);
-    else Serial.println("[MQTT] 发布失败");
+    /*if (ok) Serial.printf("[MQTT] 已发布 %d bytes\n", n);
+    else Serial.println("[MQTT] 发布失败");*/
 }
 
 /**
@@ -1426,15 +1443,6 @@ void setup() {
     Serial.printf("[诊断] 总计: 非零样本=%d, 削顶=%d\n", test_non_zero, test_clipped);
     if (test_non_zero == 0) {
         Serial.println("[诊断] ⚠️ 警告: 麦克风没有输出数据!");
-        Serial.println("[诊断] 请检查:");
-        Serial.println("       1. INMP441 VDD 是否接 3.3V (不能接5V!)");
-        Serial.println("       2. GND 是否正确连接");
-        Serial.println("       3. 引脚接线:");
-        Serial.println("          WS  → GPIO 2");
-        Serial.println("          SCK → GPIO 1");
-        Serial.println("          SD  → GPIO 42");
-        Serial.println("       4. L/R 引脚是否接地 (接GND=左声道)");
-        Serial.println("       5. INMP441 模块是否损坏 (换一个好的试试)");
     } else {
         Serial.println("[诊断] ✅ 麦克风硬件正常");
     }
@@ -1458,8 +1466,30 @@ void setup() {
 
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\n[WiFi] 已连接！IP: %s\n", WiFi.localIP().toString().c_str());
+
+        // 同步时间（TLS证书验证需要）
+        Serial.println("[NTP] 同步网络时间...");
+        configTime(8 * 3600, 0, "ntp.ntsc.ac.cn", "cn.pool.ntp.org");
+        struct tm timeinfo;
+        int ntp_retry = 0;
+        while (!getLocalTime(&timeinfo) && ntp_retry < 10) {
+            delay(500);
+            ntp_retry++;
+        }
+        if (ntp_retry < 10) {
+            Serial.printf("[NTP] 时间同步成功: %04d-%02d-%02d %02d:%02d:%02d\n",
+                          timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                          timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        } else {
+            Serial.println("[NTP] 时间同步失败，继续尝试连接...");
+        }
+
+        // 【关键】先配置TLS客户端，再初始化MQTT
+        Serial.println("[TLS] 配置安全客户端...");
+        espClient.setInsecure();  // 跳过证书验证
+        espClient.setHandshakeTimeout(12);  // 12秒握手超时（测试显示需要6秒+）
+
         // 初始化 MQTT
-        espClient.setInsecure();  // 开发阶段跳过证书校验
         mqtt.setServer(MQTT_BROKER, MQTT_PORT);
         mqtt.setCallback(mqtt_callback);
 
@@ -1481,9 +1511,9 @@ void setup() {
 
     Serial.println("[系统] 等待语音输入目的地...");
 
-    xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 8192, NULL, 3, &RadarTaskHandle, 0);
-    xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
-    xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 8192, NULL, 2, &VoiceTaskHandle, 1);
+    // xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 8192, NULL, 3, &RadarTaskHandle, 0);
+    // xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
+    // xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 8192, NULL, 2, &VoiceTaskHandle, 1);
 
     delay(300);
 }
