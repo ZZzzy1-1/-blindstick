@@ -124,6 +124,9 @@ HardwareSerial gpsSerial(2);
 
 #define VOLUME_GAIN     0.6
 
+// ==================== 音频采样参数 ====================
+#define SAMPLE_RATE     16000  // 16kHz 采样率
+
 // ==================== 函数声明 ====================
 String urlEncode(const char* str);
 float calcDistance(float lat1, float lng1, float lat2, float lng2);
