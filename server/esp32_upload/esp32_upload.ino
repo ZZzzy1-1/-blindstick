@@ -140,6 +140,9 @@ void startStreamingASR();
 void stopStreamingASR();
 void sendAudioChunk();
 void webSocketEvent(WStype_t type, uint8_t* payload, size_t length);
+String doRESTASR();
+void handleVoiceCommand(const char* text);
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length);
 String doRESTASR();  // REST API备选方案
 String base64Encode(const uint8_t* data, size_t len);  // Base64编码
 
@@ -588,13 +591,15 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
             memcpy(audio_buf, payload, length);
             xSemaphoreGive(audioMutex);
 
-            // 将音频加入播放队列（高优先级，因为这是导航/告警语音）
-            if (play_tts_audio(audio_buf, length, TTS_PRIORITY_HIGH)) {
-                Serial.println("[TTS] 音频已入队，将由TTSPlayerTask播放");
-            } else {
-                Serial.println("[TTS] 队列已满，无法入队");
-                free(audio_buf);
+            // 完整音频直接播放（备用方案，兼容旧版）
+            Serial.println("[TTS] 收到完整音频，直接播放");
+            // 跳过WAV头
+            int offset = 0;
+            if (length > 44 && audio_buf[0] == 'R' && audio_buf[1] == 'I') {
+                offset = 44;
             }
+            playPcmData(audio_buf + offset, length - offset);
+            free(audio_buf);
         }
 
     } else if (strcmp(topic, MQTT_TOPIC_NAV_STEPS) == 0) {
@@ -614,14 +619,21 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         }
 
     } else if (strcmp(topic, MQTT_TOPIC_TTS_REQ) == 0) {
-        // 收到TTS请求（网页端发送文本，ESP32自己合成）
+        // 收到TTS请求 - 转发给代理服务器进行流式合成
         StaticJsonDocument<256> doc;
         DeserializationError err = deserializeJson(doc, payload, length);
         if (!err && doc.containsKey("text")) {
             const char* text = doc["text"];
-            Serial.printf("[MQTT-TTS] 收到TTS请求: %s\n", text);
-            // ESP32自己调用百度TTS合成并播放
-            baiduTTSPlay(text);
+            int priority = doc["priority"] | PRIO_NORMAL;
+            Serial.printf("[MQTT-TTS] 转发TTS请求: %s (优先级=%d)\n", text, priority);
+
+            // 直接在这里处理流式TTS请求，发送给代理服务器
+            StaticJsonDocument<256> reqDoc;
+            reqDoc["text"] = text;
+            reqDoc["priority"] = priority;
+            char buf[256];
+            size_t len = serializeJson(reqDoc, buf, sizeof(buf));
+            mqtt.publish("blindstick/tts/request", buf, len);
         }
     }
 }
@@ -642,80 +654,6 @@ void* allocateBuffer(size_t size) {
     }
 }
 
-// ==================== 障碍物语音告警 ====================
-void checkObstacleAndAlert() {
-    // 获取当前最小距离和方向
-    float min_dist = 400.0f;
-    const char* direction = "";
-
-    // 找到最小距离的方向（简化为只检测正前、左前、右前三个方向）
-    if (dir_smt[0] < min_dist) { min_dist = dir_smt[0]; direction = "前方"; }
-    if (dir_smt[1] < min_dist) { min_dist = dir_smt[1]; direction = "右前方"; }
-    if (dir_smt[2] < min_dist) { min_dist = dir_smt[2]; direction = "左前方"; }
-
-    unsigned long now = millis();
-
-    // 如果有障碍物且距离小于阈值
-    if (min_dist < ALERT_DIST_CM) {
-        // 检查是否应该播报
-        bool should_alert = false;
-
-        if (!last_blocked) {
-            // 首次检测到障碍物
-            should_alert = true;
-            Serial.printf("[告警] 首次检测: %s%.0fcm\n", direction, min_dist);
-        } else if (now - last_alert_time > ALERT_INTERVAL_MS) {
-            // 超过间隔时间
-            should_alert = true;
-            Serial.printf("[告警] 间隔触发: %s%.0fcm (上次%.0fcm)\n",
-                         direction, min_dist, last_alert_dist);
-        } else if (fabs(min_dist - last_alert_dist) > ALERT_DIST_CHANGE) {
-            // 距离变化较大
-            should_alert = true;
-            Serial.printf("[告警] 距离变化: %.0fcm -> %.0fcm\n", last_alert_dist, min_dist);
-        }
-
-        if (should_alert && mqtt.connected()) {
-            // 构建告警文本
-            char alert_msg[128];
-            if (min_dist < 100.0f) {
-                snprintf(alert_msg, sizeof(alert_msg), "注意！%s%.0f厘米有障碍物，请立即避让",
-                         direction, min_dist);
-            } else {
-                snprintf(alert_msg, sizeof(alert_msg), "%s%.0f厘米有障碍物",
-                         direction, min_dist);
-            }
-
-            // 通过 MQTT 发送 TTS 请求
-            StaticJsonDocument<256> doc;
-            doc["type"] = "obstacle_alert";
-            doc["text"] = alert_msg;
-            doc["distance"] = min_dist;
-            doc["direction"] = direction;
-
-            char buf[256];
-            size_t len = serializeJson(doc, buf, sizeof(buf));
-
-            // 使用 QoS 1 确保消息送达
-            bool sent = mqtt.publish(MQTT_TOPIC_TTS_REQ, buf, len);
-
-            if (sent) {
-                Serial.printf("[告警] 已发送: %s\n", alert_msg);
-                last_alert_time = now;
-                last_alert_dist = min_dist;
-            } else {
-                Serial.println("[告警] MQTT发送失败!");
-            }
-        }
-        last_blocked = true;
-    } else {
-        // 障碍物消失，重置状态
-        if (last_blocked) {
-            Serial.println("[告警] 障碍物已清除");
-        }
-        last_blocked = false;
-    }
-}
 static char json_buffer[384];
 
 // ==================== 通过 MQTT 发布传感器数据 ====================
@@ -758,55 +696,6 @@ void publishSensorData() {
     else Serial.println("[MQTT] 发布失败");
 }
 
-// ==================== 从 MQTT 回调接收 TTS 音频并播放 ====================
-void processMqttTtsAudio() {
-    if (!tts_rx_ready) return;
-
-    Serial.printf("[TTS处理] 准备处理音频，大小=%d 字节\n", tts_rx_len);
-
-    // 超时检查
-    if (millis() - tts_rx_start > TTS_RX_TIMEOUT_MS) {
-        Serial.println("[TTS处理] 接收超时，丢弃");
-        tts_rx_ready = false;
-        return;
-    }
-
-    // 根据当前状态决定优先级
-    TTS_Priority priority;
-    if (is_blocked) {
-        priority = TTS_PRIORITY_HIGH;
-        audio_request_state = AUDIO_AVOID;
-        Serial.println("[TTS处理] 优先级: 高(避障)");
-    } else if (nav_active) {
-        priority = TTS_PRIORITY_NORMAL;
-        audio_request_state = AUDIO_NAV;
-        Serial.println("[TTS处理] 优先级: 中(导航)");
-    } else {
-        priority = TTS_PRIORITY_LOW;
-        audio_request_state = AUDIO_CHAT;
-        Serial.println("[TTS处理] 优先级: 低(对话)");
-    }
-
-    // 使用PSRAM分配内存并复制
-    uint8_t* buf = (uint8_t*)allocateBuffer(tts_rx_len);
-    if (!buf) {
-        Serial.println("[TTS处理] 内存不足，无法分配");
-        tts_rx_ready = false;
-        return;
-    }
-
-    memcpy(buf, (const void*)tts_rx_buf, tts_rx_len);
-
-    if (play_tts_audio(buf, tts_rx_len, priority)) {
-        Serial.printf("[TTS处理] 音频已入队，优先级=%d，大小=%d\n", priority, tts_rx_len);
-    } else {
-        Serial.println("[TTS处理] 队列满，丢弃音频");
-        free(buf);
-    }
-
-    tts_rx_ready = false;
-}
-
 // ==================== Core 0 守护线程 ====================
 void RadarMotorUploadTask(void* pvParameters) {
     Serial1.begin(115200, SERIAL_8N1, RADAR_RX_PIN, -1);
@@ -826,9 +715,6 @@ void RadarMotorUploadTask(void* pvParameters) {
         parseGPSNMEA();
         unsigned long now = millis();
         smartAvoidDecision();
-        if (is_blocked)      audio_request_state = AUDIO_AVOID;
-        else if (nav_active) audio_request_state = AUDIO_NAV;
-        else                 audio_request_state = AUDIO_IDLE;
 
         if (WiFi.status() == WL_CONNECTED) {
             // 确保 MQTT 连接成功
@@ -838,29 +724,6 @@ void RadarMotorUploadTask(void* pvParameters) {
 
         if (mqtt.connected()) {
                 mqtt.loop();  // 保活
-
-                // 【修复】处理 TTS 音频 - 改为入队，由 TTSPlayerTask 播放，避免阻塞雷达
-                if (tts_rx_ready && tts_rx_len > 0) {
-                    Serial.printf("[主循环] TTS音频就绪: %d字节，将入队播放\n", tts_rx_len);
-
-                    // 分配新缓冲区复制音频（因为 tts_rx_buf 是共享的）
-                    uint8_t* audio_buf = (uint8_t*)allocateBuffer(tts_rx_len);
-                    if (audio_buf != NULL) {
-                        memcpy(audio_buf, (const void*)tts_rx_buf, tts_rx_len);
-
-                        if (play_tts_audio(audio_buf, tts_rx_len, TTS_PRIORITY_HIGH)) {
-                            Serial.println("[主循环] TTS音频已入队");
-                        } else {
-                            Serial.println("[主循环] 队列已满，丢弃音频");
-                            free(audio_buf);
-                        }
-                    } else {
-                        Serial.println("[主循环] 内存分配失败");
-                    }
-
-                    tts_rx_ready = false;
-                    tts_rx_len = 0;
-                }
 
                 // 障碍物检测和语音告警（使用流式TTS）
                 checkObstacleAndAlert();
@@ -881,7 +744,7 @@ void NavigationTask(void* pvParameters) {
         int total = nav_total_steps;
         if (total > 0 && current_step_idx < total) {
             if (current_progress < 100) {
-                if (audio_request_state == AUDIO_AVOID || is_ai_talking) {
+                if (is_blocked || is_ai_talking) {
                     vTaskDelay(200 / portTICK_PERIOD_MS); continue;
                 }
                 vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -973,6 +836,24 @@ void i2s_out_init() {
     }
 
     Serial.println("[I2S-OUT] MAX98357功放初始化成功 (APPL 时钟)");
+}
+
+// 简单的启动提示音
+void playLocalStartupTone() {
+    Serial.println("[启动提示] 播放测试音...");
+    const int sample_rate = 16000;
+    const int num_samples = sample_rate / 2; // 0.5秒
+    static int16_t tone_buffer[8000];
+    for (int i = 0; i < num_samples; i++) {
+        float t = (float)i / sample_rate;
+        float sample = sin(2 * PI * 1000 * t) * 8000.0f;
+        tone_buffer[i] = (int16_t)sample;
+    }
+    size_t written = 0;
+    i2s_zero_dma_buffer(I2S_PORT_OUT);
+    i2s_write(I2S_PORT_OUT, tone_buffer, num_samples * 2, &written, portMAX_DELAY);
+    delay(600);
+    i2s_zero_dma_buffer(I2S_PORT_OUT);
 }
 
 // ==================== 流式语音识别（WebSocket）====================
@@ -1251,9 +1132,30 @@ String doRESTASR() {
 
     Serial.printf("[ASR-REST] 录音完成: %d字节\n", totalRead);
 
-    // 获取Token
-    String token = getBaiduAccessToken();
+    // 获取Token - 直接请求
+    String token = "";
+    {
+        WiFiClientSecure tokenClient;
+        tokenClient.setInsecure();
+        tokenClient.setTimeout(10000);
+        HTTPClient tokenHttp;
+        String url = String("https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id=") + BAIDU_API_KEY + "&client_secret=" + BAIDU_SECRET_KEY;
+        if (tokenHttp.begin(tokenClient, url)) {
+            tokenHttp.setTimeout(10000);
+            int code = tokenHttp.GET();
+            if (code == 200) {
+                String resp = tokenHttp.getString();
+                StaticJsonDocument<512> doc;
+                if (!deserializeJson(doc, resp)) {
+                    token = doc["access_token"].as<String>();
+                }
+            }
+            tokenHttp.end();
+        }
+    }
+
     if (token.length() == 0) {
+        Serial.println("[ASR-REST] 无法获取Token");
         free(buffer);
         return "";
     }
@@ -1453,7 +1355,12 @@ void setup() {
 
         // WiFi 已连接，使用MQTT代理播报启动成功
         delay(500);
-        requestTTSViaMQTT("导盲杖系统启动成功，欢迎使用");
+        StaticJsonDocument<256> doc;
+        doc["text"] = "导盲杖系统启动成功，欢迎使用";
+        doc["priority"] = PRIO_NORMAL;
+        char buf[256];
+        size_t len = serializeJson(doc, buf, sizeof(buf));
+        mqtt.publish("blindstick/tts/request", buf, len);
         Serial.println("[系统] 启动播报请求已发送");
     } else {
         Serial.println("[WiFi] 离线模式，MQTT不可用，跳过启动播报");
@@ -1845,15 +1752,6 @@ void checkObstacleAndAlert() {
 
 // ==================== 流式TTS实现（新版简化逻辑）====================
 
-const char* getPrioName(int p) {
-    switch(p) {
-        case PRIO_HIGH: return "高(雷达)";
-        case PRIO_NORMAL: return "中(对话)";
-        case PRIO_LOW: return "低(导航)";
-        default: return "未知";
-    }
-}
-
 void initStreamingTTS() {
     if (ESP.getPsramSize() > 0) {
         stream_buffer = (uint8_t*)ps_malloc(STREAM_BUF_SIZE);
@@ -1936,8 +1834,8 @@ void handleStreamControl(const char* payload, int length) {
         int segments = doc["segments"] | 0;
         Serial.printf("[流式TTS] 会话结束，共%d段\n", segments);
 
-        if (stream_buffer_used > 0 && stream_playing) {
-            playPcmData(stream_buffer, stream_buffer_used);
+        if (stream_buf_used > 0 && stream_playing) {
+            playPcmData(stream_buffer, stream_buf_used);
         }
 
         if (VoiceTaskHandle != NULL && stream_priority < PRIO_HIGH) {
@@ -1988,8 +1886,6 @@ void handleStreamAudio(const char* topic, byte* payload, unsigned int length) {
 }
 
 void announceObstacleStreaming(float distance, const char* direction) {
-    // 此函数在ESP32端直接调用baiduTTSPlay即可
-    // 代理服务器会处理成流式TTS
     char text[64];
     if (distance < 150) {
         snprintf(text, sizeof(text), "注意！前方%.0f厘米有障碍物，请立即避让！", distance);
@@ -1997,5 +1893,12 @@ void announceObstacleStreaming(float distance, const char* direction) {
         snprintf(text, sizeof(text), "前方%.0f厘米有%s障碍物", distance, direction);
     }
     Serial.printf("[雷达告警] %s\n", text);
-    baiduTTSPlay(text);
+
+    // 发送MQTT流式TTS请求
+    StaticJsonDocument<256> doc;
+    doc["text"] = text;
+    doc["priority"] = PRIO_HIGH;
+    char buf[256];
+    size_t len = serializeJson(doc, buf, sizeof(buf));
+    mqtt.publish("blindstick/tts/request", buf, len);
 }
