@@ -534,9 +534,9 @@ async function handleMqttMessage(topic, payload) {
                 const msg = JSON.parse(payload.toString());
                 console.log('[TTS-MQTT] 收到TTS请求:', msg.text);
 
-                if (msg.type === 'tts_request' && msg.text) {
+                if ((msg.type === 'tts_request' || msg.type === 'obstacle_alert') && msg.text) {
                     // ESP32无法连接百度，使用流式TTS推送给ESP32
-                    const priority = msg.priority || TTS_PRIORITY.NORMAL;
+                    const priority = msg.priority || (msg.type === 'obstacle_alert' ? TTS_PRIORITY.HIGH : TTS_PRIORITY.NORMAL);
                     await streamTTS(msg.text, priority);
                 } else {
                     // 障碍物告警或其他TTS请求 - 只记录日志，ESP32会自己播放
