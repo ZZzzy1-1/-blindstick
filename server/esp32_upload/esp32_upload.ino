@@ -106,20 +106,20 @@ HardwareSerial gpsSerial(2);
 // ==================== I2S麦克风引脚 (INMP441) ====================
 // 实际硬件接线：
 // VDD → 3.3V
-// WS  → GPIO2
-// SCK → GPIO1
-// SD  → GPIO42
+// WS  → GPIO5  (LRCK)
+// SCK → GPIO2  (BCLK)
+// SD  → GPIO8  (MIC_IN)
 // GND → GND
 // L/R → GND (接地=左声道)
-#define I2S_WS_PIN      2
-#define I2S_SCK_PIN     1
-#define I2S_SD_PIN      42
+#define I2S_WS_PIN      5   // LRCK
+#define I2S_SCK_PIN     2   // BCLK
+#define I2S_SD_PIN      8   // MIC_IN
 #define I2S_PORT        I2S_NUM_0
 
 // ==================== I2S扬声器引脚 (MAX98357) ====================
-#define I2S_BCK_PIN     4
-#define I2S_WS_OUT_PIN  5
-#define I2S_DATA_PIN    6
+#define I2S_BCK_PIN     47  // SPK_BCLK
+#define I2S_WS_OUT_PIN  41  // SPK_LRCK
+#define I2S_DATA_PIN    21  // SPK_OUT
 #define I2S_PORT_OUT    I2S_NUM_1
 
 #define VOLUME_GAIN     0.6
@@ -903,17 +903,24 @@ void i2s_init() {
 
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-        .sample_rate = 16000, .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .sample_rate = 16000,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
         .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 8, .dma_buf_len = 1024,
-        .use_apll = false, .tx_desc_auto_clear = false, .fixed_mclk = 0
+        .intr_alloc_flags = ESP_INTR_FLAG_IRAM,
+        .dma_buf_count = 4,
+        .dma_buf_len = 256,
+        .use_apll = false,
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = 0
     };
     i2s_pin_config_t pin_config = {
-        .bck_io_num = I2S_SCK_PIN, .ws_io_num = I2S_WS_PIN,
-        .data_out_num = I2S_PIN_NO_CHANGE, .data_in_num = I2S_SD_PIN
+        .bck_io_num = I2S_SCK_PIN,
+        .ws_io_num = I2S_WS_PIN,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = I2S_SD_PIN
     };
+
     esp_err_t err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
     if (err != ESP_OK) {
         Serial.printf("[I2S] 驱动安装失败: %d (", err);
@@ -929,11 +936,6 @@ void i2s_init() {
         Serial.printf("[I2S] 引脚设置失败: %d\n", err);
         return;
     }
-    err = i2s_set_clk(I2S_PORT, 16000, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
-    if (err != ESP_OK) {
-        Serial.printf("[I2S] 时钟设置失败: %d\n", err);
-        return;
-    }
     Serial.println("[I2S] 麦克风初始化成功");
 }
 
@@ -942,30 +944,36 @@ void i2s_out_init() {
 
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-        .sample_rate = 16000, .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,  // 改为立体声，兼容左右声道配置
+        .sample_rate = 16000,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 8, .dma_buf_len = 1024,
-        .use_apll = true, .tx_desc_auto_clear = true, .fixed_mclk = 0
+        .intr_alloc_flags = ESP_INTR_FLAG_IRAM,
+        .dma_buf_count = 4,
+        .dma_buf_len = 256,
+        .use_apll = false,
+        .tx_desc_auto_clear = true,
+        .fixed_mclk = 0
     };
     i2s_pin_config_t pin_config = {
-        .bck_io_num = I2S_BCK_PIN, .ws_io_num = I2S_WS_OUT_PIN,
-        .data_out_num = I2S_DATA_PIN, .data_in_num = I2S_PIN_NO_CHANGE
+        .bck_io_num = I2S_BCK_PIN,
+        .ws_io_num = I2S_WS_OUT_PIN,
+        .data_out_num = I2S_DATA_PIN,
+        .data_in_num = I2S_PIN_NO_CHANGE
     };
-    esp_err_t err = i2s_driver_install(I2S_PORT_OUT, &i2s_config, 0, NULL);
-    if (err != ESP_OK) { Serial.printf("[I2S-OUT] 驱动安装失败: %d\n", err); return; }
-    err = i2s_set_pin(I2S_PORT_OUT, &pin_config);
-    if (err != ESP_OK) { Serial.printf("[I2S-OUT] 引脚设置失败: %d\n", err); return; }
 
-    // 设置时钟 - 关键：使用 APLL 获得精确 16kHz，确保 TTS 播放不失真
-    err = i2s_set_clk(I2S_PORT_OUT, 16000, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+    esp_err_t err = i2s_driver_install(I2S_PORT_OUT, &i2s_config, 0, NULL);
     if (err != ESP_OK) {
-        Serial.printf("[I2S-OUT] 时钟设置失败: %d\n", err);
+        Serial.printf("[I2S-OUT] 驱动安装失败: %d\n", err);
+        return;
+    }
+    err = i2s_set_pin(I2S_PORT_OUT, &pin_config);
+    if (err != ESP_OK) {
+        Serial.printf("[I2S-OUT] 引脚设置失败: %d\n", err);
         return;
     }
 
-    Serial.println("[I2S-OUT] MAX98357功放初始化成功 (APPL 时钟)");
+    Serial.println("[I2S-OUT] MAX98357功放初始化成功");
 }
 
 // 简单的启动提示音
