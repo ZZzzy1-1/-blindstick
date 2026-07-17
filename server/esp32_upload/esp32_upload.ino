@@ -696,6 +696,65 @@ void publishSensorData() {
     else Serial.println("[MQTT] 发布失败");
 }
 
+/**
+ * 障碍物检测和播报 - 使用流式TTS
+ */
+void checkObstacleAndAlert() {
+    // 获取当前最小距离和方向
+    float min_dist = 400.0f;
+    const char* direction = "前方";
+
+    if (dir_smt[0] < min_dist) { min_dist = dir_smt[0]; direction = "正前方"; }
+    if (dir_smt[1] < min_dist) { min_dist = dir_smt[1]; direction = "右前方"; }
+    if (dir_smt[2] < min_dist) { min_dist = dir_smt[2]; direction = "左前方"; }
+    if (dir_smt[3] < min_dist) { min_dist = dir_smt[3]; direction = "右侧"; }
+    if (dir_smt[4] < min_dist) { min_dist = dir_smt[4]; direction = "左侧"; }
+
+    unsigned long now = millis();
+
+    // 如果有障碍物且距离小于阈值
+    if (min_dist < ALERT_DIST_CM) {
+        bool should_alert = false;
+
+        if (!last_blocked) {
+            should_alert = true;
+        } else if (now - last_alert_time > ALERT_INTERVAL_MS) {
+            should_alert = true;
+        } else if (fabs(min_dist - last_alert_dist) > ALERT_DIST_CHANGE) {
+            should_alert = true;
+        }
+
+        if (should_alert) {
+            // 构建告警文本并通过流式TTS发送
+            char alertText[128];
+            if (min_dist < 50) {
+                snprintf(alertText, sizeof(alertText), "%s%.0f厘米有障碍物，请立即避让", direction, min_dist);
+            } else if (min_dist < 100) {
+                snprintf(alertText, sizeof(alertText), "%s%.0f厘米有障碍物，请注意避让", direction, min_dist);
+            } else if (min_dist < 200) {
+                snprintf(alertText, sizeof(alertText), "%s%.0f厘米有障碍物", direction, min_dist);
+            } else {
+                snprintf(alertText, sizeof(alertText), "%s%.0f米有障碍物", direction, min_dist / 100);
+            }
+
+            Serial.printf("[障碍物播报] %s\n", alertText);
+
+            // 发送流式TTS请求
+            StaticJsonDocument<256> doc;
+            doc["text"] = alertText;
+            doc["priority"] = PRIO_HIGH;  // 高优先级
+            char buf[256];
+            size_t len = serializeJson(doc, buf, sizeof(buf));
+            mqtt.publish("blindstick/tts/request", buf, len);
+
+            last_alert_time = now;
+            last_alert_dist = min_dist;
+        }
+        last_blocked = true;
+    } else {
+        last_blocked = false;
+    }
+}
 // ==================== Core 0 守护线程 ====================
 void RadarMotorUploadTask(void* pvParameters) {
     Serial1.begin(115200, SERIAL_8N1, RADAR_RX_PIN, -1);
@@ -1381,48 +1440,6 @@ void loop() {
 
 // ==================== 流式TTS实现（新版简化逻辑）====================
 
-const char* getPrioName(int p) {
-    switch(p) {
-        case PRIO_HIGH: return "高(雷达)";
-        case PRIO_NORMAL: return "中(对话)";
-        case PRIO_LOW: return "低(导航)";
-        default: return "未知";
-    }
-}
-                int available = stream->available();
-                if (available > 0) {
-                    int toRead = min(available, len - totalRead);
-                    int r = stream->readBytes(audioBuf + totalRead, toRead);
-                    if (r > 0) totalRead += r;
-                }
-                if (totalRead >= len) break;
-                delay(1);
-            }
-
-            http.end();
-
-            Serial.printf("[百度TTS] 读取音频数据: %d字节\n", totalRead);
-
-            // 播放音频（入队）- 旧版队列已删除，改用流式TTS
-            // 直接发送到代理服务器
-            StaticJsonDocument<512> doc;
-            doc["text"] = text;  // 重新合成
-            doc["priority"] = PRIO_NORMAL;
-            char buf[512];
-            size_t len = serializeJson(doc, buf, sizeof(buf));
-            mqtt.publish("blindstick/tts/request", buf, len);
-            return true;
-        } else {
-            // 收到错误信息
-            String error = http.getString();
-            Serial.printf("[百度TTS] 错误: %s\n", error.c_str());
-        }
-    } else {
-        Serial.printf("[百度TTS] HTTP错误: %d, %s\n", httpCode, http.errorToString(httpCode).c_str());
-    }
-
-    http.end();
-
     // 直接HTTPS失败，尝试通过MQTT流式TTS
     Serial.println("[百度TTS] 直接连接失败，使用MQTT流式TTS...");
     StaticJsonDocument<256> doc;
@@ -1621,11 +1638,11 @@ bool planWalkingRoute(float destLat, float destLng, String& destName) {
     snprintf(navText, sizeof(navText), "开始导航到%s，全程%d米，预计%d分钟，%s",
              destName.c_str(), distance, duration / 60, nav_steps[0].c_str());
     // 通过MQTT发送给代理服务器进行流式TTS
-    StaticJsonDocument<512> doc;
-    doc["text"] = navText;
-    doc["priority"] = PRIO_NORMAL;
+    StaticJsonDocument<512> ttsDoc;
+    ttsDoc["text"] = navText;
+    ttsDoc["priority"] = PRIO_NORMAL;
     char buf[512];
-    size_t len = serializeJson(doc, buf, sizeof(buf));
+    size_t len = serializeJson(ttsDoc, buf, sizeof(buf));
     mqtt.publish("blindstick/tts/request", buf, len);
 
     http.end();
@@ -1690,65 +1707,6 @@ void handleVoiceCommand(const char* text) {
     }
 }
 
-/**
- * 障碍物检测和播报 - 使用流式TTS
- */
-void checkObstacleAndAlert() {
-    // 获取当前最小距离和方向
-    float min_dist = 400.0f;
-    const char* direction = "前方";
-
-    if (dir_smt[0] < min_dist) { min_dist = dir_smt[0]; direction = "正前方"; }
-    if (dir_smt[1] < min_dist) { min_dist = dir_smt[1]; direction = "右前方"; }
-    if (dir_smt[2] < min_dist) { min_dist = dir_smt[2]; direction = "左前方"; }
-    if (dir_smt[3] < min_dist) { min_dist = dir_smt[3]; direction = "右侧"; }
-    if (dir_smt[4] < min_dist) { min_dist = dir_smt[4]; direction = "左侧"; }
-
-    unsigned long now = millis();
-
-    // 如果有障碍物且距离小于阈值
-    if (min_dist < ALERT_DIST_CM) {
-        bool should_alert = false;
-
-        if (!last_blocked) {
-            should_alert = true;
-        } else if (now - last_alert_time > ALERT_INTERVAL_MS) {
-            should_alert = true;
-        } else if (fabs(min_dist - last_alert_dist) > ALERT_DIST_CHANGE) {
-            should_alert = true;
-        }
-
-        if (should_alert) {
-            // 构建告警文本并通过流式TTS发送
-            char alertText[128];
-            if (min_dist < 50) {
-                snprintf(alertText, sizeof(alertText), "%s%.0f厘米有障碍物，请立即避让", direction, min_dist);
-            } else if (min_dist < 100) {
-                snprintf(alertText, sizeof(alertText), "%s%.0f厘米有障碍物，请注意避让", direction, min_dist);
-            } else if (min_dist < 200) {
-                snprintf(alertText, sizeof(alertText), "%s%.0f厘米有障碍物", direction, min_dist);
-            } else {
-                snprintf(alertText, sizeof(alertText), "%s%.0f米有障碍物", direction, min_dist / 100);
-            }
-
-            Serial.printf("[障碍物播报] %s\n", alertText);
-
-            // 发送流式TTS请求
-            StaticJsonDocument<256> doc;
-            doc["text"] = alertText;
-            doc["priority"] = PRIO_HIGH;  // 高优先级
-            char buf[256];
-            size_t len = serializeJson(doc, buf, sizeof(buf));
-            mqtt.publish("blindstick/tts/request", buf, len);
-
-            last_alert_time = now;
-            last_alert_dist = min_dist;
-        }
-        last_blocked = true;
-    } else {
-        last_blocked = false;
-    }
-}
 
 // ==================== 流式TTS实现（新版简化逻辑）====================
 
