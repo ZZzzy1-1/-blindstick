@@ -689,8 +689,8 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
 bool last_blocked = false;
 unsigned long last_alert_time = 0;
 float last_alert_dist = 0;
-#define ALERT_INTERVAL_MS 3000  // 障碍物告警间隔 3 秒
-#define ALERT_DIST_CHANGE 30    // 距离变化超过30cm才重新播报
+#define ALERT_INTERVAL_MS 5000  // 障碍物告警间隔 5 秒（从3秒增加到5秒）
+#define ALERT_DIST_CHANGE 50    // 距离变化超过50cm才重新播报（从30cm增加到50cm）
 
 // ==================== 辅助函数：使用PSRAM或普通内存分配 ====================
 void* allocateBuffer(size_t size) {
