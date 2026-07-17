@@ -135,6 +135,7 @@ float calcDistance(float lat1, float lng1, float lat2, float lng2);
 void initStreamingTTS();
 void handleStreamControl(const char* payload, int length);
 void handleStreamAudio(const char* topic, byte* payload, unsigned int length);
+void handleTTSUrl(const char* payload, int length);  // URL方式下载并播放TTS
 void playPcmData(uint8_t* data, int len);
 void stopCurrentPlayback();
 const char* getPrioName(int p);
@@ -542,12 +543,14 @@ void mqtt_reconnect() {
             mqtt.subscribe(MQTT_TOPIC_TTS_AUDIO);       // 完整音频（备用）
             mqtt.subscribe("blindstick/tts/control");   // 流式TTS控制
             mqtt.subscribe("blindstick/tts/stream/+");  // 流式TTS音频
+            mqtt.subscribe("blindstick/tts/url");       // TTS URL（新方案）
             mqtt.subscribe(MQTT_TOPIC_NAV_STEPS);
             mqtt.subscribe(MQTT_TOPIC_TTS_REQ);
             Serial.printf("[MQTT] 已订阅主题:\n");
             Serial.printf("  - %s (完整音频-备用)\n", MQTT_TOPIC_TTS_AUDIO);
             Serial.printf("  - blindstick/tts/control (流式TTS控制)\n");
             Serial.printf("  - blindstick/tts/stream/+ (流式TTS音频)\n");
+            Serial.printf("  - blindstick/tts/url (TTS音频URL)\n");
             Serial.printf("  - %s (导航步骤)\n", MQTT_TOPIC_NAV_STEPS);
             Serial.printf("  - %s (TTS请求)\n", MQTT_TOPIC_TTS_REQ);
             retryCount = 0;
@@ -597,6 +600,12 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     // ===== 流式TTS音频数据处理 =====
     if (strncmp(topic, "blindstick/tts/stream/", 22) == 0) {
         handleStreamAudio(topic, payload, length);
+        return;
+    }
+
+    // ===== TTS URL处理（新方案：接收URL并下载）=====
+    if (strcmp(topic, "blindstick/tts/url") == 0) {
+        handleTTSUrl((const char*)payload, length);
         return;
     }
 
@@ -1790,6 +1799,109 @@ void handleVoiceCommand(const char* text) {
     }
 }
 
+
+// ==================== TTS URL处理（下载并播放）====================
+void handleTTSUrl(const char* payload, int length) {
+    // 解析JSON获取URL
+    StaticJsonDocument<512> doc;
+    DeserializationError error = deserializeJson(doc, payload, length);
+
+    if (error) {
+        Serial.printf("[TTS-URL] JSON解析失败: %s\n", error.c_str());
+        return;
+    }
+
+    const char* url = doc["url"];
+    if (!url || strlen(url) == 0) {
+        Serial.println("[TTS-URL] URL为空");
+        return;
+    }
+
+    Serial.printf("[TTS-URL] 收到URL: %s\n", url);
+
+    // 暂停语音识别
+    if (VoiceTaskHandle != NULL) {
+        vTaskSuspend(VoiceTaskHandle);
+        Serial.println("[TTS-URL] 语音识别已暂停");
+    }
+
+    // HTTP下载音频
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(10000);
+
+    HTTPClient http;
+    if (!http.begin(client, url)) {
+        Serial.println("[TTS-URL] HTTP初始化失败");
+        return;
+    }
+
+    http.setTimeout(15000);
+    int httpCode = http.GET();
+
+    if (httpCode != 200) {
+        Serial.printf("[TTS-URL] 下载失败: %d\n", httpCode);
+        http.end();
+        return;
+    }
+
+    int len = http.getSize();
+    if (len <= 0 || len > 200000) {
+        Serial.printf("[TTS-URL] 音频大小无效: %d\n", len);
+        http.end();
+        return;
+    }
+
+    Serial.printf("[TTS-URL] 音频大小: %d 字节，开始下载...\n", len);
+
+    // 分配内存
+    uint8_t* audioBuffer = (uint8_t*)malloc(len);
+    if (!audioBuffer) {
+        Serial.println("[TTS-URL] 内存分配失败");
+        http.end();
+        return;
+    }
+
+    // 读取数据
+    WiFiClient* stream = http.getStreamPtr();
+    int totalRead = 0;
+    while (totalRead < len) {
+        int available = stream->available();
+        if (available > 0) {
+            int toRead = min(available, len - totalRead);
+            int r = stream->readBytes(audioBuffer + totalRead, toRead);
+            if (r > 0) totalRead += r;
+        }
+        if (totalRead >= len) break;
+        delay(1);
+    }
+
+    http.end();
+
+    if (totalRead != len) {
+        Serial.printf("[TTS-URL] 下载不完整: %d/%d\n", totalRead, len);
+        free(audioBuffer);
+        return;
+    }
+
+    Serial.println("[TTS-URL] 下载完成，开始播放...");
+
+    // 跳过WAV头并播放
+    int offset = 0;
+    if (len > 44 && audioBuffer[0] == 'R' && audioBuffer[1] == 'I') {
+        offset = 44;
+    }
+    playPcmData(audioBuffer + offset, len - offset);
+
+    free(audioBuffer);
+    Serial.println("[TTS-URL] 播放完成");
+
+    // 恢复语音识别
+    if (VoiceTaskHandle != NULL) {
+        vTaskResume(VoiceTaskHandle);
+        Serial.println("[TTS-URL] 语音识别已恢复");
+    }
+}
 
 // ==================== 流式TTS实现（新版简化逻辑）====================
 
