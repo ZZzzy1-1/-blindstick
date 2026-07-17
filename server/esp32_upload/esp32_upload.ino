@@ -154,6 +154,53 @@ String asrResult = "";
 
 #define ASR_CHUNK_SIZE 5120  // 160ms PCM数据 @ 16kHz 16bit
 
+// ==================== 工具函数实现 ====================
+
+/**
+ * URL编码
+ */
+String urlEncode(const char* str) {
+    String encoded = "";
+    char c;
+    for (int i = 0; str[i] != '\0'; i++) {
+        c = str[i];
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            encoded += c;
+        } else {
+            char buf[4];
+            sprintf(buf, "%%%02X", c);
+            encoded += buf;
+        }
+    }
+    return encoded;
+}
+
+/**
+ * 计算两点间距离（米）
+ */
+float calcDistance(float lat1, float lng1, float lat2, float lng2) {
+    const float R = 6371000; // 地球半径（米）
+    float dLat = (lat2 - lat1) * PI / 180.0;
+    float dLng = (lng2 - lng1) * PI / 180.0;
+    float a = sin(dLat/2) * sin(dLat/2) +
+              cos(lat1 * PI / 180.0) * cos(lat2 * PI / 180.0) *
+              sin(dLng/2) * sin(dLng/2);
+    float c = 2 * atan2(sqrt(a), sqrt(1-a));
+    return R * c;
+}
+
+/**
+ * 获取优先级名称
+ */
+const char* getPrioName(int p) {
+    switch(p) {
+        case PRIO_HIGH: return "高(雷达)";
+        case PRIO_NORMAL: return "中(对话)";
+        case PRIO_LOW: return "低(导航)";
+        default: return "未知";
+    }
+}
+
 // ==================== 避障阈值 ====================
 #define ALERT_DIST_CM       180.0
 #define FRONT_CRITICAL_CM   150.0
