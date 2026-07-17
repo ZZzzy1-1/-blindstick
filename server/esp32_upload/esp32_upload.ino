@@ -1438,18 +1438,6 @@ void loop() {
     vTaskDelete(NULL);
 }
 
-// ==================== 流式TTS实现（新版简化逻辑）====================
-
-    // 直接HTTPS失败，尝试通过MQTT流式TTS
-    Serial.println("[百度TTS] 直接连接失败，使用MQTT流式TTS...");
-    StaticJsonDocument<256> doc;
-    doc["text"] = text;
-    doc["priority"] = PRIO_NORMAL;
-    char buf[256];
-    size_t len = serializeJson(doc, buf, sizeof(buf));
-    return mqtt.publish("blindstick/tts/request", buf, len);
-}
-
 // ==================== 工具函数 ====================
 
 /**
