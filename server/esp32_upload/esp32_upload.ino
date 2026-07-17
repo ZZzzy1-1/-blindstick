@@ -28,13 +28,33 @@ const char* MQTT_TOPIC_NAV_STEPS = "blindstick/nav/steps";
 WiFiClientSecure espClient;
 PubSubClient mqtt(espClient);
 
-// TTS音频接收缓冲（处理MQTT下发的音频）
-#define TTS_AUDIO_BUF_SIZE  (120 * 1024)  // 增加到120KB，支持更大音频
+// ==================== 流式TTS配置（新版）====================
+// 优先级定义
+#define PRIO_LOW     0   // 导航
+#define PRIO_NORMAL  1   // 对话
+#define PRIO_HIGH    2   // 雷达告警
+
+// 流式播放状态
+volatile bool stream_playing = false;           // 是否正在播放
+volatile int  stream_priority = 0;              // 当前播放优先级
+volatile unsigned long stream_session_id = 0;   // 当前会话ID
+
+// 音频格式
+#define AUDIO_FORMAT_PCM_16K  0  // PCM 16kHz 16bit
+#define AUDIO_FORMAT_WAV      1  // WAV格式
+
+// 缓冲区配置（用于流式接收）
+#define STREAM_BUF_SIZE  8192   // 8KB流式缓冲区
+uint8_t* stream_buffer = NULL;
+volatile int stream_buf_used = 0;
+
+// 旧的TTS缓冲区（兼容旧版）
+#define TTS_AUDIO_BUF_SIZE  (120 * 1024)
 volatile uint8_t tts_rx_buf[TTS_AUDIO_BUF_SIZE];
 volatile int     tts_rx_len = 0;
 volatile bool    tts_rx_ready = false;
 volatile unsigned long tts_rx_start = 0;
-#define TTS_RX_TIMEOUT_MS  5000  // TTS音频接收超时5秒
+#define TTS_RX_TIMEOUT_MS  5000
 
 // ==================== 高德地图参数 ====================
 const String AMAP_KEY     = "90a13b148658cc0a0525f959202a4063";
@@ -117,6 +137,15 @@ bool playTtsAudioDirect(uint8_t* audio_data, int audio_len, TTS_Priority priorit
 bool requestTTSViaMQTT(const char* text);
 void playStartupSuccess();
 void announceObstacle(float distance, const char* direction);
+
+// 流式TTS相关函数（新版）
+void initStreamingTTS();
+void handleStreamControl(const char* payload, int length);
+void handleStreamAudio(const char* topic, byte* payload, unsigned int length);
+void playPcmData(uint8_t* data, int len);
+void stopCurrentPlayback();
+const char* getPrioName(int p);
+void announceObstacleStreaming(float distance, const char* direction);
 
 // 流式语音识别相关
 void VoiceRecognitionTask(void* pvParameters);
@@ -246,9 +275,20 @@ void tts_queue_clear() {
 }
 
 bool tts_queue_enqueue(uint8_t* audio_data, int audio_len, TTS_Priority priority) {
+    // 【修复】获取互斥锁保护队列操作
+    if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        Serial.println("[TTS队列] 获取互斥锁失败");
+        return false;
+    }
+
+    bool result = false;
+
     if (tts_queue.count >= tts_queue.max_count) {
         Serial.printf("[TTS队列] 队列已满(%d)，丢弃低优先级音频\n", tts_queue.count);
-        if (priority == TTS_PRIORITY_LOW) return false;
+        if (priority == TTS_PRIORITY_LOW) {
+            xSemaphoreGive(audioMutex);
+            return false;
+        }
         TTS_QueueItem* prev = NULL;
         TTS_QueueItem* curr = tts_queue.head;
         while (curr != NULL) {
@@ -275,6 +315,7 @@ bool tts_queue_enqueue(uint8_t* audio_data, int audio_len, TTS_Priority priority
 
     if (!new_item) {
         Serial.println("[TTS队列] 队列项内存分配失败");
+        xSemaphoreGive(audioMutex);
         return false;
     }
 
@@ -293,15 +334,29 @@ bool tts_queue_enqueue(uint8_t* audio_data, int audio_len, TTS_Priority priority
     if (curr == NULL) tts_queue.tail = new_item;
     tts_queue.count++;
     Serial.printf("[TTS队列] 音频入队，优先级=%d，队列长度=%d\n", priority, tts_queue.count);
-    return true;
+    result = true;
+
+    xSemaphoreGive(audioMutex);
+    return result;
 }
 
 TTS_QueueItem* tts_queue_dequeue() {
-    if (tts_queue.head == NULL) return NULL;
+    // 【修复】获取互斥锁保护队列操作
+    if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return NULL;
+    }
+
+    if (tts_queue.head == NULL) {
+        xSemaphoreGive(audioMutex);
+        return NULL;
+    }
+
     TTS_QueueItem* item = tts_queue.head;
     tts_queue.head = item->next;
     if (tts_queue.head == NULL) tts_queue.tail = NULL;
     tts_queue.count--;
+
+    xSemaphoreGive(audioMutex);
     return item;
 }
 
@@ -319,98 +374,124 @@ const char* tts_priority_name(TTS_Priority priority) {
     }
 }
 
-// ==================== TTS 播放任务 ====================
+// ==================== TTS 播放任务（修复：添加互斥锁保护I2S）====================
 void TTSPlayerTask(void* pvParameters) {
     Serial.println("[TTS播放器] 播放任务已启动");
     is_playing_audio = false;
     current_playing_priority = TTS_PRIORITY_LOW;
+
     while (true) {
-        if (tts_queue.head != NULL && !is_playing_audio) {
-            TTS_QueueItem* item = tts_queue_dequeue();
-            if (item != NULL) {
-                is_playing_audio = true;
-                current_playing_priority = item->priority;
-                Serial.printf("[TTS播放器] 开始播放，优先级=%s，大小=%d字节\n",
-                             tts_priority_name(item->priority), item->audio_len);
+        // 获取互斥锁后再操作队列和I2S
+        if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            if (tts_queue.head != NULL && !is_playing_audio) {
+                TTS_QueueItem* item = tts_queue_dequeue();
+                if (item != NULL) {
+                    is_playing_audio = true;
+                    current_playing_priority = item->priority;
+                    xSemaphoreGive(audioMutex); // 释放锁，因为后续操作耗时较长
 
-                uint8_t* pcm_data = item->audio_data;
-                int pcm_len = item->audio_len;
+                    Serial.printf("[TTS播放器] 开始播放，优先级=%s，大小=%d字节\n",
+                                 tts_priority_name(item->priority), item->audio_len);
 
-                // 检查是否是WAV格式（有44字节头）
-                int data_offset = 0;
-                if (pcm_len > 44 &&
-                    pcm_data[0] == 'R' && pcm_data[1] == 'I' &&
-                    pcm_data[2] == 'F' && pcm_data[3] == 'F') {
-                    data_offset = 44;
-                    Serial.println("[TTS播放器] 检测到WAV格式，跳过44字节头");
-                } else {
-                    Serial.println("[TTS播放器] 原始PCM数据，无WAV头");
-                }
+                    uint8_t* pcm_data = item->audio_data;
+                    int pcm_len = item->audio_len;
 
-                if (pcm_len > data_offset) {
-                    pcm_data += data_offset;
-                    pcm_len -= data_offset;
-
-                    Serial.printf("[TTS播放器] 实际PCM数据: %d字节\n", pcm_len);
-
-                    // 使用PSRAM或普通内存分配临时缓冲区
-                    int16_t* temp_buffer = NULL;
-                    if (ESP.getPsramSize() > 0) {
-                        temp_buffer = (int16_t*)ps_malloc(pcm_len);
+                    // 检查是否是WAV格式（有44字节头）
+                    int data_offset = 0;
+                    if (pcm_len > 44 &&
+                        pcm_data[0] == 'R' && pcm_data[1] == 'I' &&
+                        pcm_data[2] == 'F' && pcm_data[3] == 'F') {
+                        data_offset = 44;
+                        Serial.println("[TTS播放器] 检测到WAV格式，跳过44字节头");
                     } else {
-                        temp_buffer = (int16_t*)malloc(pcm_len);
+                        Serial.println("[TTS播放器] 原始PCM数据，无WAV头");
                     }
 
-                    if (temp_buffer) {
-                        int16_t* src_samples = (int16_t*)pcm_data;
-                        int num_samples = pcm_len / 2;
+                    if (pcm_len > data_offset) {
+                        pcm_data += data_offset;
+                        pcm_len -= data_offset;
 
-                        // 应用音量增益
-                        for (int i = 0; i < num_samples; i++) {
-                            int32_t sample = (int32_t)(src_samples[i] * VOLUME_GAIN);
-                            if (sample > 32767) sample = 32767;
-                            if (sample < -32768) sample = -32768;
-                            temp_buffer[i] = (int16_t)sample;
+                        Serial.printf("[TTS播放器] 实际PCM数据: %d字节\n", pcm_len);
+
+                        // 使用PSRAM或普通内存分配临时缓冲区
+                        int16_t* temp_buffer = NULL;
+                        if (ESP.getPsramSize() > 0) {
+                            temp_buffer = (int16_t*)ps_malloc(pcm_len);
+                        } else {
+                            temp_buffer = (int16_t*)malloc(pcm_len);
                         }
 
-                        size_t bytes_written = 0;
-                        int total_written = 0;
-                        const int CHUNK_SIZE = 4096;
+                        if (temp_buffer) {
+                            int16_t* src_samples = (int16_t*)pcm_data;
+                            int num_samples = pcm_len / 2;
 
-                        Serial.println("[TTS播放器] 开始I2S写入...");
-                        while (total_written < pcm_len) {
-                            int to_write = min(CHUNK_SIZE, pcm_len - total_written);
-                            i2s_write(I2S_PORT_OUT, ((uint8_t*)temp_buffer) + total_written,
-                                     to_write, &bytes_written, portMAX_DELAY);
-                            if (bytes_written > 0) {
-                                total_written += bytes_written;
-                            } else {
-                                Serial.println("[TTS播放器] I2S写入失败");
-                                break;
+                            // 应用音量增益
+                            for (int i = 0; i < num_samples; i++) {
+                                int32_t sample = (int32_t)(src_samples[i] * VOLUME_GAIN);
+                                if (sample > 32767) sample = 32767;
+                                if (sample < -32768) sample = -32768;
+                                temp_buffer[i] = (int16_t)sample;
                             }
+
+                            size_t bytes_written = 0;
+                            int total_written = 0;
+                            const int CHUNK_SIZE = 4096;
+
+                            Serial.println("[TTS播放器] 开始I2S写入...");
+
+                            // 获取锁后再操作I2S
+                            if (xSemaphoreTake(audioMutex, portMAX_DELAY) == pdTRUE) {
+                                i2s_zero_dma_buffer(I2S_PORT_OUT);
+
+                                while (total_written < pcm_len) {
+                                    int to_write = min(CHUNK_SIZE, pcm_len - total_written);
+                                    esp_err_t err = i2s_write(I2S_PORT_OUT, ((uint8_t*)temp_buffer) + total_written,
+                                             to_write, &bytes_written, portMAX_DELAY);
+                                    if (err == ESP_OK && bytes_written > 0) {
+                                        total_written += bytes_written;
+                                    } else {
+                                        Serial.printf("[TTS播放器] I2S写入失败 err=%d\n", err);
+                                        break;
+                                    }
+                                }
+
+                                Serial.printf("[TTS播放器] I2S写入完成: %d字节\n", total_written);
+                                xSemaphoreGive(audioMutex);
+                            }
+
+                            free(temp_buffer);
+
+                            // 等待播放完成（不需要锁）
+                            int audio_duration_ms = (pcm_len / 32000.0) * 1000;
+                            Serial.printf("[TTS播放器] 等待 %d ms...\n", audio_duration_ms);
+                            delay(audio_duration_ms + 100);
+
+                            // 获取锁清空缓冲区
+                            if (xSemaphoreTake(audioMutex, portMAX_DELAY) == pdTRUE) {
+                                i2s_zero_dma_buffer(I2S_PORT_OUT);
+                                xSemaphoreGive(audioMutex);
+                            }
+
+                            Serial.println("[TTS播放器] 播放完成");
+                        } else {
+                            Serial.println("[TTS播放器] 内存不足，无法分配播放缓冲区");
                         }
-
-                        Serial.printf("[TTS播放器] I2S写入完成: %d字节\n", total_written);
-
-                        free(temp_buffer);
-                        i2s_zero_dma_buffer(I2S_PORT_OUT);
-
-                        // 等待播放完成
-                        int audio_duration_ms = (pcm_len / 32000.0) * 1000;
-                        Serial.printf("[TTS播放器] 等待 %d ms...\n", audio_duration_ms);
-                        delay(audio_duration_ms + 100);
-                        Serial.println("[TTS播放器] 播放完成");
                     } else {
-                        Serial.println("[TTS播放器] 内存不足，无法分配播放缓冲区");
+                        Serial.println("[TTS播放器] 音频数据太短");
                     }
-                } else {
-                    Serial.println("[TTS播放器] 音频数据太短");
-                }
 
-                free(item->audio_data);
-                free(item);
-                is_playing_audio = false;
-                current_playing_priority = TTS_PRIORITY_LOW;
+                    free(item->audio_data);
+                    free(item);
+
+                    // 获取锁更新状态
+                    if (xSemaphoreTake(audioMutex, portMAX_DELAY) == pdTRUE) {
+                        is_playing_audio = false;
+                        current_playing_priority = TTS_PRIORITY_LOW;
+                        xSemaphoreGive(audioMutex);
+                    }
+                }
+            } else {
+                xSemaphoreGive(audioMutex);
             }
         }
         vTaskDelay(50 / portTICK_PERIOD_MS);
@@ -418,12 +499,23 @@ void TTSPlayerTask(void* pvParameters) {
 }
 
 bool play_tts_audio(uint8_t* audio_data, int audio_len, TTS_Priority priority) {
-    if (tts_should_interrupt_current(priority)) {
+    // 【修复】获取互斥锁检查状态
+    if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return false;
+    }
+
+    bool should_interrupt = tts_should_interrupt_current(priority);
+
+    if (should_interrupt) {
         Serial.printf("[TTS] %s优先级音频打断当前播放\n", priority > current_playing_priority ? "更高" : "相同");
         i2s_zero_dma_buffer(I2S_PORT_OUT);
         is_playing_audio = false;
+        xSemaphoreGive(audioMutex);
         delay(50);
+    } else {
+        xSemaphoreGive(audioMutex);
     }
+
     return tts_queue_enqueue(audio_data, audio_len, priority);
 }
 
@@ -469,6 +561,13 @@ bool playTtsAudioDirect(uint8_t* audio_data, int audio_len, TTS_Priority priorit
         Serial.println("[TTS直接播放] 语音识别已暂停");
     }
 
+    // 【修复】获取互斥锁保护I2S操作
+    if (xSemaphoreTake(audioMutex, portMAX_DELAY) != pdTRUE) {
+        Serial.println("[TTS直接播放] 获取互斥锁失败");
+        free(audio_data);
+        return false;
+    }
+
     // 清空I2S缓冲区
     i2s_zero_dma_buffer(I2S_PORT_OUT);
 
@@ -480,11 +579,11 @@ bool playTtsAudioDirect(uint8_t* audio_data, int audio_len, TTS_Priority priorit
     Serial.println("[TTS直接播放] 开始I2S写入...");
     while (total_written < pcm_len) {
         int to_write = min(CHUNK_SIZE, pcm_len - total_written);
-        i2s_write(I2S_PORT_OUT, pcm_data + total_written, to_write, &written, portMAX_DELAY);
-        if (written > 0) {
+        esp_err_t err = i2s_write(I2S_PORT_OUT, pcm_data + total_written, to_write, &written, portMAX_DELAY);
+        if (err == ESP_OK && written > 0) {
             total_written += written;
         } else {
-            Serial.println("[TTS直接播放] I2S写入失败");
+            Serial.printf("[TTS直接播放] I2S写入失败 err=%d\n", err);
             break;
         }
         vTaskDelay(1);
@@ -492,14 +591,20 @@ bool playTtsAudioDirect(uint8_t* audio_data, int audio_len, TTS_Priority priorit
 
     Serial.printf("[TTS直接播放] I2S写入完成: %d字节\n", total_written);
 
+    // 释放互斥锁
+    xSemaphoreGive(audioMutex);
+
     // 等待播放完成
     int audio_duration_ms = (pcm_len / 32000.0) * 1000;
     Serial.printf("[TTS直接播放] 等待 %d ms...\n", audio_duration_ms);
     delay(audio_duration_ms + 200);
     Serial.println("[TTS直接播放] 播放完成");
 
-    // 清空I2S缓冲区
-    i2s_zero_dma_buffer(I2S_PORT_OUT);
+    // 【修复】获取锁清空缓冲区
+    if (xSemaphoreTake(audioMutex, portMAX_DELAY) == pdTRUE) {
+        i2s_zero_dma_buffer(I2S_PORT_OUT);
+        xSemaphoreGive(audioMutex);
+    }
 
     // 释放音频数据
     free(audio_data);
@@ -754,8 +859,12 @@ void mqtt_reconnect() {
     // 配置MQTT客户端
     mqtt.setSocketTimeout(5);
     mqtt.setKeepAlive(30);
-    mqtt.setBufferSize(75000);  // 减少到75KB，足够接收60KB分段+MQTT开销
+    mqtt.setBufferSize(131072);  // 增加到128KB，支持更大音频+MQTT开销
     mqtt.setCallback(mqtt_callback);
+
+    // 【关键】打印缓冲区大小，确认设置生效
+    Serial.printf("[MQTT] 配置完成: SocketTimeout=5s, KeepAlive=30s\n");
+    Serial.printf("[MQTT] 缓冲区大小: %d 字节 (应该为 131072)\n", 131072);
 
     int retryCount = 0;
     while (!mqtt.connected()) {
@@ -770,10 +879,14 @@ void mqtt_reconnect() {
             mqtt.subscribe(MQTT_TOPIC_TTS_AUDIO);
             mqtt.subscribe("blindstick/tts/segments");
             mqtt.subscribe("blindstick/tts/pcm/+");  // 使用通配符订阅所有分段
+            mqtt.subscribe("blindstick/tts/control");   // 流式TTS控制
+            mqtt.subscribe("blindstick/tts/stream/+");  // 流式TTS音频
             mqtt.subscribe(MQTT_TOPIC_NAV_STEPS);
             mqtt.subscribe(MQTT_TOPIC_TTS_REQ);
             Serial.printf("[MQTT] 已订阅主题:\n");
-            Serial.printf("  - %s (TTS音频)\n", MQTT_TOPIC_TTS_AUDIO);
+            Serial.printf("  - %s (TTS音频-旧版)\n", MQTT_TOPIC_TTS_AUDIO);
+            Serial.printf("  - blindstick/tts/control (流式TTS控制-新版)\n");
+            Serial.printf("  - blindstick/tts/stream/+ (流式TTS音频-新版)\n");
             Serial.printf("  - blindstick/tts/segments (分段通知)\n");
             Serial.printf("  - blindstick/tts/pcm/+ (分段音频)\n");
             Serial.printf("  - %s (导航步骤)\n", MQTT_TOPIC_NAV_STEPS);
@@ -807,62 +920,89 @@ void mqtt_reconnect() {
     }
 }
 
-// ==================== MQTT 消息回调 ====================
+// ==================== MQTT 消息回调（支持流式TTS）====================
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     Serial.printf("[MQTT] 收到 [%s] 长度=%d\n", topic, length);
 
-    if (strcmp(topic, MQTT_TOPIC_TTS_AUDIO) == 0) {
-        Serial.printf("[MQTT] 收到TTS音频: %d字节\n", length);
-        if (length > 1000 && length < TTS_AUDIO_BUF_SIZE) {
-            // 暂停语音识别，释放内存
-            if (VoiceTaskHandle != NULL) {
-                vTaskSuspend(VoiceTaskHandle);
-                webSocket.disconnect();
-                Serial.println("[TTS] 语音识别已暂停");
-            }
+    // ===== 流式TTS控制消息处理（最高优先级）=====
+    if (strcmp(topic, "blindstick/tts/control") == 0) {
+        handleStreamControl((const char*)payload, length);
+        return;
+    }
 
-            // 直接播放，不缓冲
-            Serial.println("[TTS] 开始播放...");
+    // ===== 流式TTS音频数据处理 =====
+    if (strncmp(topic, "blindstick/tts/stream/", 22) == 0) {
+        handleStreamAudio(topic, payload, length);
+        return;
+    }
 
-            // 检查WAV头
-            int offset = 0;
-            if (length > 44 && payload[0]=='R' && payload[1]=='I' && payload[2]=='F' && payload[3]=='F') {
-                offset = 44;
-                Serial.println("[TTS] 跳过WAV头");
-            }
-
-            // 清空I2S缓冲区
-            i2s_zero_dma_buffer(I2S_PORT_OUT);
-
-            // 写入I2S（分块写入，避免DMA缓冲区溢出）
-            const int CHUNK_SIZE = 4096;
-            int total_written = 0;
-            size_t written = 0;
-
-            while (total_written < (int)(length - offset)) {
-                int to_write = min(CHUNK_SIZE, (int)(length - offset - total_written));
-                i2s_write(I2S_PORT_OUT, payload + offset + total_written, to_write, &written, portMAX_DELAY);
-                total_written += written;
-                vTaskDelay(1);
-            }
-            Serial.printf("[TTS] 写入I2S: %d字节\n", total_written);
-
-            // 等待播放完成
-            int wait_ms = (length - offset) / 32 + 200;
-            Serial.printf("[TTS] 播放中...等待%d毫秒\n", wait_ms);
-            delay(wait_ms);
-
-            i2s_zero_dma_buffer(I2S_PORT_OUT);
-            Serial.println("[TTS] 播放完成");
-
-            // 恢复语音识别任务
-            if (VoiceTaskHandle != NULL) {
-                vTaskResume(VoiceTaskHandle);
-                Serial.println("[TTS] 语音识别已恢复");
-            }
-        } else {
-            Serial.printf("[MQTT] 音频长度无效: %d (范围: 1000-%d)\n", length, TTS_AUDIO_BUF_SIZE);
+    // 打印前 20 字节内容用于调试（仅非音频数据）
+    if (length < 1000) {
+        Serial.print("[MQTT] 内容: ");
+        for (int i = 0; i < min(50, (int)length); i++) {
+            Serial.printf("%c", payload[i]);
         }
+        Serial.println();
+    }
+
+    // ===== 原有的TTS_AUDIO处理（兼容旧版）=====
+    if (strcmp(topic, MQTT_TOPIC_TTS_AUDIO) == 0) {
+        // 【修复】不再直接播放，而是将音频复制到队列，由 TTSPlayerTask 播放
+        Serial.printf("[MQTT] 收到TTS音频: %d字节，将入队播放\n", length);
+
+        // 【关键调试】检查音频长度是否合理
+        if (length < 1000) {
+            Serial.printf("[MQTT] 警告: 音频数据太短(%d字节)，可能被截断!\n", length);
+            Serial.println("[MQTT] 预期应该是 60000+ 字节");
+        } else if (length > 100000) {
+            Serial.printf("[MQTT] 警告: 音频数据异常大(%d字节)\n", length);
+        }
+
+        if (length < 1000 || length >= TTS_AUDIO_BUF_SIZE) {
+            Serial.printf("[MQTT] 音频长度无效: %d (范围: 1000-%d)\n", length, TTS_AUDIO_BUF_SIZE);
+            return;
+        }
+
+        // 【关键调试】检查WAV头
+        if (length > 44) {
+            Serial.printf("[MQTT] WAV头检查: %c%c%c%c\n", payload[0], payload[1], payload[2], payload[3]);
+            uint32_t wavSize = *(uint32_t*)(payload + 4);
+            Serial.printf("[MQTT] WAV声明大小: %d 字节\n", wavSize + 8);
+            Serial.printf("[MQTT] 实际接收大小: %d 字节\n", length);
+            if (wavSize + 8 != length) {
+                Serial.println("[MQTT] 警告: WAV大小与实际接收不符，数据可能截断!");
+            }
+        }
+
+        // 暂停语音识别，释放内存
+        if (VoiceTaskHandle != NULL) {
+            vTaskSuspend(VoiceTaskHandle);
+            webSocket.disconnect();
+            Serial.println("[TTS] 语音识别已暂停");
+        }
+
+        // 使用互斥锁保护音频缓冲区
+        if (xSemaphoreTake(audioMutex, portMAX_DELAY) == pdTRUE) {
+            // 分配内存并复制音频数据
+            uint8_t* audio_buf = (uint8_t*)allocateBuffer(length);
+            if (audio_buf == NULL) {
+                Serial.println("[TTS] 内存分配失败，无法播放");
+                xSemaphoreGive(audioMutex);
+                return;
+            }
+
+            memcpy(audio_buf, payload, length);
+            xSemaphoreGive(audioMutex);
+
+            // 将音频加入播放队列（高优先级，因为这是导航/告警语音）
+            if (play_tts_audio(audio_buf, length, TTS_PRIORITY_HIGH)) {
+                Serial.println("[TTS] 音频已入队，将由TTSPlayerTask播放");
+            } else {
+                Serial.println("[TTS] 队列已满，无法入队");
+                free(audio_buf);
+            }
+        }
+
     } else if (strncmp(topic, "blindstick/tts/segments", 23) == 0) {
         // 收到分段音频通知
         StaticJsonDocument<256> doc;
@@ -875,6 +1015,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
             tts_rx_len = 0;
             Serial.printf("[TTS-分段] 准备接收%d段音频，总大小%d字节\n", tts_segments_expected, tts_total_size);
         }
+
     } else if (strncmp(topic, "blindstick/tts/pcm/", 19) == 0) {
         // 收到音频分段
         int seg_idx = atoi(topic + 19);
@@ -882,78 +1023,56 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
                      seg_idx, length, tts_rx_len, TTS_AUDIO_BUF_SIZE);
 
         if (tts_rx_len + length < TTS_AUDIO_BUF_SIZE) {
-            memcpy((void*)(tts_rx_buf + tts_rx_len), payload, length);
-            tts_rx_len += length;
-            tts_segments_received++;
-            tts_received_size += length;
+            // 使用互斥锁保护缓冲区
+            if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                memcpy((void*)(tts_rx_buf + tts_rx_len), payload, length);
+                tts_rx_len += length;
+                tts_segments_received++;
+                tts_received_size += length;
+                xSemaphoreGive(audioMutex);
 
-            Serial.printf("[TTS-分段] 已接收%d/%d段，累计%d字节\n",
-                         tts_segments_received, tts_segments_expected, tts_rx_len);
+                Serial.printf("[TTS-分段] 已接收%d/%d段，累计%d字节\n",
+                             tts_segments_received, tts_segments_expected, tts_rx_len);
 
-            // 如果收齐所有段，开始播放
-            if (tts_segments_received >= tts_segments_expected && tts_segments_expected > 0) {
-                Serial.printf("[TTS-分段] 收齐所有段，开始播放: %d字节\n", tts_rx_len);
+                // 如果收齐所有段，将完整音频入队
+                if (tts_segments_received >= tts_segments_expected && tts_segments_expected > 0) {
+                    Serial.printf("[TTS-分段] 收齐所有段，将%d字节音频入队\n", tts_rx_len);
 
-                // 检查音频格式
-                if (tts_rx_len > 44) {
-                    Serial.printf("[TTS] 音频头: %c%c%c%c\n",
-                                 tts_rx_buf[0], tts_rx_buf[1], tts_rx_buf[2], tts_rx_buf[3]);
+                    // 暂停语音识别
+                    if (VoiceTaskHandle != NULL) {
+                        vTaskSuspend(VoiceTaskHandle);
+                        webSocket.disconnect();
+                        Serial.println("[TTS] 语音识别已暂停");
+                    }
+
+                    // 分配新缓冲区复制完整音频
+                    uint8_t* audio_buf = (uint8_t*)allocateBuffer(tts_rx_len);
+                    if (audio_buf != NULL) {
+                        memcpy(audio_buf, (const void*)tts_rx_buf, tts_rx_len);
+
+                        if (play_tts_audio(audio_buf, tts_rx_len, TTS_PRIORITY_HIGH)) {
+                            Serial.println("[TTS] 分段音频已入队");
+                        } else {
+                            Serial.println("[TTS] 队列已满，丢弃音频");
+                            free(audio_buf);
+                        }
+                    } else {
+                        Serial.println("[TTS] 内存分配失败");
+                    }
+
+                    // 重置接收状态
+                    tts_segments_expected = 0;
+                    tts_segments_received = 0;
+                    tts_rx_len = 0;
                 }
-
-                // 暂停语音识别任务，释放内存
-                if (VoiceTaskHandle != NULL) {
-                    vTaskSuspend(VoiceTaskHandle);
-                    webSocket.disconnect();
-                    Serial.println("[TTS] 语音识别已暂停");
-                }
-
-                // 检查WAV头
-                int offset = 0;
-                if (tts_rx_len > 44 && tts_rx_buf[0]=='R' && tts_rx_buf[1]=='I' && tts_rx_buf[2]=='F' && tts_rx_buf[3]=='F') {
-                    offset = 44;
-                    Serial.println("[TTS] 跳过WAV头");
-                }
-
-                // 清空I2S缓冲区
-                i2s_zero_dma_buffer(I2S_PORT_OUT);
-
-                // 写入I2S（分块写入）
-                const int CHUNK_SIZE = 4096;
-                int total_written = 0;
-                size_t written = 0;
-
-                while (total_written < tts_rx_len - offset) {
-                    int to_write = min(CHUNK_SIZE, tts_rx_len - offset - total_written);
-                    i2s_write(I2S_PORT_OUT, (const void*)(tts_rx_buf + offset + total_written), to_write, &written, portMAX_DELAY);
-                    total_written += written;
-                    vTaskDelay(1);
-                }
-
-                Serial.printf("[TTS] 写入I2S: %d字节\n", total_written);
-
-                // 等待播放完成
-                int wait_ms = (tts_rx_len - offset) / 32 + 200;
-                Serial.printf("[TTS] 播放中...等待%d毫秒\n", wait_ms);
-                delay(wait_ms);
-
-                i2s_zero_dma_buffer(I2S_PORT_OUT);
-                Serial.println("[TTS] 播放完成");
-
-                // 恢复语音识别任务
-                if (VoiceTaskHandle != NULL) {
-                    vTaskResume(VoiceTaskHandle);
-                    Serial.println("[TTS] 语音识别已恢复");
-                }
-
-                // 重置
-                tts_segments_expected = 0;
-                tts_segments_received = 0;
-                tts_rx_len = 0;
+            } else {
+                Serial.println("[TTS-分段] 获取互斥锁失败");
             }
         } else {
             Serial.printf("[TTS-分段] 缓冲区溢出！当前%d + 新%d = %d > %d\n",
                          tts_rx_len, length, tts_rx_len + length, TTS_AUDIO_BUF_SIZE);
         }
+
     } else if (strcmp(topic, MQTT_TOPIC_NAV_STEPS) == 0) {
         StaticJsonDocument<4096> doc;
         DeserializationError err = deserializeJson(doc, payload, length);
@@ -969,6 +1088,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
                 Serial.printf("[MQTT] 导航 → %s，%d步\n", doc["destination"].as<const char*>(), nav_total_steps);
             else Serial.printf("[MQTT] 导航 %d步\n", nav_total_steps);
         }
+
     } else if (strcmp(topic, MQTT_TOPIC_TTS_REQ) == 0) {
         // 收到TTS请求（网页端发送文本，ESP32自己合成）
         StaticJsonDocument<256> doc;
@@ -1195,51 +1315,23 @@ void RadarMotorUploadTask(void* pvParameters) {
         if (mqtt.connected()) {
                 mqtt.loop();  // 保活
 
-                // 处理 TTS 音频 - 直接播放，不经过队列
-                if (tts_rx_ready) {
-                    Serial.printf("[主循环] 直接播放TTS音频: %d字节\n", tts_rx_len);
+                // 【修复】处理 TTS 音频 - 改为入队，由 TTSPlayerTask 播放，避免阻塞雷达
+                if (tts_rx_ready && tts_rx_len > 0) {
+                    Serial.printf("[主循环] TTS音频就绪: %d字节，将入队播放\n", tts_rx_len);
 
-                    // 直接播放，不入队
-                    uint8_t* pcm_data = (uint8_t*)tts_rx_buf;
-                    int pcm_len = tts_rx_len;
+                    // 分配新缓冲区复制音频（因为 tts_rx_buf 是共享的）
+                    uint8_t* audio_buf = (uint8_t*)allocateBuffer(tts_rx_len);
+                    if (audio_buf != NULL) {
+                        memcpy(audio_buf, (const void*)tts_rx_buf, tts_rx_len);
 
-                    // 检查是否是WAV格式（有44字节头）
-                    int offset = 0;
-                    if (pcm_len > 44 && pcm_data[0]=='R' && pcm_data[1]=='I' && pcm_data[2]=='F' && pcm_data[3]=='F') {
-                        offset = 44;
-                        Serial.println("[直接播放] 检测到WAV格式，跳过44字节头");
-                    } else {
-                        Serial.println("[直接播放] 原始PCM数据，无WAV头");
-                    }
-
-                    if (pcm_len > offset) {
-                        Serial.printf("[直接播放] 开始播放，数据大小: %d字节\n", pcm_len - offset);
-
-                        // 清空I2S缓冲区
-                        i2s_zero_dma_buffer(I2S_PORT_OUT);
-
-                        // 分块写入，避免缓冲区溢出
-                        const int CHUNK_SIZE = 4096;
-                        int total_written = 0;
-                        size_t written = 0;
-
-                        while (total_written < pcm_len - offset) {
-                            int to_write = min(CHUNK_SIZE, pcm_len - offset - total_written);
-                            i2s_write(I2S_PORT_OUT, pcm_data + offset + total_written, to_write, &written, portMAX_DELAY);
-                            total_written += written;
-                            vTaskDelay(1); // 给系统一点时间
+                        if (play_tts_audio(audio_buf, tts_rx_len, TTS_PRIORITY_HIGH)) {
+                            Serial.println("[主循环] TTS音频已入队");
+                        } else {
+                            Serial.println("[主循环] 队列已满，丢弃音频");
+                            free(audio_buf);
                         }
-
-                        Serial.printf("[直接播放] 已写入I2S: %d字节\n", total_written);
-
-                        // 等待播放完成（根据数据量计算时间）
-                        // 16000Hz, 16bit, 单声道 = 32000字节/秒
-                        int play_time_ms = (pcm_len - offset) / 32;
-                        Serial.printf("[直接播放] 等待%d毫秒播放完成...\n", play_time_ms);
-                        delay(play_time_ms + 100);
-
-                        i2s_zero_dma_buffer(I2S_PORT_OUT);
-                        Serial.println("[直接播放] 播放完成");
+                    } else {
+                        Serial.println("[主循环] 内存分配失败");
                     }
 
                     tts_rx_ready = false;
@@ -1334,7 +1426,7 @@ void i2s_out_init() {
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
         .sample_rate = 16000, .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,  // 改为立体声，兼容左右声道配置
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = 8, .dma_buf_len = 1024,
@@ -1903,6 +1995,9 @@ void setup() {
 
     audioMutex = xSemaphoreCreateMutex();
     if (audioMutex) Serial.println("[系统] 互斥锁已创建");
+
+    // 初始化流式TTS
+    initStreamingTTS();
 
     i2s_out_init();
     // I2S 麦克风初始化（必须在 VoiceAssistantTask 启动前完成）
@@ -2538,4 +2633,161 @@ void checkObstacleAndAlertBaidu() {
     } else {
         last_blocked = false;
     }
+}
+
+// ==================== 流式TTS实现（新版简化逻辑）====================
+
+const char* getPrioName(int p) {
+    switch(p) {
+        case PRIO_HIGH: return "高(雷达)";
+        case PRIO_NORMAL: return "中(对话)";
+        case PRIO_LOW: return "低(导航)";
+        default: return "未知";
+    }
+}
+
+void initStreamingTTS() {
+    if (ESP.getPsramSize() > 0) {
+        stream_buffer = (uint8_t*)ps_malloc(STREAM_BUF_SIZE);
+    } else {
+        stream_buffer = (uint8_t*)malloc(STREAM_BUF_SIZE);
+    }
+    if (stream_buffer) {
+        Serial.printf("[流式TTS] 缓冲区分配成功: %d字节\n", STREAM_BUF_SIZE);
+    } else {
+        Serial.println("[流式TTS] 缓冲区分配失败！");
+    }
+    stream_playing = false;
+    stream_priority = 0;
+    stream_buf_used = 0;
+}
+
+void playPcmData(uint8_t* data, int len) {
+    if (!data || len < 2) return;
+    int16_t* samples = (int16_t*)data;
+    int num_samples = len / 2;
+    for (int i = 0; i < num_samples; i += 256) {
+        int16_t temp_buffer[256];
+        int chunk_samples = min(256, num_samples - i);
+        for (int j = 0; j < chunk_samples; j++) {
+            int32_t sample = (int32_t)(samples[i + j] * VOLUME_GAIN);
+            if (sample > 32767) sample = 32767;
+            if (sample < -32768) sample = -32768;
+            temp_buffer[j] = (int16_t)sample;
+        }
+        size_t bytes_written = 0;
+        i2s_write(I2S_PORT_OUT, temp_buffer, chunk_samples * 2, &bytes_written, portMAX_DELAY);
+    }
+}
+
+void stopCurrentPlayback() {
+    i2s_zero_dma_buffer(I2S_PORT_OUT);
+    stream_playing = false;
+    stream_buf_used = 0;
+    Serial.println("[流式TTS] 停止当前播放");
+}
+
+void handleStreamControl(const char* payload, int length) {
+    StaticJsonDocument<256> doc;
+    DeserializationError err = deserializeJson(doc, payload, length);
+    if (err) {
+        Serial.println("[流式TTS] 控制消息解析失败");
+        return;
+    }
+
+    const char* type = doc["type"] | "unknown";
+    int new_priority = doc["priority"] | 0;
+    unsigned long session_id = doc["session_id"] | 0;
+
+    if (strcmp(type, "stream_start") == 0) {
+        Serial.printf("[流式TTS] 开始新会话 priority=%s session=%lu\n",
+                     getPrioName(new_priority), session_id);
+
+        if (stream_playing) {
+            if (new_priority >= stream_priority) {
+                Serial.printf("[流式TTS] 打断当前%s播放\n", getPrioName(stream_priority));
+                stopCurrentPlayback();
+            } else {
+                Serial.printf("[流式TTS] 忽略低优先级%s\n", getPrioName(new_priority));
+                return;
+            }
+        }
+
+        stream_playing = true;
+        stream_priority = new_priority;
+        stream_session_id = session_id;
+        stream_buf_used = 0;
+
+        if (VoiceTaskHandle != NULL) {
+            vTaskSuspend(VoiceTaskHandle);
+            webSocket.disconnect();
+            Serial.println("[流式TTS] 语音识别已暂停");
+        }
+
+    } else if (strcmp(type, "stream_end") == 0) {
+        int segments = doc["segments"] | 0;
+        Serial.printf("[流式TTS] 会话结束，共%d段\n", segments);
+
+        if (stream_buffer_used > 0 && stream_playing) {
+            playPcmData(stream_buffer, stream_buffer_used);
+        }
+
+        if (VoiceTaskHandle != NULL && stream_priority < PRIO_HIGH) {
+            vTaskResume(VoiceTaskHandle);
+        }
+
+        stream_playing = false;
+        stream_buf_used = 0;
+
+    } else if (strcmp(type, "interrupt") == 0) {
+        Serial.printf("[流式TTS] 收到打断信号\n");
+        stopCurrentPlayback();
+        if (VoiceTaskHandle != NULL) {
+            vTaskResume(VoiceTaskHandle);
+        }
+    }
+}
+
+void handleStreamAudio(const char* topic, byte* payload, unsigned int length) {
+    if (!stream_playing) return;
+
+    int segment_idx = 0;
+    const char* last_slash = strrchr(topic, '/');
+    if (last_slash) {
+        segment_idx = atoi(last_slash + 1);
+    }
+
+    // 高优先级立即播放，不缓冲
+    if (stream_priority == PRIO_HIGH) {
+        Serial.printf("[流式TTS] 立即播放第%d段: %d字节\n", segment_idx, length);
+        playPcmData(payload, length);
+        return;
+    }
+
+    // 普通优先级使用缓冲
+    if (stream_buffer && stream_buf_used + length <= STREAM_BUF_SIZE) {
+        memcpy(stream_buffer + stream_buf_used, payload, length);
+        stream_buf_used += length;
+
+        // 缓冲区半满时播放一半
+        if (stream_buf_used >= STREAM_BUF_SIZE / 2) {
+            int play_size = stream_buf_used / 2;
+            playPcmData(stream_buffer, play_size);
+            memmove(stream_buffer, stream_buffer + play_size, stream_buf_used - play_size);
+            stream_buf_used -= play_size;
+        }
+    }
+}
+
+void announceObstacleStreaming(float distance, const char* direction) {
+    // 此函数在ESP32端直接调用baiduTTSPlay即可
+    // 代理服务器会处理成流式TTS
+    char text[64];
+    if (distance < 150) {
+        snprintf(text, sizeof(text), "注意！前方%.0f厘米有障碍物，请立即避让！", distance);
+    } else {
+        snprintf(text, sizeof(text), "前方%.0f厘米有%s障碍物", distance, direction);
+    }
+    Serial.printf("[雷达告警] %s\n", text);
+    baiduTTSPlay(text);
 }

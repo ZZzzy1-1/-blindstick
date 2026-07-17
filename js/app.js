@@ -202,6 +202,102 @@ async function baiduTTS(text) {
     return null;
 }
 
+// ==================== 流式TTS（新）====================
+// 优先级定义
+const TTS_PRIORITY = {
+    LOW: 0,      // 导航
+    NORMAL: 1,   // 对话
+    HIGH: 2      // 雷达告警
+};
+
+// 当前TTS会话状态
+let currentTTSSession = {
+    sessionId: null,
+    priority: 0,
+    isPlaying: false
+};
+
+/**
+ * 发送TTS请求到代理服务器进行流式合成
+ * @param {string} text - 要合成的文本
+ * @param {number} priority - 优先级 0=低(导航) 1=中(对话) 2=高(雷达告警)
+ * @returns {Promise<boolean>}
+ */
+async function streamTTS(text, priority = TTS_PRIORITY.NORMAL) {
+    console.log(`[流式TTS] 请求: "${text}" 优先级=${priority}`);
+
+    if (!mqttClient || !AppState.mqttConnected) {
+        console.error('[流式TTS] MQTT未连接');
+        return false;
+    }
+
+    try {
+        // 调用代理服务器的推送接口
+        const response = await fetch(`${API_BASE}/api/tts/push`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text, priority })
+        });
+
+        const result = await response.json();
+        if (result.status === 'ok') {
+            console.log('[流式TTS] 已推送到ESP32:', text.substring(0, 30));
+            return true;
+        } else {
+            console.error('[流式TTS] 推送失败:', result.message);
+            return false;
+        }
+    } catch (e) {
+        console.error('[流式TTS] 请求异常:', e.message);
+        // 降级到普通TTS
+        return baiduTTS(text);
+    }
+}
+
+/**
+ * 立即打断当前TTS播放（用于雷达告警等紧急场景）
+ * @param {number} newPriority - 新播放的优先级
+ */
+async function interruptTTS(newPriority = TTS_PRIORITY.HIGH) {
+    console.log(`[流式TTS] 打断请求，新优先级=${newPriority}`);
+
+    try {
+        await fetch(`${API_BASE}/api/tts/interrupt`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ priority: newPriority })
+        });
+    } catch (e) {
+        console.error('[流式TTS] 打断请求失败:', e.message);
+    }
+}
+
+/**
+ * 发送雷达告警语音（高优先级，立即打断）
+ * @param {number} distance - 距离（厘米）
+ * @param {string} direction - 方向
+ */
+async function announceObstacle(distance, direction) {
+    let text;
+    if (distance < 150) {
+        text = `注意！前方${Math.round(distance)}厘米有障碍物，请立即避让！`;
+    } else {
+        text = `前方${Math.round(distance)}厘米有${direction}障碍物`;
+    }
+
+    console.log('[雷达告警]', text);
+    await streamTTS(text, TTS_PRIORITY.HIGH);
+}
+
+/**
+ * 发送导航语音（普通优先级）
+ * @param {string} text - 导航文本
+ */
+async function announceNavigation(text) {
+    console.log('[导航语音]', text);
+    await streamTTS(text, TTS_PRIORITY.LOW);
+}
+
 // --- 处理语音导航（接收ESP32录音，识别，规划，发送TTS音频回ESP32播放）---
 async function handleVoiceNavigation(pcmBytes) {
     console.log('[语音] 收到PCM数据', pcmBytes.length, '字节');
@@ -267,26 +363,47 @@ async function handleVoiceNavigation(pcmBytes) {
 
     // 通过代理服务器合成TTS
     const ttsAudio = await baiduTTSWeb(ttsText);
-    if (ttsAudio && mqttClient) {
-        // 如果音频太大，分段发送
-        const MAX_MQTT_SIZE = 60000;
-        if (ttsAudio.length > MAX_MQTT_SIZE) {
+    if (ttsAudio && mqttClient && AppState.mqttConnected) {
+        // 【调试】强制分段发送，测试是否是大消息问题
+        const FORCE_SEGMENT = true;  // 设为 true 强制分段
+        const MAX_MQTT_SIZE = 30000; // 每段30KB，更安全
+
+        console.log('[语音] TTS音频大小:', ttsAudio.length, '字节');
+
+        // 如果音频太大或强制分段
+        if (ttsAudio.length > MAX_MQTT_SIZE || FORCE_SEGMENT) {
             const segments = Math.ceil(ttsAudio.length / MAX_MQTT_SIZE);
+            console.log('[语音] 分段发送:', segments, '段, 每段最大', MAX_MQTT_SIZE, '字节');
+
+            // 发送段数通知
             mqttClient.publish('blindstick/tts/segments', JSON.stringify({
                 segments: segments,
                 totalSize: ttsAudio.length
-            }));
+            }), { qos: 1 });
+
+            // 分段发送
             for (let i = 0; i < segments; i++) {
                 const start = i * MAX_MQTT_SIZE;
                 const end = Math.min(start + MAX_MQTT_SIZE, ttsAudio.length);
                 const segment = ttsAudio.slice(start, end);
-                mqttClient.publish(`blindstick/tts/pcm/${i}`, segment);
-                await new Promise(r => setTimeout(r, 100));
+                const topic = `blindstick/tts/pcm/${i}`;
+
+                await new Promise((resolve) => {
+                    mqttClient.publish(topic, segment, { qos: 1 }, (err) => {
+                        if (err) console.error(`[语音] 第${i+1}段发送失败:`, err);
+                        else console.log(`[语音] 第${i+1}/${segments}段发送成功`);
+                        resolve();
+                    });
+                });
+                await new Promise(r => setTimeout(r, 150)); // 增加延迟
             }
         } else {
-            mqttClient.publish(MQTT_CONFIG.topics.ttsAudio, ttsAudio);
+            // 小音频直接发送
+            mqttClient.publish(MQTT_CONFIG.topics.ttsAudio, ttsAudio, { qos: 1 });
+            console.log('[语音] TTS音频已发送给ESP32:', ttsAudio.length, '字节');
         }
-        console.log('[语音] TTS音频已发送给ESP32');
+    } else {
+        console.error('[语音] 无法发送TTS音频: mqttClient=', !!mqttClient, 'connected=', AppState.mqttConnected);
     }
 
     updateNavigationSteps(navMsg);
@@ -548,6 +665,7 @@ async function handleMqttMessage(topic, payload) {
                                 await new Promise((resolve) => {
                                     mqttClient.publish(topic, segment, { qos: 1 }, (err) => {
                                         if (err) console.error(`[TTS-MQTT] 第${i+1}段发送失败:`, err);
+                                        else console.log(`[TTS-MQTT] 第${i+1}/${segments}段发送成功`);
                                         resolve();
                                     });
                                 });
@@ -555,8 +673,19 @@ async function handleMqttMessage(topic, payload) {
                                 await new Promise(r => setTimeout(r, 100)); // 避免过快
                             }
                         } else {
-                            // 小音频直接发送
-                            mqttClient.publish(MQTT_CONFIG.topics.ttsAudio, ttsAudio);
+                            // 小音频直接发送 - 明确指定为二进制
+                            console.log('[TTS-MQTT] 准备发送音频...');
+                            console.log('[TTS-MQTT] 音频类型:', ttsAudio.constructor.name);
+                            console.log('[TTS-MQTT] 音频长度:', ttsAudio.length);
+                            console.log('[TTS-MQTT] 前4字节:', ttsAudio[0], ttsAudio[1], ttsAudio[2], ttsAudio[3], '(应该是 82,73,70,70 = RIFF)');
+
+                            mqttClient.publish(MQTT_CONFIG.topics.ttsAudio, ttsAudio, { qos: 1 }, (err) => {
+                                if (err) {
+                                    console.error('[TTS-MQTT] 发送失败:', err);
+                                } else {
+                                    console.log('[TTS-MQTT] 发送成功确认');
+                                }
+                            });
                             console.log('[TTS-MQTT] 已发送TTS音频:', ttsAudio.length, '字节');
                         }
                         console.log('[语音播报]', msg.text);

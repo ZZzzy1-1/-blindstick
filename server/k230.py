@@ -47,7 +47,7 @@ import socket
 WIFI_SSID     = "Edian"
 WIFI_PASSWORD = "Edian1234567890#"
 SERVER_HOST   = "192.168.3.24"
-SERVER_PORT   = 8080
+SERVER_PORT   = 80800
 
 wlan = network.WLAN(network.STA_IF)
 try: wlan.active(True)
