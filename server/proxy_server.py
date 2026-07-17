@@ -426,9 +426,13 @@ class TestModeHandler:
         """处理MQTT消息"""
         topic = msg.topic
 
+        # 调试：打印所有收到的消息
+        print(f"[MQTT调试] 收到消息: {topic}, 长度: {len(msg.payload)}")
+
         try:
             # 控制消息（开始/结束）
             if topic == "blindstick/test/audio":
+                print(f"[测试模式] 收到控制消息: {msg.payload}")
                 data = json.loads(msg.payload)
                 msg_type = data.get('type', '')
 
@@ -443,6 +447,8 @@ class TestModeHandler:
 
         except Exception as e:
             print(f"[测试模式] 处理消息失败: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _handle_start(self, data):
         """开始录音"""
