@@ -883,17 +883,32 @@ void RadarMotorUploadTask(void* pvParameters) {
 
 // ==================== Core 1 导航任务 ====================
 void NavigationTask(void* pvParameters) {
+    Serial.println("[导航] 任务已启动");
     while (true) {
         int total = nav_total_steps;
-        if (total > 0 && current_step_idx < total) {
+        if (total > 0 && current_step_idx < total && nav_active) {
             if (current_progress < 100) {
                 if (is_blocked || is_ai_talking) {
-                    vTaskDelay(200 / portTICK_PERIOD_MS); continue;
+                    vTaskDelay(200 / portTICK_PERIOD_MS);
+                    continue;
                 }
-                vTaskDelay(1000 / portTICK_PERIOD_MS);
-                current_progress += 10;
+                // 每3秒增加5%进度，一步约60秒
+                vTaskDelay(3000 / portTICK_PERIOD_MS);
+                current_progress += 5;
+
+                // 调试输出
+                static int last_debug = -1;
+                if (current_progress / 20 != last_debug) {
+                    last_debug = current_progress / 20;
+                    Serial.printf("[导航] 步骤 %d/%d, 进度: %d%%\n",
+                                  current_step_idx + 1, total, current_progress);
+                }
             } else {
-                current_progress = 0; current_step_idx++;
+                current_progress = 0;
+                current_step_idx++;
+                Serial.printf("[导航] 进入步骤 %d/%d: %s\n",
+                              current_step_idx + 1, total, nav_steps[current_step_idx].c_str());
+
                 if (current_step_idx >= total) {
                     nav_active = false;
                     nav_total_steps = 1;
@@ -903,7 +918,8 @@ void NavigationTask(void* pvParameters) {
                 vTaskDelay(1000 / portTICK_PERIOD_MS);
             }
         } else {
-            current_step_idx = 0; current_progress = 0;
+            current_step_idx = 0;
+            current_progress = 0;
             vTaskDelay(1000 / portTICK_PERIOD_MS);
         }
         vTaskDelay(50 / portTICK_PERIOD_MS);
@@ -1532,8 +1548,8 @@ void setup() {
 
     Serial.println("[系统] 等待语音输入目的地...");
 
-    // xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 8192, NULL, 3, &RadarTaskHandle, 0);
-    // xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
+    xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 8192, NULL, 3, &RadarTaskHandle, 0);
+    xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
     xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 8192, NULL, 2, &VoiceTaskHandle, 1);
 
     delay(300);
