@@ -67,7 +67,8 @@
       "WebFetch(domain:blindstick-4.onrender.com)",
       "Bash(tasklist)",
       "Bash(findstr python *)",
-      "Bash(python3 *)"
+      "Bash(python3 *)",
+      "PowerShell(Set-Content *)"
     ]
   }
 }

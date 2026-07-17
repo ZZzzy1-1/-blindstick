@@ -1829,7 +1829,7 @@ void handleVoiceCommand(const char* text) {
 
 // ==================== TTS URL处理（下载并播放）====================
 void handleTTSUrl(const char* payload, int length) {
-    // 解析JSON获取URL
+    // 解析JSON获取URL和文本
     StaticJsonDocument<512> doc;
     DeserializationError error = deserializeJson(doc, payload, length);
 
@@ -1839,19 +1839,24 @@ void handleTTSUrl(const char* payload, int length) {
     }
 
     const char* url = doc["url"];
+    const char* text = doc["text"];
     if (!url || strlen(url) == 0) {
         Serial.println("[TTS-URL] URL为空");
         return;
     }
 
-    // 去重：检查是否和上次播放的URL相同
-    static String lastUrl = "";
-    String currentUrl = String(url);
-    if (currentUrl == lastUrl) {
-        Serial.println("[TTS-URL] 重复URL，跳过播放");
+    // 去重：基于文本内容 + 3秒时间窗口
+    static String lastText = "";
+    static unsigned long lastPlayTime = 0;
+    String currentText = text ? String(text) : "";
+    unsigned long now = millis();
+
+    if (currentText == lastText && (now - lastPlayTime) < 3000) {
+        Serial.println("[TTS-URL] 3秒内重复文本，跳过播放");
         return;
     }
-    lastUrl = currentUrl;
+    lastText = currentText;
+    lastPlayTime = now;
 
     Serial.printf("[TTS-URL] 收到URL: %s\n", url);
 

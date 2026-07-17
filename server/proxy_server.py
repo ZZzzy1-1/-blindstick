@@ -255,8 +255,10 @@ def tts_push():
         if 'audio' in resp.headers.get('Content-Type', ''):
             audio_data = resp.content
             print(f"[TTS] Synthesis success: {len(audio_data)} bytes")
-            file_hash = hashlib.md5(text.encode()).hexdigest()[:12]
-            filename = f"tts_{file_hash}.wav"
+            # 添加时间戳确保文件名唯一，避免重复播放问题
+            timestamp = int(time.time())
+            file_hash = hashlib.md5(text.encode()).hexdigest()[:8]
+            filename = f"tts_{timestamp}_{file_hash}.wav"
             filepath = os.path.join(AUDIO_CACHE_DIR, filename)
             os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
             with open(filepath, 'wb') as f:
