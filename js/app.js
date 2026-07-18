@@ -410,16 +410,16 @@ async function handleMqttMessage(topic, payload) {
             const msg = JSON.parse(payload.toString());
             console.log('[MQTT] 传感器数据:', JSON.stringify(msg));
 
-            // 设备状态
-            if (msg.status) {
-                updateModuleStatus({
-                    main:  msg.status.esp32,
-                    vision: msg.status.k230,
-                    radar:  msg.status.lidar,
-                    gps:    msg.status.gps,
-                    voice:  msg.status.voice
-                });
-            }
+            // 设备状态 - 根据真实传感器数据推断
+            // ESP32 没有直接发送 status 对象，需要根据各传感器数据推断
+            const deviceStatus = {
+                main: true,  // ESP32 在线（能收到MQTT消息就是在线）
+                vision: false,  // K230 暂时未接入，后面用户会提供
+                radar: !!(msg.radar && (msg.radar.f !== undefined || msg.radar.front !== undefined)),
+                gps: !!(msg.gps && msg.gps.sats > 0),
+                voice: true  // 语音模块在线（能处理TTS请求）
+            };
+            updateModuleStatus(deviceStatus);
 
             // 雷达数据（五向）- 简化为短字段名
             if (msg.radar) {
@@ -577,16 +577,22 @@ async function handleMqttMessage(topic, payload) {
 
 // ================= UI 状态更新函数 =================
 function updateModuleStatus(modules) {
-    const keys = ['main', 'vision', 'radar', 'gps', 'voice'];
-    keys.forEach(k => {
-        if (modules[k] !== undefined) {
-            const target = Array.from(document.querySelectorAll('.status-bar .status-item'))
-                .find(item => item.textContent.includes(
-                    k === 'main' ? '主控' : k === 'vision' ? '视觉' : k === 'radar' ? '雷达' : k === 'gps' ? 'GPS' : '语音'
-                ));
-            if (target) target.className = modules[k] ? 'status-item online' : 'status-item offline';
+    const statusMap = {
+        main: 'status-main',
+        vision: 'status-vision',
+        radar: 'status-radar',
+        gps: 'status-gps',
+        voice: 'status-voice'
+    };
+
+    for (const [key, elementId] of Object.entries(statusMap)) {
+        if (modules[key] !== undefined) {
+            const el = document.getElementById(elementId);
+            if (el) {
+                el.className = modules[key] ? 'status-item online' : 'status-item offline';
+            }
         }
-    });
+    }
 }
 
 function updateRadarCircles(front, frontLeft, frontRight, left, right) {
@@ -794,6 +800,8 @@ function updateSatellites(count) {
         else if (count > 0)  { gpsEl.textContent = 'GPS信号弱';   gpsEl.className = 'tag warn'; }
         else                 { gpsEl.textContent = 'GPS搜星中';   gpsEl.className = 'tag warn'; }
     }
+    // 更新GPS状态栏
+    updateModuleStatus({ gps: count > 0 });
 }
 
 // ================= 导航记录 =================
@@ -845,7 +853,7 @@ function init() {
     initMap();
     initDetectionStats();
     connectMQTT();        // ← MQTT 替代 WebSocket
-    // loadConfig();      // ← Netlify 静态托管无后端，禁用
+    loadHomeCitySettings(); // 加载常住地设置
     initModal();
 
     function loop() {
@@ -1250,4 +1258,92 @@ if (typeof window !== 'undefined') {
     window.playStartupSound = playStartupSound;
     window.announceObstacleWithDistance = announceObstacleWithDistance;
     window.handleVoiceNavigationAdvanced = handleVoiceNavigationAdvanced;
+}
+
+// ================= 新增：常住地设置功能 =================
+
+/**
+ * 打开设置弹窗
+ */
+function openSettings() {
+    const modal = document.getElementById('settingsModal');
+    const currentCityDiv = document.getElementById('currentHomeCity');
+    const homeCityInput = document.getElementById('homeCityInput');
+
+    // 加载当前常住地
+    const savedCity = localStorage.getItem('homeCity') || API_CONFIG.homeCity;
+    if (currentCityDiv) {
+        currentCityDiv.textContent = savedCity;
+    }
+    if (homeCityInput) {
+        homeCityInput.value = '';
+        homeCityInput.placeholder = `例如：${savedCity}`;
+    }
+
+    modal.style.display = 'flex';
+    console.log('[设置] 打开设置弹窗，当前常住地:', savedCity);
+}
+
+/**
+ * 关闭设置弹窗
+ */
+function closeSettings() {
+    const modal = document.getElementById('settingsModal');
+    modal.style.display = 'none';
+}
+
+/**
+ * 保存常住地设置
+ */
+function saveSettings() {
+    const homeCityInput = document.getElementById('homeCityInput');
+    const newCity = homeCityInput.value.trim();
+
+    if (!newCity) {
+        showToast('请输入常住地城市名称');
+        return;
+    }
+
+    // 保存到 localStorage
+    localStorage.setItem('homeCity', newCity);
+
+    // 更新 API_CONFIG
+    API_CONFIG.homeCity = newCity;
+    AppState.config.homeCity = newCity;
+
+    // 通过 MQTT 发送给 ESP32
+    if (mqttClient && AppState.mqttConnected) {
+        const msg = JSON.stringify({
+            type: 'home_city_update',
+            city: newCity,
+            ts: Date.now()
+        });
+        mqttClient.publish('blindstick/config/home_city', msg);
+        console.log('[设置] 常住地已发送给ESP32:', newCity);
+    }
+
+    // 更新显示
+    const currentCityDiv = document.getElementById('currentHomeCity');
+    if (currentCityDiv) {
+        currentCityDiv.textContent = newCity;
+    }
+
+    showToast(`常住地已设置为：${newCity}`);
+    closeSettings();
+
+    console.log('[设置] 常住地已保存:', newCity);
+}
+
+/**
+ * 加载常住地设置（从 localStorage）
+ */
+function loadHomeCitySettings() {
+    const savedCity = localStorage.getItem('homeCity');
+    if (savedCity) {
+        API_CONFIG.homeCity = savedCity;
+        AppState.config.homeCity = savedCity;
+        console.log('[设置] 已加载常住地:', savedCity);
+    } else {
+        console.log('[设置] 使用默认常住地:', API_CONFIG.homeCity);
+    }
 }

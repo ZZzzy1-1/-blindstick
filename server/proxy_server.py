@@ -179,6 +179,84 @@ class MQTTAudioSender:
         self.username = "blindstick"
         self.password = "2026"
 
+    def on_message(self, client, userdata, msg):
+        """处理接收到的MQTT消息"""
+        try:
+            topic = msg.topic
+            payload = msg.payload.decode('utf-8')
+            print(f"[MQTT] Received on {topic}: {payload[:100]}...")
+
+            if topic == "blindstick/tts/request":
+                # 处理TTS请求
+                data = json.loads(payload)
+                text = data.get("text", "")
+                priority = data.get("priority", 0)
+
+                if text:
+                    print(f"[MQTT] TTS Request received: '{text[:50]}...' priority={priority}")
+                    # 调用TTS生成并推送
+                    self.handle_tts_request(text, priority)
+
+        except Exception as e:
+            print(f"[MQTT] Message handling error: {e}")
+
+    def handle_tts_request(self, text, priority=0):
+        """处理TTS请求：调用百度TTS并推送URL到ESP32"""
+        try:
+            token = get_baidu_token()
+            if not token:
+                print("[TTS] Cannot get token")
+                return
+
+            url = "https://tsn.baidu.com/text2audio"
+            payload = {
+                "tex": text,
+                "tok": token,
+                "cuid": "blindstick_proxy",
+                "ctp": 1,
+                "lan": "zh",
+                "spd": 5,
+                "pit": 5,
+                "vol": 9,
+                "per": 1,
+                "aue": 6
+            }
+
+            resp = requests.post(url, data=payload, timeout=15, verify=False)
+
+            if 'audio' in resp.headers.get('Content-Type', ''):
+                audio_data = resp.content
+                print(f"[TTS] Synthesis success: {len(audio_data)} bytes")
+
+                # 保存音频文件
+                timestamp = int(time.time())
+                file_hash = hashlib.md5(text.encode()).hexdigest()[:8]
+                filename = f"tts_{timestamp}_{file_hash}.wav"
+                filepath = os.path.join(AUDIO_CACHE_DIR, filename)
+                os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
+
+                with open(filepath, 'wb') as f:
+                    f.write(audio_data)
+
+                # 生成公网URL并推送
+                full_url = f"https://blindstick-4.onrender.com/audio/{filename}"
+                url_payload = json.dumps({
+                    "type": "tts_url",
+                    "url": full_url,
+                    "text": text[:30],
+                    "priority": priority
+                })
+
+                self.client.publish("blindstick/tts/url", url_payload)
+                print(f"[MQTT] TTS URL pushed: {full_url}")
+            else:
+                print(f"[TTS] Synthesis failed: {resp.text[:200]}")
+
+        except Exception as e:
+            print(f"[TTS] Handle request error: {e}")
+            import traceback
+            traceback.print_exc()
+
     def connect(self):
         if not MQTT_AVAILABLE:
             return False
@@ -186,17 +264,25 @@ class MQTTAudioSender:
             self.client = mqtt.Client(client_id="proxy_server_tts")
             self.client.username_pw_set(self.username, self.password)
             self.client.tls_set()
+
             def on_connect(client, userdata, flags, rc):
                 if rc == 0:
                     self.connected = True
                     print(f"[MQTT] Connected to {self.broker}")
+                    # 订阅TTS请求主题
+                    client.subscribe("blindstick/tts/request")
+                    print("[MQTT] Subscribed to blindstick/tts/request")
                 else:
                     print(f"[MQTT] Connection failed, code: {rc}")
+
             def on_disconnect(client, userdata, rc):
                 self.connected = False
                 print(f"[MQTT] Disconnected")
+
             self.client.on_connect = on_connect
             self.client.on_disconnect = on_disconnect
+            self.client.on_message = self.on_message
+
             self.client.connect(self.broker, self.port, 60)
             self.client.loop_start()
             return True

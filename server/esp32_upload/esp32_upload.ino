@@ -254,6 +254,9 @@ float gps_speed = 0.0;
 int   gps_heading = 0;
 int   gps_satellites = 0;
 
+// 常住地设置（默认黄石市，可通过MQTT更新）
+String home_city = "黄石市";
+
 volatile bool amap_fused = false;
 
 enum LidarState { WAIT_HEADER_AA, WAIT_HEADER_55, READ_CT, READ_LSN, READ_PAYLOAD };
@@ -295,7 +298,7 @@ void motorControl(int steerPower) {
     }
 }
 
-// ==================== 避障决策 ====================
+// ==================== 避障决策（智能转向，判断目标方向空间是否充足）====================
 void smartAvoidDecision() {
     float f  = dir_smt[0];
     float fR = dir_smt[1];
@@ -304,43 +307,124 @@ void smartAvoidDecision() {
     float L  = dir_smt[4];
     static unsigned long turnStartMs = 0;
     static bool was_turning = false;
+    static int turn_direction = 0;  // 0=无, 1=左转, -1=右转
     unsigned long now = millis();
 
-    bool front_blocked = (f < 150.0f) || (fL < 150.0f) || (fR < 150.0f);
-    bool side_alert    = (L < 70.0f)  || (R < 70.0f);
+    // 阈值定义
+    const float FRONT_BLOCK_CM = 150.0f;   // 前方阻挡阈值
+    const float SIDE_BLOCK_CM = 70.0f;     // 侧边阻挡阈值
+    const float TURN_CLEAR_CM = 200.0f;    // 转向目标方向需要至少200cm才转向
+    const float TURN_TIMEOUT_MS = 2500;    // 转向超时时间
+
+    bool front_blocked = (f < FRONT_BLOCK_CM) || (fL < FRONT_BLOCK_CM) || (fR < FRONT_BLOCK_CM);
+    bool side_alert    = (L < SIDE_BLOCK_CM)  || (R < SIDE_BLOCK_CM);
     is_blocked = front_blocked || side_alert;
 
-    if (front_blocked) {
-        turnStartMs = now; was_turning = true;
-        if (fL > fR)  motorControl( STEER_MAX_PWM);
-        else          motorControl(-STEER_MAX_PWM);
+    // AI说话时停止电机
+    if (is_ai_talking) {
+        motorControl(0);
         return;
     }
+
+    // 前方被阻挡，需要转向
+    if (front_blocked) {
+        // 智能判断：选择空间更大的一边，但只有当目标方向有足够空间时才转向
+        bool should_turn_left = false;
+        bool should_turn_right = false;
+
+        // 判断左转条件：左前方或左侧有足够空间
+        if (fL > fR && fL > TURN_CLEAR_CM) {
+            should_turn_left = true;
+        } else if (L > R && L > TURN_CLEAR_CM) {
+            should_turn_left = true;
+        }
+
+        // 判断右转条件：右前方或右侧有足够空间
+        if (fR > fL && fR > TURN_CLEAR_CM) {
+            should_turn_right = true;
+        } else if (R > L && R > TURN_CLEAR_CM) {
+            should_turn_right = true;
+        }
+
+        // 执行转向决策
+        if (should_turn_left && !should_turn_right) {
+            // 只能左转
+            turnStartMs = now;
+            was_turning = true;
+            turn_direction = 1;
+            motorControl(STEER_MAX_PWM);
+            return;
+        } else if (should_turn_right && !should_turn_left) {
+            // 只能右转
+            turnStartMs = now;
+            was_turning = true;
+            turn_direction = -1;
+            motorControl(-STEER_MAX_PWM);
+            return;
+        } else if (should_turn_left && should_turn_right) {
+            // 两边都可以，选择空间更大的
+            float left_space = max(fL, L);
+            float right_space = max(fR, R);
+            turnStartMs = now;
+            was_turning = true;
+            if (left_space > right_space) {
+                turn_direction = 1;
+                motorControl(STEER_MAX_PWM);
+            } else {
+                turn_direction = -1;
+                motorControl(-STEER_MAX_PWM);
+            }
+            return;
+        }
+        // 两边都不够空间，不转向，只停止（避免撞墙）
+        motorControl(0);
+        return;
+    }
+
+    // 正在转向后的恢复逻辑
     if (was_turning) {
-        bool escape_clear;
-        if (fL > fR)  escape_clear = (fL > 250.0f && f > 200.0f);
-        else          escape_clear = (fR > 250.0f && f > 200.0f);
-        bool timeout = (now - turnStartMs) > 2500;
+        // 判断转向目标方向是否已经有足够空间
+        bool escape_clear = false;
+        if (turn_direction == 1) {
+            // 之前向左转，检查左侧和左前方
+            escape_clear = (fL > TURN_CLEAR_CM && f > FRONT_BLOCK_CM);
+        } else if (turn_direction == -1) {
+            // 之前向右转，检查右侧和右前方
+            escape_clear = (fR > TURN_CLEAR_CM && f > FRONT_BLOCK_CM);
+        }
+        bool timeout = (now - turnStartMs) > TURN_TIMEOUT_MS;
+
         if (escape_clear || timeout) {
             was_turning = false;
+            turn_direction = 0;
         } else {
-            if (fL > fR)  motorControl( STEER_MAX_PWM);
-            else          motorControl(-STEER_MAX_PWM);
+            // 继续转向
+            if (turn_direction == 1) {
+                motorControl(STEER_MAX_PWM);
+            } else if (turn_direction == -1) {
+                motorControl(-STEER_MAX_PWM);
+            }
             return;
         }
     }
+
+    // 侧边告警微调（保持安全距离）
     if (side_alert) {
-        float leftPull  = (70.0f - L) * 3.0f;
-        float rightPull = (70.0f - R) * 3.0f;
+        float leftPull  = (SIDE_BLOCK_CM - L) * 3.0f;
+        float rightPull = (SIDE_BLOCK_CM - R) * 3.0f;
         motorControl((int)(leftPull - rightPull));
         return;
     }
+
+    // 右侧沿墙走模式（保持与右侧墙壁的安全距离）
     if (R < 200.0f) {
         float err = R - 90.0f;
         err = constrain(err, -50.0f, 60.0f);
         motorControl((int)(err * 0.4f));
         return;
     }
+
+    // 无障碍，直行
     motorControl(0);
 }
 
@@ -547,6 +631,7 @@ void mqtt_reconnect() {
             mqtt.subscribe("blindstick/tts/url");       // TTS URL（新方案）
             mqtt.subscribe(MQTT_TOPIC_NAV_STEPS);
             mqtt.subscribe(MQTT_TOPIC_TTS_REQ);
+            mqtt.subscribe("blindstick/config/home_city");  // 常住地设置
             Serial.printf("[MQTT] 已订阅主题:\n");
             Serial.printf("  - %s (完整音频-备用)\n", MQTT_TOPIC_TTS_AUDIO);
             Serial.printf("  - blindstick/tts/control (流式TTS控制)\n");
@@ -554,6 +639,7 @@ void mqtt_reconnect() {
             Serial.printf("  - blindstick/tts/url (TTS音频URL)\n");
             Serial.printf("  - %s (导航步骤)\n", MQTT_TOPIC_NAV_STEPS);
             Serial.printf("  - %s (TTS请求)\n", MQTT_TOPIC_TTS_REQ);
+            Serial.printf("  - blindstick/config/home_city (常住地设置)\n");
             retryCount = 0;
         } else {
             int rc = mqtt.state();
@@ -607,6 +693,28 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
     // ===== TTS URL处理（新方案：接收URL并下载）=====
     if (strcmp(topic, "blindstick/tts/url") == 0) {
         handleTTSUrl((const char*)payload, length);
+        return;
+    }
+
+    // ===== 常住地设置处理 =====
+    if (strcmp(topic, "blindstick/config/home_city") == 0) {
+        StaticJsonDocument<256> doc;
+        DeserializationError err = deserializeJson(doc, payload, length);
+        if (!err && doc.containsKey("city")) {
+            const char* new_city = doc["city"];
+            home_city = String(new_city);
+            Serial.printf("[配置] 常住地已更新为: %s\n", home_city.c_str());
+
+            // 播报确认
+            StaticJsonDocument<256> ttsDoc;
+            char confirmText[64];
+            snprintf(confirmText, sizeof(confirmText), "常住地已设置为%s", home_city.c_str());
+            ttsDoc["text"] = confirmText;
+            ttsDoc["priority"] = PRIO_NORMAL;
+            char buf[256];
+            size_t len = serializeJson(ttsDoc, buf, sizeof(buf));
+            mqtt.publish("blindstick/tts/request", buf, len);
+        }
         return;
     }
 
@@ -726,8 +834,11 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
 bool last_blocked = false;
 unsigned long last_alert_time = 0;
 float last_alert_dist = 0;
-#define ALERT_INTERVAL_MS 5000  // 障碍物告警间隔 5 秒（从3秒增加到5秒）
-#define ALERT_DIST_CHANGE 50    // 距离变化超过50cm才重新播报（从30cm增加到50cm）
+#define ALERT_INTERVAL_MS 5000  // 障碍物告警间隔 5 秒
+#define ALERT_DIST_CHANGE 50    // 距离变化超过50cm才重新播报
+
+// 开机语音播报标志（只播报一次）
+volatile bool startup_announced = false;
 
 // ==================== 辅助函数：使用PSRAM或普通内存分配 ====================
 void* allocateBuffer(size_t size) {
@@ -781,62 +892,117 @@ void publishSensorData() {
 }
 
 /**
- * 障碍物检测和播报 - 使用流式TTS
+ * 障碍物检测和播报 - 简化版：只播报方向和建议，不播报具体距离
+ * 5秒内只播报一次
  */
 void checkObstacleAndAlert() {
-    // 获取当前最小距离和方向
-    float min_dist = 400.0f;
-    const char* direction = "前方";
+    // 检查各个方向的障碍物（只检测正前、左、右三个主要方向）
+    float f  = dir_smt[0];  // 正前方
+    float fL = dir_smt[2];  // 左前方
+    float fR = dir_smt[1];  // 右前方
+    float L  = dir_smt[4];  // 左侧
+    float R  = dir_smt[3];  // 右侧
 
-    if (dir_smt[0] < min_dist) { min_dist = dir_smt[0]; direction = "正前方"; }
-    if (dir_smt[1] < min_dist) { min_dist = dir_smt[1]; direction = "右前方"; }
-    if (dir_smt[2] < min_dist) { min_dist = dir_smt[2]; direction = "左前方"; }
-    if (dir_smt[3] < min_dist) { min_dist = dir_smt[3]; direction = "右侧"; }
-    if (dir_smt[4] < min_dist) { min_dist = dir_smt[4]; direction = "左侧"; }
+    // 定义避障阈值
+    const float FRONT_ALERT_CM = 180.0f;   // 前方告警阈值
+    const float SIDE_ALERT_CM = 120.0f;    // 侧方告警阈值
 
     unsigned long now = millis();
 
-    // 如果有障碍物且距离小于阈值
-    if (min_dist < ALERT_DIST_CM) {
-        bool should_alert = false;
+    // 5秒内只播报一次
+    if (now - last_alert_time < ALERT_INTERVAL_MS) {
+        return;
+    }
 
-        if (!last_blocked) {
-            should_alert = true;
-        } else if (now - last_alert_time > ALERT_INTERVAL_MS) {
-            should_alert = true;
-        } else if (fabs(min_dist - last_alert_dist) > ALERT_DIST_CHANGE) {
-            should_alert = true;
+    // 判断哪个方向有障碍物（优先级：正前方 > 左前方 > 右前方 > 左侧 > 右侧）
+    bool has_obstacle = false;
+    String alert_text = "";
+    String avoid_direction = "";  // 建议转向方向
+
+    // 正前方障碍物（最高优先级）
+    if (f < FRONT_ALERT_CM) {
+        has_obstacle = true;
+        // 判断应该向哪边避让：哪边空间大就往哪边转
+        if (fL > fR && fL > FRONT_ALERT_CM) {
+            alert_text = "前方有障碍物，请向左绕行";
+            avoid_direction = "left";
+        } else if (fR > fL && fR > FRONT_ALERT_CM) {
+            alert_text = "前方有障碍物，请向右绕行";
+            avoid_direction = "right";
+        } else if (L > R && L > SIDE_ALERT_CM) {
+            alert_text = "前方有障碍物，请向左绕行";
+            avoid_direction = "left";
+        } else if (R >= L && R > SIDE_ALERT_CM) {
+            alert_text = "前方有障碍物，请向右绕行";
+            avoid_direction = "right";
+        } else {
+            alert_text = "前方有障碍物，请注意避让";
+            avoid_direction = "";
         }
-
-        if (should_alert) {
-            // 构建告警文本并通过流式TTS发送
-            char alertText[128];
-            if (min_dist < 50) {
-                snprintf(alertText, sizeof(alertText), "%s%.0f厘米有障碍物，请立即避让", direction, min_dist);
-            } else if (min_dist < 100) {
-                snprintf(alertText, sizeof(alertText), "%s%.0f厘米有障碍物，请注意避让", direction, min_dist);
-            } else if (min_dist < 200) {
-                snprintf(alertText, sizeof(alertText), "%s%.0f厘米有障碍物", direction, min_dist);
-            } else {
-                snprintf(alertText, sizeof(alertText), "%s%.0f米有障碍物", direction, min_dist / 100);
-            }
-
-            Serial.printf("[障碍物播报] %s\n", alertText);
-
-            // 发送流式TTS请求
-            StaticJsonDocument<256> doc;
-            doc["text"] = alertText;
-            doc["priority"] = PRIO_HIGH;  // 高优先级
-            char buf[256];
-            size_t len = serializeJson(doc, buf, sizeof(buf));
-            mqtt.publish("blindstick/tts/request", buf, len);
-
-            last_alert_time = now;
-            last_alert_dist = min_dist;
+    }
+    // 左前方障碍物
+    else if (fL < FRONT_ALERT_CM && fL < fR) {
+        has_obstacle = true;
+        if (fR > FRONT_ALERT_CM) {
+            alert_text = "左前方有障碍物，请向右绕行";
+            avoid_direction = "right";
+        } else if (R > SIDE_ALERT_CM) {
+            alert_text = "左前方有障碍物，请向右绕行";
+            avoid_direction = "right";
+        } else {
+            alert_text = "左前方有障碍物，请注意避让";
+            avoid_direction = "";
         }
-        last_blocked = true;
-    } else {
-        last_blocked = false;
+    }
+    // 右前方障碍物
+    else if (fR < FRONT_ALERT_CM) {
+        has_obstacle = true;
+        if (fL > FRONT_ALERT_CM) {
+            alert_text = "右前方有障碍物，请向左绕行";
+            avoid_direction = "left";
+        } else if (L > SIDE_ALERT_CM) {
+            alert_text = "右前方有障碍物，请向左绕行";
+            avoid_direction = "left";
+        } else {
+            alert_text = "右前方有障碍物，请注意避让";
+            avoid_direction = "";
+        }
+    }
+    // 左侧障碍物
+    else if (L < SIDE_ALERT_CM && L < R) {
+        has_obstacle = true;
+        if (R > SIDE_ALERT_CM) {
+            alert_text = "左侧有障碍物，请向右绕行";
+            avoid_direction = "right";
+        } else {
+            alert_text = "左侧有障碍物，请注意避让";
+            avoid_direction = "";
+        }
+    }
+    // 右侧障碍物
+    else if (R < SIDE_ALERT_CM) {
+        has_obstacle = true;
+        if (L > SIDE_ALERT_CM) {
+            alert_text = "右侧有障碍物，请向左绕行";
+            avoid_direction = "left";
+        } else {
+            alert_text = "右侧有障碍物，请注意避让";
+            avoid_direction = "";
+        }
+    }
+
+    if (has_obstacle) {
+        Serial.printf("[障碍物播报] %s\n", alert_text.c_str());
+
+        // 发送流式TTS请求（高优先级）
+        StaticJsonDocument<256> doc;
+        doc["text"] = alert_text;
+        doc["priority"] = PRIO_HIGH;
+        char buf[256];
+        size_t len = serializeJson(doc, buf, sizeof(buf));
+        mqtt.publish("blindstick/tts/request", buf, len);
+
+        last_alert_time = now;
     }
 }
 // ==================== Core 0 守护线程 ====================
@@ -881,12 +1047,44 @@ void RadarMotorUploadTask(void* pvParameters) {
     }
 }
 
-// ==================== Core 1 导航任务 ====================
+// ==================== Core 1 导航任务（带路口播报）====================
 void NavigationTask(void* pvParameters) {
     Serial.println("[导航] 任务已启动");
+    static int last_step_idx = -1;  // 用于检测路段变化
+
     while (true) {
         int total = nav_total_steps;
         if (total > 0 && current_step_idx < total && nav_active) {
+            // 检测是否进入新路段
+            if (current_step_idx != last_step_idx) {
+                last_step_idx = current_step_idx;
+
+                // 播报当前路段指引
+                String current_instruction = nav_steps[current_step_idx];
+                String announcement = "";
+
+                if (current_step_idx == 0) {
+                    // 第一步，已包含在planWalkingRoute的播报中，这里不重复
+                } else if (current_step_idx >= total - 1) {
+                    // 最后一步
+                    announcement = "即将到达目的地，" + current_instruction;
+                } else {
+                    // 中间步骤
+                    announcement = "下一个路口，" + current_instruction;
+                }
+
+                // 播报路段指引（如果不是第一步）
+                if (announcement.length() > 0 && mqtt.connected()) {
+                    Serial.printf("[导航播报] %s\n", announcement.c_str());
+                    StaticJsonDocument<512> doc;
+                    doc["text"] = announcement;
+                    doc["priority"] = PRIO_NORMAL;
+                    char buf[512];
+                    size_t len = serializeJson(doc, buf, sizeof(buf));
+                    mqtt.publish("blindstick/tts/request", buf, len);
+                }
+            }
+
             if (current_progress < 100) {
                 if (is_blocked || is_ai_talking) {
                     vTaskDelay(200 / portTICK_PERIOD_MS);
@@ -913,13 +1111,25 @@ void NavigationTask(void* pvParameters) {
                     nav_active = false;
                     nav_total_steps = 1;
                     nav_steps[0] = "导航完成，请说出新目的地";
+                    last_step_idx = -1;
                     Serial.println("[导航] 路线已完成");
+
+                    // 播报导航完成
+                    if (mqtt.connected()) {
+                        StaticJsonDocument<256> doc;
+                        doc["text"] = "导航完成，已到达目的地";
+                        doc["priority"] = PRIO_NORMAL;
+                        char buf[256];
+                        size_t len = serializeJson(doc, buf, sizeof(buf));
+                        mqtt.publish("blindstick/tts/request", buf, len);
+                    }
                 }
                 vTaskDelay(1000 / portTICK_PERIOD_MS);
             }
         } else {
             current_step_idx = 0;
             current_progress = 0;
+            last_step_idx = -1;
             vTaskDelay(1000 / portTICK_PERIOD_MS);
         }
         vTaskDelay(50 / portTICK_PERIOD_MS);
@@ -1541,15 +1751,18 @@ void setup() {
         // 连接MQTT（非阻塞重试）
         mqtt_reconnect();
 
-        // WiFi 已连接，使用MQTT代理播报启动成功
-        delay(500);
-        StaticJsonDocument<256> doc;
-        doc["text"] = "导盲杖系统启动成功，欢迎使用";
-        doc["priority"] = PRIO_NORMAL;
-        char buf[256];
-        size_t len = serializeJson(doc, buf, sizeof(buf));
-        mqtt.publish("blindstick/tts/request", buf, len);
-        Serial.println("[系统] 启动播报请求已发送");
+        // WiFi 已连接，使用MQTT代理播报启动成功（只播报一次）
+        if (!startup_announced) {
+            delay(500);
+            StaticJsonDocument<256> doc;
+            doc["text"] = "导盲杖系统启动成功，欢迎使用";
+            doc["priority"] = PRIO_NORMAL;
+            char buf[256];
+            size_t len = serializeJson(doc, buf, sizeof(buf));
+            mqtt.publish("blindstick/tts/request", buf, len);
+            Serial.println("[系统] 启动播报请求已发送");
+            startup_announced = true;
+        }
     } else {
         Serial.println("[WiFi] 离线模式，MQTT不可用，跳过启动播报");
     }
@@ -1620,7 +1833,7 @@ String extractDestination(const char* text) {
 }
 
 /**
- * 搜索最近的目的地
+ * 搜索最近的目的地（使用常住地限制搜索范围）
  */
 bool searchNearestDestination(const char* keyword, float& outLat, float& outLng, String& outName, float& outDistance) {
     if (WiFi.status() != WL_CONNECTED) return false;
@@ -1631,7 +1844,7 @@ bool searchNearestDestination(const char* keyword, float& outLat, float& outLng,
 
     HTTPClient http;
     String url = "https://api.map.baidu.com/place/v2/search?query=" + urlEncode(keyword) +
-                 "&region=" + urlEncode("黄石市") +
+                 "&region=" + urlEncode(home_city) +
                  "&output=json&ak=e9R2xrzLSwLzjMH5fdqHz4dLB0gXwIZW&page_size=5";
 
     if (!http.begin(client, url)) return false;
@@ -1768,6 +1981,11 @@ bool planWalkingRoute(float destLat, float destLng, String& destName) {
 
 /**
  * 处理语音识别结果
+ * 流程：
+ * 1. 提取目的地（支持触发词+目的地或直接说目的地）
+ * 2. 使用GPS当前位置搜索最近的目的地
+ * 3. 如果超过10公里，播报"目的地距离超过10公里，请再说一次"并继续监听
+ * 4. 如果在10公里内，开始导航并播报导航信息
  */
 void handleVoiceCommand(const char* text) {
     Serial.printf("[语音识别] 识别结果: %s\n", text);
@@ -1779,9 +1997,16 @@ void handleVoiceCommand(const char* text) {
     if (destination.length() < 2) {
         Serial.println("[语音识别] 无触发词，尝试直接搜索...");
         destination = String(text);
-        // 去除标点
+        // 去除标点和常见语气词
         destination.replace("。", "");
         destination.replace("，", "");
+        destination.replace("！", "");
+        destination.replace("？", "");
+        destination.replace("啊", "");
+        destination.replace("吧", "");
+        destination.replace("呢", "");
+        destination.replace("吗", "");
+        destination.replace("哦", "");
         destination.trim();
     }
 
@@ -1792,14 +2017,14 @@ void handleVoiceCommand(const char* text) {
 
     Serial.printf("[语音识别] 目的地: %s\n", destination.c_str());
 
-    // 搜索最近的目的地
+    // 搜索最近的目的地（使用GPS当前位置）
     float destLat, destLng, distance;
     String destName;
 
     if (!searchNearestDestination(destination.c_str(), destLat, destLng, destName, distance)) {
         // 发送失败提示 - 使用流式TTS
         StaticJsonDocument<256> doc;
-        doc["text"] = "抱歉，没有找到该地点";
+        doc["text"] = "抱歉，没有找到该地点，请重新说出目的地";
         doc["priority"] = PRIO_NORMAL;
         char buf[256];
         size_t len = serializeJson(doc, buf, sizeof(buf));
@@ -1807,19 +2032,23 @@ void handleVoiceCommand(const char* text) {
         return;
     }
 
-    // 检查距离是否太远
+    // 检查距离是否太远（超过10公里）
     if (distance > MAX_NAVIGATION_DISTANCE) {
         char msg[128];
-        snprintf(msg, sizeof(msg), "目的地%s距离您%.1f公里，距离太远，请重新选择较近的地点",
-                 destName.c_str(), distance / 1000);
+        snprintf(msg, sizeof(msg), "目的地距离超过10公里，请再说一次");
         StaticJsonDocument<256> doc;
         doc["text"] = msg;
         doc["priority"] = PRIO_NORMAL;
         char buf[256];
         size_t len = serializeJson(doc, buf, sizeof(buf));
         mqtt.publish("blindstick/tts/request", buf, len);
+        // 不设置nav_active，继续监听新的语音输入
+        Serial.println("[导航] 目的地超过10公里，继续监听...");
         return;
     }
+
+    // 在10公里内，开始导航
+    Serial.printf("[导航] 找到目的地: %s, 距离: %.1f米\n", destName.c_str(), distance);
 
     // 规划路线
     if (planWalkingRoute(destLat, destLng, destName)) {

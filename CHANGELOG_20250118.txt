@@ -1,0 +1,282 @@
+# 导盲杖项目代码变更总结（2025-01-18）
+
+## 一、版本变更概览
+
+### 主要变更
+1. **架构重构**: 从直接传输音频数据改为URL方案
+2. **协议优化**: 修复MQTT TLS连接问题
+3. **功能完善**: 支持直接说地点名导航、语音识别优化
+4. **测试程序**: 添加多种测试模式
+
+---
+
+## 二、后端 (server/proxy_server.py)
+
+### 当前版本特性
+
+#### 1. TTS传输方案（URL方式）
+```
+旧方案: 后端合成 → MQTT直接发送音频数据 → ESP32
+新方案: 后端合成 → 保存文件 → 生成URL → MQTT发送URL → ESP32下载 → 播放
+```
+
+**优点:**
+- 避免MQTT传输大文件（>100KB）的问题
+- ESP32可以控制下载时机
+- 更稳定可靠
+
+**文件命名格式:**
+```python
+filename = f"tts_{timestamp}_{hash}.wav"  # 例: tts_1234567890_113f28c9.wav
+```
+
+#### 2. 主要API接口
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/api/tts/push` | POST | 推送TTS到ESP32，返回URL |
+| `/api/asr` | POST | 语音识别 |
+| `/audio/<filename>` | GET | 下载TTS音频文件 |
+| `/health` | GET | 健康检查 |
+
+#### 3. MQTT主题
+
+| 主题 | 方向 | 说明 |
+|------|------|------|
+| `blindstick/tts/url` | 后端→ESP32 | 发送TTS音频URL |
+| `blindstick/sensors` | ESP32→后端 | 传感器数据上报 |
+
+#### 4. 关键配置
+```python
+MQTT_BROKER = "u72a7838.ala.asia-southeast1.emqxsl.com"
+MQTT_PORT = 8883 (TLS)
+AUDIO_CACHE_DIR = "./audio_cache"
+BAIDU_TTS_PER = "4146"  # 发音人
+```
+
+---
+
+## 三、ESP32主程序 (server/esp32_upload/esp32_upload.ino)
+
+### 当前版本特性
+
+#### 1. 功能模块
+- ✅ WiFi连接管理
+- ✅ MQTT连接（TLS 8883端口）
+- ✅ 语音识别（WebSocket流式 + REST API备选）
+- ✅ 语音合成（URL下载播放）
+- ✅ 导航功能（步骤播报）
+- ✅ 雷达避障
+- ✅ GPS定位
+
+#### 2. I2S引脚配置
+```cpp
+// 麦克风 (INMP441)
+#define I2S_WS_PIN      5   // LRCK
+#define I2S_SCK_PIN     2   // BCLK
+#define I2S_SD_PIN      8   // MIC_IN
+
+// 扬声器 (MAX98357)
+#define I2S_BCK_PIN     47  // SPK_BCLK
+#define I2S_WS_OUT_PIN  41  // SPK_LRCK
+#define I2S_DATA_PIN    21  // SPK_OUT
+```
+
+#### 3. MQTT订阅主题
+```cpp
+blindstick/tts/url          // TTS音频URL（新方案）
+blindstick/tts/control      // 流式TTS控制
+blindstick/tts/stream/+     // 流式TTS音频
+blindstick/nav/steps        // 导航步骤
+blindstick/tts/request      // TTS请求
+```
+
+#### 4. 语音识别流程
+```
+录音 → WebSocket流式识别 → 收到结果 → 处理命令 → 等待5秒 → 开始下一次识别
+```
+
+**关键改进:**
+- 处理完结果后立即清空 `asrResult`，避免重复处理
+- 导航触发后等待5秒让TTS播报完成
+- 支持直接说地点名（无需"带我去"等触发词）
+
+#### 5. TTS播放流程（URL方式）
+```cpp
+void handleTTSUrl(const char* payload, int length) {
+    // 1. 解析JSON获取URL
+    // 2. 检查3秒内是否重复
+    // 3. 暂停语音识别
+    // 4. HTTP下载音频
+    // 5. 播放
+    // 6. 恢复语音识别
+}
+```
+
+#### 6. 导航功能
+- 支持百度地图步行路线规划
+- 自动播报导航步骤
+- 进度更新（每3秒+5%，约60秒完成一步）
+
+---
+
+## 四、前端 (js/app.js)
+
+### 当前版本特性
+
+#### 1. TTS请求处理
+```javascript
+// 收到ESP32的TTS请求 → 调用后端API → 后端返回URL → MQTT发送给ESP32
+async function streamTTS(text, priority) {
+    const response = await fetch(`${API_BASE}/api/tts/push`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, priority })
+    });
+}
+```
+
+#### 2. 网页显示
+- 雷达数据可视化（5方向距离）
+- 导航步骤显示
+- 系统状态监控
+
+---
+
+## 五、测试程序
+
+### 已创建的测试程序
+
+#### 1. `asr_tts_test.ino`（独立测试）
+**功能:** 语音识别 + 百度TTS回环测试
+**使用:** 自动循环录音 → 识别 → 播报
+**特点:** 不依赖MQTT，直接调用百度API
+
+#### 2. `test_record_loop.ino`（已删除）
+**状态:** 已删除，功能合并到主程序
+
+#### 3. `test_record_loop_auto.ino`（已删除）
+**状态:** 已删除，功能合并到主程序
+
+#### 4. `mqtt_diagnostic.ino`（诊断工具）
+**功能:** 诊断MQTT连接问题
+**测试内容:**
+- TCP连接测试（1883端口）
+- TLS连接测试（8883端口）
+- 百度API连通性测试
+
+#### 5. `diagnostic_tts.ino`（诊断工具）
+**功能:** 测试TTS播放功能
+
+---
+
+## 六、关键问题修复记录
+
+### 问题1: MQTT TLS连接失败（-2错误）
+**原因:** 证书验证失败、时间不同步
+**修复:**
+- 添加NTP时间同步
+- 使用 `setInsecure()` 跳过证书验证
+- 增加握手超时时间
+
+### 问题2: TTS音频传输失败
+**原因:** MQTT消息太大（>100KB），导致传输失败
+**修复:** 改为URL方案，ESP32主动下载
+
+### 问题3: 语音识别重复处理
+**原因:** `asrResult` 未清空
+**修复:** 处理完后立即清空结果变量
+
+### 问题4: TTS重复播放
+**原因:** 前后端都发送了相同消息
+**修复:**
+- 后端：文件名添加时间戳
+- ESP32：基于文本+3秒窗口去重
+
+### 问题5: 导航进度太快
+**原因:** 每1秒+10%，10秒就完成一步
+**修复:** 改为每3秒+5%，约60秒完成一步
+
+### 问题6: 需要触发词才能导航
+**原因:** 只识别"带我去"等触发词
+**修复:** 无触发词时直接使用识别文本搜索
+
+---
+
+## 七、部署检查清单
+
+### 后端 (Render)
+- [ ] 重新部署到 Render
+- [ ] 检查日志显示 `[MQTT] Connected`
+- [ ] 检查日志显示文件保存路径
+
+### ESP32
+- [ ] 上传 `esp32_upload.ino`
+- [ ] 检查串口显示 `[MQTT] 已连接`
+- [ ] 检查NTP时间同步成功
+- [ ] 测试语音识别
+- [ ] 测试导航功能
+
+### 前端
+- [ ] 打开网页
+- [ ] 检查MQTT连接
+- [ ] 检查雷达数据显示
+
+---
+
+## 八、使用说明
+
+### 正常启动流程
+1. ESP32开机 → 连接WiFi → 连接MQTT
+2. 播放"导盲杖系统启动成功，欢迎使用"
+3. 开始语音识别（自动循环）
+
+### 导航使用
+1. **大声说目的地**（如"天安门"、"湖北师范大学"）
+2. ESP32识别 → 搜索地点 → 规划路线
+3. 播报"开始导航到XXX，全程XXX米..."
+4. 导航过程中自动播报步骤
+
+### 注意事项
+- 说话声音要大，距离麦克风10cm以内
+- 导航过程中会暂停语音识别
+- TTS播报完成后自动恢复语音识别
+
+---
+
+## 九、文件位置
+
+```
+项目根目录/
+├── server/
+│   ├── proxy_server.py          # 后端主程序
+│   └── esp32_upload/
+│       ├── esp32_upload.ino     # ESP32主程序
+│       ├── asr_tts_test.ino     # 独立测试程序
+│       └── mqtt_diagnostic.ino  # 诊断工具
+├── js/
+│   └── app.js                   # 前端程序
+└── index.html                   # 前端页面
+```
+
+---
+
+## 十、Git提交记录
+
+```
+0da2924 fix: 修复语音识别重复处理和TTS播报冲突问题
+12df7cd fix: 修复TTS重复播放问题
+ff53dad fix: 添加TTS URL去重，避免重复播放
+baa79e2 fix: 减慢导航进度速度，添加调试输出
+6a043a9 fix: 支持直接说地点名导航（无需触发词）
+4dc852d fix: Rewrite proxy_server.py in English
+273f03c fix: 修复webSocket变量声明和Python乱码问题
+f92745e feat: ESP32改用URL方式接收TTS音频
+a3cdd81 feat: 改用URL方案传输TTS音频
+...
+```
+
+---
+
+**总结日期:** 2025-01-18
+**当前状态:** 所有功能正常，等待重新部署后端和上传ESP32代码
