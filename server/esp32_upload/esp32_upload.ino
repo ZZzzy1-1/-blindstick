@@ -2159,6 +2159,7 @@ void handleTTSUrl(const char* payload, int length) {
             Serial.println("[TTS-URL] 语音识别已恢复");
         }
     }
+}
 
 // ==================== 流式TTS实现（新版简化逻辑）====================
 
