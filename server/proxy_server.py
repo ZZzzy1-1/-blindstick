@@ -189,22 +189,28 @@ class MQTTAudioSender:
         self.max_retries = 5
 
     def on_message(self, client, userdata, msg):
-        """处理接收到的MQTT消息"""
+        """处理接收到的MQTT消息 - 使用线程池异步处理避免阻塞"""
         try:
             topic = msg.topic
             payload = msg.payload.decode('utf-8')
-            print(f"[MQTT] Received on {topic}: {payload[:100]}...")
+            print(f"[MQTT] Received on {topic}: {payload[:80]}...")
 
             if topic == "blindstick/tts/request":
-                # 处理TTS请求
+                # 快速解析，异步处理TTS
                 data = json.loads(payload)
                 text = data.get("text", "")
                 priority = data.get("priority", 0)
 
                 if text:
-                    print(f"[MQTT] TTS Request received: '{text[:50]}...' priority={priority}")
-                    # 调用TTS生成并推送
-                    self.handle_tts_request(text, priority)
+                    print(f"[MQTT] TTS快速接收: '{text[:30]}...' 优先级={priority}")
+                    # 使用线程异步处理，不阻塞MQTT回调
+                    import threading
+                    t = threading.Thread(
+                        target=self.handle_tts_request,
+                        args=(text, priority),
+                        daemon=True
+                    )
+                    t.start()
 
         except Exception as e:
             print(f"[MQTT] Message handling error: {e}")
