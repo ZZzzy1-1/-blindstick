@@ -257,6 +257,9 @@ int   gps_satellites = 0;
 // 常住地设置（默认黄石市，可通过MQTT更新）
 String home_city = "黄石市";
 
+// 开机语音播报标志（只播报一次）
+volatile bool startup_announced = false;
+
 volatile bool amap_fused = false;
 
 enum LidarState { WAIT_HEADER_AA, WAIT_HEADER_55, READ_CT, READ_LSN, READ_PAYLOAD };
@@ -870,9 +873,6 @@ unsigned long last_alert_time = 0;
 float last_alert_dist = 0;
 #define ALERT_INTERVAL_MS 5000  // 障碍物告警间隔 5 秒
 #define ALERT_DIST_CHANGE 50    // 距离变化超过50cm才重新播报
-
-// 开机语音播报标志（只播报一次）
-volatile bool startup_announced = false;
 
 // 避障语音去重：记录上次播报的文本和时间
 static String last_alert_text = "";
