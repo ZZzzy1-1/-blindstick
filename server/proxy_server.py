@@ -165,8 +165,15 @@ tts_manager = StreamingTTSManager()
 try:
     import paho.mqtt.client as mqtt
     MQTT_AVAILABLE = True
+    # 检查是否有 CallbackAPIVersion (paho-mqtt >= 2.0)
+    try:
+        from paho.mqtt.enums import CallbackAPIVersion
+        MQTT_V2 = True
+    except ImportError:
+        MQTT_V2 = False
 except ImportError:
     MQTT_AVAILABLE = False
+    MQTT_V2 = False
     print("[Warning] paho-mqtt not installed")
 
 class MQTTAudioSender:
@@ -178,6 +185,8 @@ class MQTTAudioSender:
         self.topic_control = "blindstick/tts/control"
         self.username = "blindstick"
         self.password = "2026"
+        self.connect_retry_count = 0
+        self.max_retries = 5
 
     def on_message(self, client, userdata, msg):
         """处理接收到的MQTT消息"""
@@ -259,36 +268,84 @@ class MQTTAudioSender:
 
     def connect(self):
         if not MQTT_AVAILABLE:
+            print("[MQTT] paho-mqtt not available")
             return False
-        try:
-            self.client = mqtt.Client(client_id="proxy_server_tts")
-            self.client.username_pw_set(self.username, self.password)
-            self.client.tls_set()
 
-            def on_connect(client, userdata, flags, rc):
-                if rc == 0:
+        if self.connected:
+            return True
+
+        try:
+            # 使用新版 API (paho-mqtt >= 2.0) 或旧版 API
+            if MQTT_V2:
+                self.client = mqtt.Client(
+                    callback_api_version=CallbackAPIVersion.VERSION2,
+                    client_id="proxy_server_tts"
+                )
+            else:
+                self.client = mqtt.Client(client_id="proxy_server_tts")
+
+            self.client.username_pw_set(self.username, self.password)
+
+            # 设置TLS，但禁用证书验证（Render环境可能缺少CA证书）
+            try:
+                self.client.tls_set(cert_reqs=0)
+                self.client.tls_insecure_set(True)
+            except Exception as e:
+                print(f"[MQTT] TLS setup warning: {e}")
+
+            def on_connect(client, userdata, flags, rc, properties=None):
+                # 兼容新旧版本回调
+                if isinstance(rc, int):
+                    reason_code = rc
+                else:
+                    reason_code = rc.value if hasattr(rc, 'value') else 0
+
+                if reason_code == 0:
                     self.connected = True
+                    self.connect_retry_count = 0
                     print(f"[MQTT] Connected to {self.broker}")
                     # 订阅TTS请求主题
                     client.subscribe("blindstick/tts/request")
                     print("[MQTT] Subscribed to blindstick/tts/request")
                 else:
-                    print(f"[MQTT] Connection failed, code: {rc}")
+                    print(f"[MQTT] Connection failed, code: {reason_code}")
 
-            def on_disconnect(client, userdata, rc):
+            def on_disconnect(client, userdata, rc, properties=None):
                 self.connected = False
-                print(f"[MQTT] Disconnected")
+                print(f"[MQTT] Disconnected, code: {rc}")
+
+            def on_connect_fail(client, userdata):
+                print("[MQTT] Connection failed (on_connect_fail)")
+                self.connected = False
 
             self.client.on_connect = on_connect
             self.client.on_disconnect = on_disconnect
+            self.client.on_connect_fail = on_connect_fail
             self.client.on_message = self.on_message
 
-            self.client.connect(self.broker, self.port, 60)
+            # 设置连接超时
+            self.client.connect_timeout = 15
+
+            print(f"[MQTT] Connecting to {self.broker}:{self.port}...")
+            self.client.connect(self.broker, self.port, keepalive=60)
             self.client.loop_start()
             return True
+
         except Exception as e:
             print(f"[MQTT] Connection error: {e}")
+            import traceback
+            traceback.print_exc()
+            self.connect_retry_count += 1
+            if self.connect_retry_count < self.max_retries:
+                print(f"[MQTT] Will retry ({self.connect_retry_count}/{self.max_retries})")
             return False
+
+    def reconnect_if_needed(self):
+        """检查连接状态，如需要则重连"""
+        if not self.connected and self.connect_retry_count < self.max_retries:
+            print("[MQTT] Reconnecting...")
+            return self.connect()
+        return self.connected
 
 mqtt_sender = MQTTAudioSender()
 
@@ -398,13 +455,31 @@ def health_check():
 if __name__ == '__main__':
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    print("[Startup] Connecting MQTT...")
-    mqtt_sender.connect()
-    time.sleep(1)
+
     port = int(os.environ.get('PORT', 8090))
     print("=" * 50)
     print("Baidu API Proxy Server - TTS Version")
     print("=" * 50)
     print(f"Running at: http://0.0.0.0:{port}")
     print("=" * 50)
+
+    # 启动 MQTT 连接（在后台重试）
+    print("[Startup] Starting MQTT connection...")
+    def mqtt_connect_loop():
+        while not mqtt_sender.connected and mqtt_sender.connect_retry_count < mqtt_sender.max_retries:
+            mqtt_sender.connect()
+            if not mqtt_sender.connected:
+                time.sleep(5)
+        if mqtt_sender.connected:
+            print("[MQTT] Connection established successfully")
+        else:
+            print("[MQTT] Failed to connect after maximum retries")
+            print("[MQTT] TTS push will not work, but API endpoints are still available")
+
+    # 在后台线程启动 MQTT 连接
+    import threading
+    mqtt_thread = threading.Thread(target=mqtt_connect_loop, daemon=True)
+    mqtt_thread.start()
+
+    # 启动 Flask 服务
     app.run(host='0.0.0.0', port=port, debug=False)
