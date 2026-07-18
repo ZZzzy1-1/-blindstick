@@ -310,9 +310,14 @@ class MQTTAudioSender:
                 else:
                     print(f"[MQTT] Connection failed, code: {reason_code}")
 
-            def on_disconnect(client, userdata, rc, properties=None):
+            def on_disconnect(client, userdata, disconnect_flags=None, rc=None, properties=None):
+                """处理断开连接，兼容新旧版本"""
                 self.connected = False
-                print(f"[MQTT] Disconnected, code: {rc}")
+                # 处理不同版本的参数
+                if rc is not None:
+                    print(f"[MQTT] Disconnected, code: {rc}")
+                else:
+                    print("[MQTT] Disconnected")
 
             def on_connect_fail(client, userdata):
                 print("[MQTT] Connection failed (on_connect_fail)")
