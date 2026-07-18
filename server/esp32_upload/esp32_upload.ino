@@ -139,7 +139,6 @@ void handleTTSUrl(const char* payload, int length);  // URL方式下载并播放
 void playPcmData(uint8_t* data, int len);
 void stopCurrentPlayback();
 const char* getPrioName(int p);
-void announceObstacle(float distance, const char* direction);
 
 // 流式语音识别相关
 void VoiceRecognitionTask(void* pvParameters);
@@ -931,20 +930,21 @@ void publishSensorData() {
 }
 
 /**
- * 障碍物检测和播报 - 简化版：只播报方向和建议，不播报具体距离
- * 5秒内只播报一次
+ * 障碍物检测和播报 - 与避障决策使用相同阈值
+ * 统一播报格式：方向 + 转向建议，不播报具体距离
+ * 5秒内只播报一次，相同文本不重复
  */
 void checkObstacleAndAlert() {
-    // 检查各个方向的障碍物（只检测正前、左、右三个主要方向）
+    // 检查各个方向的障碍物
     float f  = dir_smt[0];  // 正前方
-    float fL = dir_smt[2];  // 左前方
     float fR = dir_smt[1];  // 右前方
-    float L  = dir_smt[4];  // 左侧
+    float fL = dir_smt[2];  // 左前方
     float R  = dir_smt[3];  // 右侧
+    float L  = dir_smt[4];  // 左侧
 
-    // 定义避障阈值
-    const float FRONT_ALERT_CM = 180.0f;   // 前方告警阈值
-    const float SIDE_ALERT_CM = 120.0f;    // 侧方告警阈值
+    // 使用与避障决策相同的阈值
+    const float FRONT_ALERT_CM = 100.0f;   // 前方告警阈值（与FRONT_BLOCK_CM一致）
+    const float SIDE_ALERT_CM = 50.0f;     // 侧边告警阈值（与SIDE_BLOCK_CM一致）
 
     unsigned long now = millis();
 
@@ -956,7 +956,6 @@ void checkObstacleAndAlert() {
     // 判断哪个方向有障碍物（优先级：正前方 > 左前方 > 右前方 > 左侧 > 右侧）
     bool has_obstacle = false;
     String alert_text = "";
-    String avoid_direction = "";  // 建议转向方向
 
     // 正前方障碍物（最高优先级）
     if (f < FRONT_ALERT_CM) {
@@ -964,47 +963,32 @@ void checkObstacleAndAlert() {
         // 判断应该向哪边避让：哪边空间大就往哪边转
         if (fL > fR && fL > FRONT_ALERT_CM) {
             alert_text = "前方有障碍物，请向左绕行";
-            avoid_direction = "left";
         } else if (fR > fL && fR > FRONT_ALERT_CM) {
             alert_text = "前方有障碍物，请向右绕行";
-            avoid_direction = "right";
         } else if (L > R && L > SIDE_ALERT_CM) {
             alert_text = "前方有障碍物，请向左绕行";
-            avoid_direction = "left";
         } else if (R >= L && R > SIDE_ALERT_CM) {
             alert_text = "前方有障碍物，请向右绕行";
-            avoid_direction = "right";
         } else {
             alert_text = "前方有障碍物，请注意避让";
-            avoid_direction = "";
         }
     }
     // 左前方障碍物
     else if (fL < FRONT_ALERT_CM && fL < fR) {
         has_obstacle = true;
-        if (fR > FRONT_ALERT_CM) {
+        if (fR > FRONT_ALERT_CM || R > SIDE_ALERT_CM) {
             alert_text = "左前方有障碍物，请向右绕行";
-            avoid_direction = "right";
-        } else if (R > SIDE_ALERT_CM) {
-            alert_text = "左前方有障碍物，请向右绕行";
-            avoid_direction = "right";
         } else {
             alert_text = "左前方有障碍物，请注意避让";
-            avoid_direction = "";
         }
     }
     // 右前方障碍物
     else if (fR < FRONT_ALERT_CM) {
         has_obstacle = true;
-        if (fL > FRONT_ALERT_CM) {
+        if (fL > FRONT_ALERT_CM || L > SIDE_ALERT_CM) {
             alert_text = "右前方有障碍物，请向左绕行";
-            avoid_direction = "left";
-        } else if (L > SIDE_ALERT_CM) {
-            alert_text = "右前方有障碍物，请向左绕行";
-            avoid_direction = "left";
         } else {
             alert_text = "右前方有障碍物，请注意避让";
-            avoid_direction = "";
         }
     }
     // 左侧障碍物
@@ -1012,10 +996,8 @@ void checkObstacleAndAlert() {
         has_obstacle = true;
         if (R > SIDE_ALERT_CM) {
             alert_text = "左侧有障碍物，请向右绕行";
-            avoid_direction = "right";
         } else {
             alert_text = "左侧有障碍物，请注意避让";
-            avoid_direction = "";
         }
     }
     // 右侧障碍物
@@ -1023,18 +1005,15 @@ void checkObstacleAndAlert() {
         has_obstacle = true;
         if (L > SIDE_ALERT_CM) {
             alert_text = "右侧有障碍物，请向左绕行";
-            avoid_direction = "left";
         } else {
             alert_text = "右侧有障碍物，请注意避让";
-            avoid_direction = "";
         }
     }
 
     if (has_obstacle) {
         // 去重检查：相同文本5秒内不重复播报
-        unsigned long now = millis();
         if (alert_text == last_alert_text && (now - last_alert_text_time) < ALERT_TEXT_DUPLICATE_MS) {
-            Serial.printf("[障碍物播报] 去重：5秒内已播报过相同内容\n");
+            Serial.printf("[障碍物播报] 去重：5秒内已播报过\n");
             return;
         }
 
@@ -1049,8 +1028,8 @@ void checkObstacleAndAlert() {
         mqtt.publish("blindstick/tts/request", buf, len);
 
         last_alert_time = now;
-        last_alert_text = alert_text;  // 记录上次播报的文本
-        last_alert_text_time = now;     // 记录时间
+        last_alert_text = alert_text;
+        last_alert_text_time = now;
     }
 }
 // ==================== Core 0 守护线程 ====================
@@ -2377,22 +2356,4 @@ void handleStreamAudio(const char* topic, byte* payload, unsigned int length) {
             stream_buf_used -= play_size;
         }
     }
-}
-
-void announceObstacleStreaming(float distance, const char* direction) {
-    char text[64];
-    if (distance < 150) {
-        snprintf(text, sizeof(text), "注意！前方%.0f厘米有障碍物，请立即避让！", distance);
-    } else {
-        snprintf(text, sizeof(text), "前方%.0f厘米有%s障碍物", distance, direction);
-    }
-    Serial.printf("[雷达告警] %s\n", text);
-
-    // 发送MQTT流式TTS请求
-    StaticJsonDocument<256> doc;
-    doc["text"] = text;
-    doc["priority"] = PRIO_HIGH;
-    char buf[256];
-    size_t len = serializeJson(doc, buf, sizeof(buf));
-    mqtt.publish("blindstick/tts/request", buf, len);
 }
