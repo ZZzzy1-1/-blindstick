@@ -1844,7 +1844,7 @@ bool searchNearestDestination(const char* keyword, float& outLat, float& outLng,
 
     HTTPClient http;
     String url = "https://api.map.baidu.com/place/v2/search?query=" + urlEncode(keyword) +
-                 "&region=" + urlEncode(home_city) +
+                 "&region=" + urlEncode(home_city.c_str()) +
                  "&output=json&ak=e9R2xrzLSwLzjMH5fdqHz4dLB0gXwIZW&page_size=5";
 
     if (!http.begin(client, url)) return false;
