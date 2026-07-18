@@ -2035,28 +2035,86 @@ TaskHandle_t TTSPlayerTaskHandle = NULL;
 volatile float dir_raw[NUM_DIR] = {400.0f, 400.0f, 400.0f, 400.0f, 400.0f};
 volatile float dir_smt[NUM_DIR] = {400.0f, 400.0f, 400.0f, 400.0f, 400.0f};
 
-// ==================== 本地告警音效（无需网络，立即播放）====================
-// 使用简单的蜂鸣器音效，不需要TTS，响应时间 < 50ms
-void playAlertTone(int direction) {
-    // direction: 0=前方, 1=左, 2=右
-    const int sample_rate = 16000;
-    const int duration_ms = 300;  // 300ms短促提示
-    const int num_samples = sample_rate * duration_ms / 1000;
-    int16_t tone_buffer[4800];  // 300ms @ 16kHz
+// ==================== 本地告警音效系统（无需网络，<50ms响应）====================
+// 使用不同频率和节奏来传达不同信息
 
-    // 根据方向使用不同频率
-    int freq = (direction == 0) ? 1500 : (direction == 1) ? 1200 : 1800;
+// 播放单个音调
+void playTone(int freq, int duration_ms, int volume = 4000) {
+    const int sample_rate = 16000;
+    int num_samples = sample_rate * duration_ms / 1000;
+    int16_t* buffer = (int16_t*)malloc(num_samples * 2);
+    if (!buffer) return;
 
     for (int i = 0; i < num_samples; i++) {
         float t = (float)i / sample_rate;
-        // 添加衰减效果
         float envelope = 1.0f - (float)i / num_samples;
-        float sample = sin(2 * PI * freq * t) * 4000.0f * envelope;
-        tone_buffer[i] = (int16_t)sample;
+        buffer[i] = (int16_t)(sin(2 * PI * freq * t) * volume * envelope);
     }
 
-    size_t written = 0;
-    i2s_write(I2S_PORT_OUT, tone_buffer, num_samples * 2, &written, portMAX_DELAY);
+    i2s_write(I2S_PORT_OUT, buffer, num_samples * 2, NULL, portMAX_DELAY);
+    free(buffer);
+}
+
+// 播放双音（滴滴声）
+void playDoubleTone(int freq1, int freq2, int duration_ms) {
+    playTone(freq1, duration_ms / 2);
+    delay(50);
+    playTone(freq2, duration_ms / 2);
+}
+
+// 【主函数】智能本地告警 - 根据距离和方向选择不同声音
+void playSmartAlert(int direction, float distance) {
+    // direction: 0=前方, 1=左, 2=右
+    // distance: 障碍物距离(cm)
+
+    // 根据距离选择紧急程度
+    bool isUrgent = (distance < 50);
+
+    if (isUrgent) {
+        // 紧急情况：<50cm，急促高频三声
+        int freq = (direction == 0) ? 2000 : (direction == 1) ? 1800 : 2200;
+        playTone(freq, 100);
+        delay(50);
+        playTone(freq, 100);
+        delay(50);
+        playTone(freq, 150);
+    } else {
+        // 普通情况：50-80cm，不同方向不同音调
+        if (direction == 0) {
+            // 前方：中音单声
+            playTone(1500, 250);
+        } else if (direction == 1) {
+            // 左方：低音下滑
+            playTone(1200, 150);
+            delay(30);
+            playTone(1000, 150);
+        } else {
+            // 右方：高音上滑
+            playTone(1600, 150);
+            delay(30);
+            playTone(1800, 150);
+        }
+    }
+}
+
+// 播放简短的"左转"/"右转"模拟音（使用音节模式）
+void playDirectionVoice(int direction) {
+    if (direction == 1) {
+        // "左" - 低降调
+        playTone(800, 200);
+        delay(50);
+        playTone(600, 250);
+    } else if (direction == 2) {
+        // "右" - 高升调
+        playTone(1000, 200);
+        delay(50);
+        playTone(1400, 250);
+    }
+}
+
+// 兼容旧接口
+void playAlertTone(int direction) {
+    playSmartAlert(direction, 60);  // 默认60cm普通告警
 }
 
 // ==================== 电机控制 ====================
@@ -2114,15 +2172,25 @@ void smartAvoidDecision() {
     // 【关键优化1】电机立即执行避障，不等待语音
     // 前方被阻挡，需要转向
     if (front_blocked) {
-        // 【关键优化2】立即播放本地音效提示（< 50ms延迟）
+        // 计算最近障碍物距离和方向
+        float minDist = f;
+        int alertDir = 0;  // 0=前, 1=左, 2=右
+        if (fL < minDist) { minDist = fL; alertDir = 1; }
+        if (fR < minDist) { minDist = fR; alertDir = 2; }
+
+        // 【关键优化2】智能本地音效（根据距离和方向）
         if (now - lastAlertToneMs > ALERT_TONE_INTERVAL_MS) {
             lastAlertToneMs = now;
-            // 根据最近障碍物方向选择音效
-            int minDistDir = 0;  // 0=前, 1=右, 2=左
-            float minDist = f;
-            if (fL < minDist) { minDist = fL; minDistDir = 1; }
-            if (fR < minDist) { minDist = fR; minDistDir = 2; }
-            playAlertTone(minDistDir);
+
+            if (minDist < 50) {
+                // 紧急情况：<50cm，播放急促告警 + 方向模拟音
+                playSmartAlert(alertDir, minDist);  // 三声急促
+                delay(100);
+                playDirectionVoice(alertDir);       // 模拟"左"/"右"
+            } else {
+                // 普通情况：单次方向音
+                playSmartAlert(alertDir, minDist);
+            }
         }
 
         // 判断转向方向（原有逻辑）
@@ -2608,13 +2676,26 @@ void checkObstacleAndAlert() {
             return;
         }
 
+        // 【优化】紧急情况使用超短文本，加快TTS合成速度
+        String tts_text = alert_text;
+        if (isUrgent) {
+            // 提取关键动作词
+            if (alert_text.indexOf("向左") >= 0) {
+                tts_text = "左转";  // 0.5秒语音 vs 2秒
+            } else if (alert_text.indexOf("向右") >= 0) {
+                tts_text = "右转";
+            } else {
+                tts_text = "注意";  // 最短
+            }
+        }
+
         // 发送TTS请求
         setTTSRequesting(true);
         tts_request_start_time = now;
 
         // 发送流式TTS请求（高优先级）
         StaticJsonDocument<256> doc;
-        doc["text"] = alert_text;
+        doc["text"] = tts_text;  // 使用优化后的短文本
         doc["priority"] = PRIO_HIGH;
         char buf[256];
         size_t len = serializeJson(doc, buf, sizeof(buf));
@@ -2622,10 +2703,11 @@ void checkObstacleAndAlert() {
 
         if (published) {
             last_alert_time = now;
-            last_alert_text = alert_text;
+            last_alert_text = alert_text;  // 记录原文本用于去重
             last_alert_text_time = now;
             consecutiveAlerts = 0;  // 重置计数
-            Serial.printf("[障碍物] TTS请求已发送: %s\n", alert_text.c_str());
+            Serial.printf("[障碍物] TTS请求已发送: %s (原文:%s)\n",
+                tts_text.c_str(), alert_text.c_str());
         } else {
             setTTSRequesting(false);
         }
