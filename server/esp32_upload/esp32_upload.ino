@@ -1963,6 +1963,8 @@ volatile bool nav_active = false;
 
 volatile bool  is_blocked  = false;
 volatile bool  is_ai_talking = false;
+volatile bool  is_tts_requesting = false;  // TTS请求状态标志，防止重复发送
+unsigned long  tts_request_start_time = 0;
 
 int last_motor_pwm = 0;
 String last_motor_dir = "stop";
@@ -2421,9 +2423,6 @@ static String last_alert_text = "";
 static unsigned long last_alert_text_time = 0;
 #define ALERT_TEXT_DUPLICATE_MS 8000  // 相同文本8秒内不重复
 
-// TTS请求状态标志（防止重复发送）
-static volatile bool is_tts_requesting = false;
-static unsigned long tts_request_start_time = 0;
 #define TTS_REQUEST_TIMEOUT_MS 10000  // TTS请求超时时间10秒
 
 // ==================== 辅助函数：使用PSRAM或普通内存分配 ====================
