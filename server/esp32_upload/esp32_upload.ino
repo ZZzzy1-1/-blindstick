@@ -1875,13 +1875,10 @@ void VoiceRecognitionTask(void* pvParameters);
 String doVoiceRecognition();
 String getBaiduToken();
 void handleVoiceCommand(const char* text);
-void webSocketEvent(WStype_t type, uint8_t* payload, size_t length);
-String doRESTASR();  // REST API备选方案
 String base64Encode(const uint8_t* data, size_t len);  // Base64编码
 
 // 语音识别相关
 void VoiceRecognitionTask(void* pvParameters);
-String doVoiceRecognition();
 String getBaiduToken();
 
 // ==================== 工具函数实现 ====================
@@ -2343,7 +2340,6 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         // 暂停语音识别
         if (VoiceTaskHandle != NULL) {
             vTaskSuspend(VoiceTaskHandle);
-            webSocket.disconnect();
         }
 
         // 使用互斥锁保护音频缓冲区
@@ -3745,8 +3741,6 @@ void handleStreamControl(const char* payload, int length) {
 
         if (VoiceTaskHandle != NULL) {
             vTaskSuspend(VoiceTaskHandle);
-            webSocket.disconnect();
-            Serial.println("[流式TTS] 语音识别已暂停");
         }
 
     } else if (strcmp(type, "stream_end") == 0) {
