@@ -106,20 +106,20 @@ HardwareSerial gpsSerial(2);
 // ==================== I2S麦克风引脚 (INMP441) ====================
 // 实际硬件接线：
 // VDD → 3.3V
-// WS  → GPIO5  (LRCK)
-// SCK → GPIO2  (BCLK)
-// SD  → GPIO8  (MIC_IN)
+// WS  → GPIO2  (LRCK)
+// SCK → GPIO1  (BCLK)
+// SD  → GPIO42  (MIC_IN)
 // GND → GND
 // L/R → GND (接地=左声道)
-#define I2S_WS_PIN      5   // LRCK
-#define I2S_SCK_PIN     2   // BCLK
-#define I2S_SD_PIN      8   // MIC_IN
+#define I2S_WS_PIN      2   // LRCK
+#define I2S_SCK_PIN     1   // BCLK
+#define I2S_SD_PIN      42   // MIC_IN
 #define I2S_PORT        I2S_NUM_0
 
 // ==================== I2S扬声器引脚 (MAX98357) ====================
-#define I2S_BCK_PIN     47  // SPK_BCLK
-#define I2S_WS_OUT_PIN  41  // SPK_LRCK
-#define I2S_DATA_PIN    21  // SPK_OUT
+#define I2S_BCK_PIN     4  // SPK_BCLK
+#define I2S_WS_OUT_PIN  5  // SPK_LRCK
+#define I2S_DATA_PIN    6  // SPK_OUT
 #define I2S_PORT_OUT    I2S_NUM_1
 
 #define VOLUME_GAIN     0.6
@@ -2336,5 +2336,3 @@ void announceObstacleStreaming(float distance, const char* direction) {
     size_t len = serializeJson(doc, buf, sizeof(buf));
     mqtt.publish("blindstick/tts/request", buf, len);
 }
-
-
