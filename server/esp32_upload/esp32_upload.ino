@@ -360,20 +360,20 @@ void smartAvoidDecision() {
 
         // 执行转向决策
         if (should_turn_left && !should_turn_right) {
-            // 只能左转
+            // 只能左转 - 传入负数
             turnStartMs = now;
             was_turning = true;
             turn_direction = 1;
-            Serial.printf("[电机] 左转 | 雷达 F:%.0f FL:%.0f FR:%.0f\n", f, fL, fR);
-            motorControl(STEER_MAX_PWM);
+            Serial.printf("[电机决策] 左转 | 雷达 F:%.0f FL:%.0f FR:%.0f\n", f, fL, fR);
+            motorControl(-STEER_MAX_PWM);  // 负数=左转
             return;
         } else if (should_turn_right && !should_turn_left) {
-            // 只能右转
+            // 只能右转 - 传入正数
             turnStartMs = now;
             was_turning = true;
             turn_direction = -1;
-            Serial.printf("[电机] 右转 | 雷达 F:%.0f FL:%.0f FR:%.0f\n", f, fL, fR);
-            motorControl(-STEER_MAX_PWM);
+            Serial.printf("[电机决策] 右转 | 雷达 F:%.0f FL:%.0f FR:%.0f\n", f, fL, fR);
+            motorControl(STEER_MAX_PWM);   // 正数=右转
             return;
         } else if (should_turn_left && should_turn_right) {
             // 两边都可以，选择空间更大的
@@ -383,12 +383,12 @@ void smartAvoidDecision() {
             was_turning = true;
             if (left_space > right_space) {
                 turn_direction = 1;
-                Serial.printf("[电机] 左转(选大空间) | 左%.0fcm 右%.0fcm\n", left_space, right_space);
-                motorControl(STEER_MAX_PWM);
+                Serial.printf("[电机决策] 左转(选大空间%.0fcm) | 左%.0fcm 右%.0fcm\n", left_space, left_space, right_space);
+                motorControl(-STEER_MAX_PWM);  // 负数=左转
             } else {
                 turn_direction = -1;
-                Serial.printf("[电机] 右转(选大空间) | 左%.0fcm 右%.0fcm\n", left_space, right_space);
-                motorControl(-STEER_MAX_PWM);
+                Serial.printf("[电机决策] 右转(选大空间%.0fcm) | 左%.0fcm 右%.0fcm\n", right_space, left_space, right_space);
+                motorControl(STEER_MAX_PWM);   // 正数=右转
             }
             return;
         }
@@ -417,9 +417,9 @@ void smartAvoidDecision() {
         } else {
             // 继续转向
             if (turn_direction == 1) {
-                motorControl(STEER_MAX_PWM);
+                motorControl(-STEER_MAX_PWM);  // 负数=左转
             } else if (turn_direction == -1) {
-                motorControl(-STEER_MAX_PWM);
+                motorControl(STEER_MAX_PWM);   // 正数=右转
             }
             return;
         }
@@ -659,19 +659,18 @@ void mqtt_reconnect() {
             Serial.printf("  - blindstick/config/home_city (常住地设置)\n");
             retryCount = 0;
 
-            // 【开机语音】MQTT连接成功后发送，确保能发送成功
-            static bool startup_voice_sent = false;
-            if (!startup_voice_sent && !startup_announced) {
-                delay(500);  // 等待订阅完成
+            // 【开机语音】MQTT首次连接成功后发送
+            // 使用双重检查确保只发送一次，即使MQTT重连也不会重复
+            if (!startup_announced) {
+                delay(200);  // 减少等待时间，加快启动
                 StaticJsonDocument<256> doc;
-                doc["text"] = "导盲杖系统启动成功，欢迎使用";
+                doc["text"] = "系统启动成功";
                 doc["priority"] = PRIO_NORMAL;
                 char buf[256];
                 size_t len = serializeJson(doc, buf, sizeof(buf));
                 bool published = mqtt.publish("blindstick/tts/request", buf, len);
                 if (published) {
                     Serial.println("[系统] 开机语音已发送");
-                    startup_voice_sent = true;
                     startup_announced = true;
                 } else {
                     Serial.println("[系统] 开机语音发送失败");
@@ -1749,27 +1748,15 @@ void setup() {
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("\n[WiFi] 已连接！IP: %s\n", WiFi.localIP().toString().c_str());
 
-        // 同步时间（TLS证书验证需要）
-        Serial.println("[NTP] 同步网络时间...");
-        configTime(8 * 3600, 0, "ntp.ntsc.ac.cn", "cn.pool.ntp.org");
-        struct tm timeinfo;
-        int ntp_retry = 0;
-        while (!getLocalTime(&timeinfo) && ntp_retry < 10) {
-            delay(500);
-            ntp_retry++;
-        }
-        if (ntp_retry < 10) {
-            Serial.printf("[NTP] 时间同步成功: %04d-%02d-%02d %02d:%02d:%02d\n",
-                          timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
-                          timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-        } else {
-            Serial.println("[NTP] 时间同步失败，继续尝试连接...");
-        }
+        // 【删除NTP同步以加快启动速度】
+        // TLS使用setInsecure已跳过证书验证，不需要时间同步
+        // Serial.println("[NTP] 同步网络时间...");
+        // configTime(8 * 3600, 0, "ntp.ntsc.ac.cn", "cn.pool.ntp.org");
 
         // 【关键】先配置TLS客户端，再初始化MQTT
         Serial.println("[TLS] 配置安全客户端...");
-        espClient.setInsecure();  // 跳过证书验证
-        espClient.setHandshakeTimeout(12);  // 12秒握手超时（测试显示需要6秒+）
+        espClient.setInsecure();  // 跳过证书验证，不需要NTP时间
+        espClient.setHandshakeTimeout(8);  // 减少到8秒
 
         // 初始化 MQTT
         mqtt.setServer(MQTT_BROKER, MQTT_PORT);
