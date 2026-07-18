@@ -584,10 +584,11 @@ void mqtt_reconnect() {
             Serial.printf("  - blindstick/config/home_city (常住地设置)\n");
             retryCount = 0;
 
-            // 【开机语音】MQTT首次连接成功后发送
-            // 使用双重检查确保只发送一次，即使MQTT重连也不会重复
-            if (!startup_announced) {
-                delay(200);  // 减少等待时间，加快启动
+            // 【开机语音】只在系统启动后的首次MQTT连接时发送一次
+            // 使用静态变量确保断电重启前不会重复发送
+            static bool first_connect_done = false;
+            if (!first_connect_done) {
+                delay(200);
                 StaticJsonDocument<256> doc;
                 doc["text"] = "系统启动成功";
                 doc["priority"] = PRIO_NORMAL;
@@ -596,9 +597,10 @@ void mqtt_reconnect() {
                 bool published = mqtt.publish("blindstick/tts/request", buf, len);
                 if (published) {
                     Serial.println("[系统] 开机语音已发送");
+                    first_connect_done = true;
                     startup_announced = true;
                 } else {
-                    Serial.println("[系统] 开机语音发送失败");
+                    Serial.println("[系统] 开机语音发送失败，下次连接重试");
                 }
             }
         } else {
@@ -872,11 +874,6 @@ void checkObstacleAndAlert() {
 
     unsigned long now = millis();
 
-    // 5秒内只播报一次
-    if (now - last_alert_time < ALERT_INTERVAL_MS) {
-        return;
-    }
-
     // 判断哪个方向有障碍物（优先级：正前方 > 左前方 > 右前方 > 左侧 > 右侧）
     bool has_obstacle = false;
     String alert_text = "";
@@ -934,7 +931,13 @@ void checkObstacleAndAlert() {
         }
     }
 
+    // 只有检测到有障碍物且满足播报间隔时才播报
     if (has_obstacle) {
+        // 检查5秒播报间隔
+        if (now - last_alert_time < ALERT_INTERVAL_MS) {
+            return;  // 时间未到，不播报
+        }
+
         // 去重检查：相同文本5秒内不重复播报
         if (alert_text == last_alert_text && (now - last_alert_text_time) < ALERT_TEXT_DUPLICATE_MS) {
             Serial.printf("[障碍物播报] 去重：5秒内已播报过\n");
@@ -985,9 +988,10 @@ void RadarMotorUploadTask(void* pvParameters) {
         if (mqtt.connected()) {
                 mqtt.loop();  // 保活
 
-                // 障碍物检测和语音告警（使用流式TTS）
+                // 障碍物检测和语音告警（独立控制频率）
                 checkObstacleAndAlert();
 
+                // 数据上传 - 每200ms一次，与语音播报频率无关
                 if (now - lastUpload >= UPLOAD_INTERVAL_MS) {
                     lastUpload = now;
                     publishSensorData();
