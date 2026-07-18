@@ -237,7 +237,7 @@ class MQTTAudioSender:
                 "aue": 6
             }
 
-            resp = requests.post(url, data=payload, timeout=15, verify=False)
+            resp = requests.post(url, data=payload, timeout=8, verify=False)  // 减少超时时间以提高响应速度
 
             if 'audio' in resp.headers.get('Content-Type', ''):
                 audio_data = resp.content

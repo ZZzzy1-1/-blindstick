@@ -1075,27 +1075,100 @@ async function planRouteToNearest(destination, currentLat, currentLng) {
     }
 }
 
-// ================= 新增：开机播报（发送文本给ESP32功放播放）====================
+// ================= 新增：事件记录功能 =================
 
 /**
- * 开机播报 - 发送文本给ESP32，由ESP32功放播放
+ * 添加事件记录到网页大屏
+ * @param {string} category - 事件类别：'系统', '导航', '障碍物', '语音'
+ * @param {string} message - 事件消息
+ */
+function addEventLog(category, message) {
+    const eventList = document.getElementById('eventList');
+    if (!eventList) {
+        console.warn('[事件记录] 找不到eventList元素');
+        return;
+    }
+
+    // 根据类别设置颜色
+    const colorMap = {
+        '系统': '#00d4ff',
+        '导航': '#2ed573',
+        '障碍物': '#ff4757',
+        '语音': '#ffa502',
+        '雷达': '#ff6348'
+    };
+    const color = colorMap[category] || '#ffffff';
+
+    // 创建事件项
+    const item = document.createElement('div');
+    item.className = 'event-item';
+    item.style.cssText = `
+        padding: 8px 12px;
+        margin-bottom: 6px;
+        background: rgba(255,255,255,0.05);
+        border-radius: 6px;
+        border-left: 3px solid ${color};
+        font-size: 13px;
+        line-height: 1.4;
+        animation: fadeIn 0.3s ease;
+    `;
+
+    const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    item.innerHTML = `
+        <div style="color: ${color}; font-weight: 600; margin-bottom: 2px;">${category} · ${time}</div>
+        <div style="color: rgba(255,255,255,0.9);">${message}</div>
+    `;
+
+    // 插入到列表顶部
+    eventList.insertBefore(item, eventList.firstChild);
+
+    // 限制最多显示50条记录
+    while (eventList.children.length > 50) {
+        eventList.removeChild(eventList.lastChild);
+    }
+
+    console.log(`[事件记录] [${category}] ${message}`);
+}
+
+/**
+ * 清空事件记录
+ */
+function clearEventLog() {
+    const eventList = document.getElementById('eventList');
+    if (eventList) {
+        eventList.innerHTML = '';
+    }
+}
+
+/**
+ * 清空聊天历史
+ */
+function clearChatHistory() {
+    const chatContainer = document.getElementById('chatContainer');
+    if (chatContainer) {
+        chatContainer.innerHTML = '<div class="chat-welcome">语音对话功能暂不可用</div>';
+    }
+}
+
+/**
+ * 清空导航历史
+ */
+function clearNavHistory() {
+    const navHistoryList = document.getElementById('navHistoryList');
+    if (navHistoryList) {
+        navHistoryList.innerHTML = '<div class="nav-empty">暂无导航记录</div>';
+    }
+}
+
+// ================= 新增：开机播报（已由ESP32硬件端处理）====================
+
+/**
+ * 开机播报 - 已由ESP32硬件端处理，前端只记录日志，避免重复播报
  */
 async function playStartupSound() {
-    console.log('[开机播报] 发送启动文本给ESP32');
-    console.log('系统', '设备启动成功');
-
-    const startupText = '导盲杖系统启动成功，欢迎使用';
-    // 通过MQTT发送文本给ESP32，让ESP32自己合成语音并由功放播放
-    if (mqttClient && AppState.mqttConnected) {
-        const msg = JSON.stringify({
-            type: 'tts_request',
-            text: startupText
-        });
-        mqttClient.publish(MQTT_CONFIG.topics.ttsReq, msg);
-        console.log('[开机播报] 已发送文本给ESP32:', startupText);
-    } else {
-        console.error('[开机播报] MQTT未连接');
-    }
+    console.log('[开机播报] ESP32硬件已处理开机语音，前端仅记录日志');
+    addEventLog('系统', '设备启动成功');
+    // 注意：不再通过MQTT发送TTS请求，因为ESP32在连接MQTT后会自动发送开机语音
 }
 
 // ================= 障碍物检测（仅用于统计和显示，不播报）====================
@@ -1132,6 +1205,8 @@ async function handleObstacleDetection(radarData) {
         document.getElementById('obstacleCount').textContent = AppState.reportData.obstacleCount;
         AppState.lastObstacleState = true;
         console.log('[障碍物] 检测到障碍物，距离:', Math.round(minDist), 'cm');
+        // 添加事件记录
+        addEventLog('障碍物', `检测到障碍物，距离 ${Math.round(minDist)}cm`);
     } else if (minDist >= OBSTACLE_THRESHOLD + 20) {
         // 增加20cm迟滞，避免频繁切换
         AppState.lastObstacleState = false;
@@ -1146,20 +1221,21 @@ async function handleObstacleDetection(radarData) {
  */
 async function handleVoiceNavigationAdvanced(text) {
     console.log('[语音导航] 收到文本:', text);
-    console.log('语音', `识别: ${text}`);
+    addEventLog('语音', `识别: ${text}`);
 
     // 提取目的地
     const destination = extractDestinationAdvanced(text);
 
     if (!destination) {
         console.log('[语音导航] 未提取到有效目的地');
+        addEventLog('语音', '未提取到有效目的地');
         // 发送文本给ESP32，由ESP32播放提示音
         await baiduTTS('请说出具体地点，例如带我去天安门');
         return;
     }
 
     console.log('[语音导航] 目的地:', destination);
-    console.log('导航', `目的地: ${destination}`);
+    addEventLog('导航', `目的地: ${destination}`);
 
     const currentPos = AppState.lastGpsPos;
 
@@ -1168,6 +1244,7 @@ async function handleVoiceNavigationAdvanced(text) {
 
     if (!route) {
         console.log('[语音导航] 路线规划失败');
+        addEventLog('导航', '路线规划失败');
         // 发送文本给ESP32，由ESP32播放提示音
         await baiduTTS('抱歉，没有找到该地点的路线');
         return;
@@ -1176,9 +1253,9 @@ async function handleVoiceNavigationAdvanced(text) {
     // 检查距离是否太远
     if (route.tooFar) {
         console.log('[语音导航]', route.message);
+        addEventLog('导航', route.message);
         // 发送文本给ESP32，由ESP32播放提示音
         await baiduTTS(route.message + '，请重新选择较近的地点');
-        console.log('导航', route.message);
         return;
     }
 
@@ -1195,7 +1272,7 @@ async function handleVoiceNavigationAdvanced(text) {
     if (mqttClient && AppState.mqttConnected) {
         mqttClient.publish(MQTT_CONFIG.topics.navSteps, JSON.stringify(navMsg));
         console.log('[语音导航] 导航路线已发送:', route.steps.length, '步');
-        console.log('导航', `开始导航到 ${route.destination}，共${route.steps.length}步，${Math.round(route.distance)}米`);
+        addEventLog('导航', `开始导航到 ${route.destination}，共${route.steps.length}步，${Math.round(route.distance)}米`);
     }
 
     // 发送导航播报文本给ESP32，由ESP32功放播放
@@ -1215,6 +1292,10 @@ if (typeof window !== 'undefined') {
     window.planRouteToNearest = planRouteToNearest;
     window.playStartupSound = playStartupSound;
     window.handleVoiceNavigationAdvanced = handleVoiceNavigationAdvanced;
+    window.addEventLog = addEventLog;
+    window.clearEventLog = clearEventLog;
+    window.clearChatHistory = clearChatHistory;
+    window.clearNavHistory = clearNavHistory;
 }
 
 // ================= 新增：常住地设置功能 =================

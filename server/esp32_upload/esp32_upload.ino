@@ -251,8 +251,9 @@ int   gps_satellites = 0;
 // 常住地设置（默认黄石市，可通过MQTT更新）
 String home_city = "黄石市";
 
-// 开机语音播报标志（只播报一次）
-volatile bool startup_announced = false;
+// 开机语音播报标志（只播报一次）- 使用RTC内存保持，深度睡眠后也能记住
+RTC_DATA_ATTR static bool startup_announced_rtc = false;
+volatile bool startup_announced = false;  // 运行时标志，用于防止同一运行周期内重复
 
 enum LidarState { WAIT_HEADER_AA, WAIT_HEADER_55, READ_CT, READ_LSN, READ_PAYLOAD };
 volatile LidarState lidar_state = WAIT_HEADER_AA;
@@ -308,9 +309,9 @@ void smartAvoidDecision() {
     unsigned long now = millis();
 
     // 阈值定义 - 降低阈值让电机更容易响应
-    const float FRONT_BLOCK_CM = 100.0f;   // 前方阻挡阈值 从150降到100
-    const float SIDE_BLOCK_CM = 50.0f;     // 侧边阻挡阈值 从70降到50
-    const float TURN_CLEAR_CM = 120.0f;    // 转向目标方向需要至少120cm 从200降到120
+    const float FRONT_BLOCK_CM = 80.0f;    // 前方阻挡阈值 从100降到80
+    const float SIDE_BLOCK_CM = 40.0f;     // 侧边阻挡阈值 从50降到40
+    const float TURN_CLEAR_CM = 100.0f;    // 转向目标方向需要至少100cm 从120降到100
     const float TURN_TIMEOUT_MS = 2500;    // 转向超时时间
 
     // 调试输出 - 每2秒打印一次雷达数据
@@ -584,10 +585,8 @@ void mqtt_reconnect() {
             Serial.printf("  - blindstick/config/home_city (常住地设置)\n");
             retryCount = 0;
 
-            // 【开机语音】只在系统启动后的首次MQTT连接时发送一次
-            // 使用静态变量确保断电重启前不会重复发送
-            static bool first_connect_done = false;
-            if (!first_connect_done) {
+            // 【开机语音】只在系统启动后的首次MQTT连接时发送一次（使用RTC内存保持状态）
+            if (!startup_announced && !startup_announced_rtc) {
                 delay(200);
                 StaticJsonDocument<256> doc;
                 doc["text"] = "系统启动成功";
@@ -597,8 +596,8 @@ void mqtt_reconnect() {
                 bool published = mqtt.publish("blindstick/tts/request", buf, len);
                 if (published) {
                     Serial.println("[系统] 开机语音已发送");
-                    first_connect_done = true;
                     startup_announced = true;
+                    startup_announced_rtc = true;  // 写入RTC内存，防止重复播报
                 } else {
                     Serial.println("[系统] 开机语音发送失败，下次连接重试");
                 }
@@ -749,10 +748,13 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
             free(audio_buf);
             Serial.println("[TTS] 播放完成");
 
-            // 恢复语音识别
+            // 恢复语音识别 - 确保在TTS完成后恢复
             if (VoiceTaskHandle != NULL) {
-                vTaskResume(VoiceTaskHandle);
-                Serial.println("[TTS] 语音识别已恢复");
+                eTaskState taskState = eTaskGetState(VoiceTaskHandle);
+                if (taskState == eSuspended) {
+                    vTaskResume(VoiceTaskHandle);
+                    Serial.println("[TTS] 语音识别已恢复");
+                }
             }
         }
 
@@ -796,13 +798,13 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
 bool last_blocked = false;
 unsigned long last_alert_time = 0;
 float last_alert_dist = 0;
-#define ALERT_INTERVAL_MS 5000  // 障碍物告警间隔 5 秒
-#define ALERT_DIST_CHANGE 50    // 距离变化超过50cm才重新播报
+#define ALERT_INTERVAL_MS 2000        // 障碍物告警间隔 2 秒（减少延迟）
+#define ALERT_DIST_CHANGE 30          // 距离变化超过30cm才重新播报（从50减少到30）
 
 // 避障语音去重：记录上次播报的文本和时间
 static String last_alert_text = "";
 static unsigned long last_alert_text_time = 0;
-#define ALERT_TEXT_DUPLICATE_MS 5000  // 相同文本5秒内不重复
+#define ALERT_TEXT_DUPLICATE_MS 3000  // 相同文本3秒内不重复（从5秒减少到3秒，提高响应速度）
 
 // ==================== 辅助函数：使用PSRAM或普通内存分配 ====================
 void* allocateBuffer(size_t size) {
@@ -868,9 +870,9 @@ void checkObstacleAndAlert() {
     float R  = dir_smt[3];  // 右侧
     float L  = dir_smt[4];  // 左侧
 
-    // 使用与避障决策相同的阈值
-    const float FRONT_ALERT_CM = 100.0f;   // 前方告警阈值（与FRONT_BLOCK_CM一致）
-    const float SIDE_ALERT_CM = 50.0f;     // 侧边告警阈值（与SIDE_BLOCK_CM一致）
+    // 使用与避障决策相同的阈值（已降低以更快响应）
+    const float FRONT_ALERT_CM = 80.0f;    // 前方告警阈值（与FRONT_BLOCK_CM一致）
+    const float SIDE_ALERT_CM = 40.0f;     // 侧边告警阈值（与SIDE_BLOCK_CM一致）
 
     unsigned long now = millis();
 
@@ -2149,11 +2151,14 @@ void handleTTSUrl(const char* payload, int length) {
     free(audioBuffer);
     Serial.println("[TTS-URL] 播放完成");
 
-    // 恢复语音识别
+    // 恢复语音识别 - 确保正确恢复
     if (VoiceTaskHandle != NULL) {
-        vTaskResume(VoiceTaskHandle);
+        eTaskState taskState = eTaskGetState(VoiceTaskHandle);
+        if (taskState == eSuspended) {
+            vTaskResume(VoiceTaskHandle);
+            Serial.println("[TTS-URL] 语音识别已恢复");
+        }
     }
-}
 
 // ==================== 流式TTS实现（新版简化逻辑）====================
 
@@ -2247,7 +2252,11 @@ void handleStreamControl(const char* payload, int length) {
         }
 
         if (VoiceTaskHandle != NULL && stream_priority < PRIO_HIGH) {
-            vTaskResume(VoiceTaskHandle);
+            eTaskState taskState = eTaskGetState(VoiceTaskHandle);
+            if (taskState == eSuspended) {
+                vTaskResume(VoiceTaskHandle);
+                Serial.println("[流式TTS] 语音识别已恢复");
+            }
         }
 
         stream_playing = false;
@@ -2257,7 +2266,11 @@ void handleStreamControl(const char* payload, int length) {
         Serial.printf("[流式TTS] 收到打断信号\n");
         stopCurrentPlayback();
         if (VoiceTaskHandle != NULL) {
-            vTaskResume(VoiceTaskHandle);
+            eTaskState taskState = eTaskGetState(VoiceTaskHandle);
+            if (taskState == eSuspended) {
+                vTaskResume(VoiceTaskHandle);
+                Serial.println("[流式TTS] 语音识别已恢复");
+            }
         }
     }
 }
