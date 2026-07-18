@@ -49,7 +49,9 @@ const AppState = {
     videoDetections: [],
     gpsHistory: [],
     isRunning: true,
-    gpsCenter: [30.23193, 115.05791],
+    gpsCenter: null,  // 不再硬编码，从第一个GPS数据获取
+    gpsInitialized: false,  // GPS是否已初始化
+    gpsHasFix: false,       // GPS是否已定位
     reportData: {
         totalMileage: 0, navCount: 0, obstacleCount: 0, detourCount: 0,
     },
@@ -701,25 +703,42 @@ let map, pathPolyline, marker;
 function initMap() {
     const mapEl = document.getElementById('map');
     if (!mapEl) return;
-    map = L.map('map', { zoomControl: false }).setView(AppState.gpsCenter, 15);
+    // 初始视图使用中国中心，等待GPS数据
+    const defaultCenter = [35.0, 105.0];
+    map = L.map('map', { zoomControl: false }).setView(defaultCenter, 4);
     L.tileLayer('https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}', {
         subdomains: ['1', '2', '3', '4'], attribution: '© 高德地图'
     }).addTo(map);
     pathPolyline = L.polyline([], { color: '#2563eb', weight: 4 }).addTo(map);
-    marker = L.circleMarker(AppState.gpsCenter, { color: '#2563eb', radius: 6, fillColor: '#fff', fillOpacity: 1, weight: 3 }).addTo(map);
+    marker = L.circleMarker(defaultCenter, { color: '#2563eb', radius: 6, fillColor: '#fff', fillOpacity: 1, weight: 3 }).addTo(map);
 }
 
 function updateGPS(lng, lat, speed) {
     const pos = [lat, lng];
+
+    // 更新地图中心（仅在首次接收到有效GPS时）
+    if (map && !AppState.gpsInitialized) {
+        map.setView(pos, 15);
+        AppState.gpsInitialized = true;
+    }
+
     if (marker) marker.setLatLng(pos);
     if (pathPolyline) pathPolyline.addLatLng(pos);
-    if (map) map.setView(pos);
+    if (map) map.panTo(pos);  // 平滑移动地图
+
     const lngEl = document.getElementById('lng');
     const latEl = document.getElementById('lat');
     const speedEl = document.getElementById('speed');
-    if (lngEl) lngEl.textContent = lng.toFixed(4);
-    if (latEl) latEl.textContent = lat.toFixed(4);
+    if (lngEl) lngEl.textContent = lng.toFixed(6);  // 提高精度到6位小数
+    if (latEl) latEl.textContent = lat.toFixed(6);
     if (speedEl) speedEl.textContent = (speed || 0).toFixed(1);
+
+    // 更新状态为GPS已定位
+    if (!AppState.gpsHasFix) {
+        AppState.gpsHasFix = true;
+        console.log('[GPS] 已定位');
+    }
+
     // 计算里程
     if (AppState.lastGpsPos) {
         const dist = calcDistance(AppState.lastGpsPos.lat, AppState.lastGpsPos.lng, lat, lng);

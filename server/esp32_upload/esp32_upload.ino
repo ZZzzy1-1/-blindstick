@@ -289,9 +289,11 @@ void motorControl(int steerPower) {
     if (safe > 30) {
         digitalWrite(MOTOR_IN1, HIGH); digitalWrite(MOTOR_IN2, LOW);
         analogWrite(MOTOR_PWM, safe); last_motor_dir = "right";
+        Serial.printf("[电机执行] 右转 PWM=%d\n", safe);
     } else if (safe < -30) {
         digitalWrite(MOTOR_IN1, LOW); digitalWrite(MOTOR_IN2, HIGH);
         analogWrite(MOTOR_PWM, abs(safe)); last_motor_dir = "left";
+        Serial.printf("[电机执行] 左转 PWM=%d\n", abs(safe));
     } else {
         digitalWrite(MOTOR_IN1, LOW); digitalWrite(MOTOR_IN2, LOW);
         analogWrite(MOTOR_PWM, 0); last_motor_dir = "stop";
@@ -310,11 +312,19 @@ void smartAvoidDecision() {
     static int turn_direction = 0;  // 0=无, 1=左转, -1=右转
     unsigned long now = millis();
 
-    // 阈值定义
-    const float FRONT_BLOCK_CM = 150.0f;   // 前方阻挡阈值
-    const float SIDE_BLOCK_CM = 70.0f;     // 侧边阻挡阈值
-    const float TURN_CLEAR_CM = 200.0f;    // 转向目标方向需要至少200cm才转向
+    // 阈值定义 - 降低阈值让电机更容易响应
+    const float FRONT_BLOCK_CM = 100.0f;   // 前方阻挡阈值 从150降到100
+    const float SIDE_BLOCK_CM = 50.0f;     // 侧边阻挡阈值 从70降到50
+    const float TURN_CLEAR_CM = 120.0f;    // 转向目标方向需要至少120cm 从200降到120
     const float TURN_TIMEOUT_MS = 2500;    // 转向超时时间
+
+    // 调试输出 - 每2秒打印一次雷达数据
+    static unsigned long last_debug = 0;
+    if (now - last_debug > 2000) {
+        last_debug = now;
+        Serial.printf("[避障] 雷达: F:%.0f FL:%.0f FR:%.0f L:%.0f R:%.0f | blocked:%d\n",
+                      f, fL, fR, L, R, is_blocked);
+    }
 
     bool front_blocked = (f < FRONT_BLOCK_CM) || (fL < FRONT_BLOCK_CM) || (fR < FRONT_BLOCK_CM);
     bool side_alert    = (L < SIDE_BLOCK_CM)  || (R < SIDE_BLOCK_CM);
@@ -352,6 +362,7 @@ void smartAvoidDecision() {
             turnStartMs = now;
             was_turning = true;
             turn_direction = 1;
+            Serial.printf("[电机] 左转 | 雷达 F:%.0f FL:%.0f FR:%.0f\n", f, fL, fR);
             motorControl(STEER_MAX_PWM);
             return;
         } else if (should_turn_right && !should_turn_left) {
@@ -359,6 +370,7 @@ void smartAvoidDecision() {
             turnStartMs = now;
             was_turning = true;
             turn_direction = -1;
+            Serial.printf("[电机] 右转 | 雷达 F:%.0f FL:%.0f FR:%.0f\n", f, fL, fR);
             motorControl(-STEER_MAX_PWM);
             return;
         } else if (should_turn_left && should_turn_right) {
@@ -369,14 +381,17 @@ void smartAvoidDecision() {
             was_turning = true;
             if (left_space > right_space) {
                 turn_direction = 1;
+                Serial.printf("[电机] 左转(选大空间) | 左%.0fcm 右%.0fcm\n", left_space, right_space);
                 motorControl(STEER_MAX_PWM);
             } else {
                 turn_direction = -1;
+                Serial.printf("[电机] 右转(选大空间) | 左%.0fcm 右%.0fcm\n", left_space, right_space);
                 motorControl(-STEER_MAX_PWM);
             }
             return;
         }
         // 两边都不够空间，不转向，只停止（避免撞墙）
+        Serial.printf("[电机] 停止(空间不足) | 雷达 F:%.0f L:%.0f R:%.0f\n", f, L, R);
         motorControl(0);
         return;
     }
@@ -641,6 +656,25 @@ void mqtt_reconnect() {
             Serial.printf("  - %s (TTS请求)\n", MQTT_TOPIC_TTS_REQ);
             Serial.printf("  - blindstick/config/home_city (常住地设置)\n");
             retryCount = 0;
+
+            // 【开机语音】MQTT连接成功后发送，确保能发送成功
+            static bool startup_voice_sent = false;
+            if (!startup_voice_sent && !startup_announced) {
+                delay(500);  // 等待订阅完成
+                StaticJsonDocument<256> doc;
+                doc["text"] = "导盲杖系统启动成功，欢迎使用";
+                doc["priority"] = PRIO_NORMAL;
+                char buf[256];
+                size_t len = serializeJson(doc, buf, sizeof(buf));
+                bool published = mqtt.publish("blindstick/tts/request", buf, len);
+                if (published) {
+                    Serial.println("[系统] 开机语音已发送");
+                    startup_voice_sent = true;
+                    startup_announced = true;
+                } else {
+                    Serial.println("[系统] 开机语音发送失败");
+                }
+            }
         } else {
             int rc = mqtt.state();
             Serial.printf("[MQTT] 连接失败 rc=%d, ", rc);
@@ -1765,25 +1799,8 @@ void setup() {
         // 连接MQTT（非阻塞重试）
         mqtt_reconnect();
 
-        // WiFi 已连接，使用MQTT代理播报启动成功（只播报一次）
-        // 使用静态变量确保即使在mqtt_reconnect中也不会重复发送
-        static bool startup_sent = false;
-        if (!startup_announced && !startup_sent) {
-            delay(500);
-            StaticJsonDocument<256> doc;
-            doc["text"] = "导盲杖系统启动成功，欢迎使用";
-            doc["priority"] = PRIO_NORMAL;
-            char buf[256];
-            size_t len = serializeJson(doc, buf, sizeof(buf));
-            bool published = mqtt.publish("blindstick/tts/request", buf, len);
-            if (published) {
-                Serial.println("[系统] 启动播报请求已发送");
-                startup_announced = true;
-                startup_sent = true;  // 静态变量，确保只发送一次
-            } else {
-                Serial.println("[系统] 启动播报发送失败，将在下次连接重试");
-            }
-        }
+        // 注意：开机语音已移到 mqtt_reconnect 的 on_connect 回调中发送
+        // 确保 MQTT 连接成功后才发送，避免发送失败
     } else {
         Serial.println("[WiFi] 离线模式，MQTT不可用，跳过启动播报");
     }
@@ -1893,9 +1910,24 @@ bool searchNearestDestination(const char* keyword, float& outLat, float& outLng,
         return false;
     }
 
-    // 计算当前位置
-    float currentLat = gps_lat > 1.0 ? gps_lat : 30.229320;
-    float currentLng = gps_lng > 1.0 ? gps_lng : 115.063977;
+    // 计算当前位置 - 使用实时GPS数据，不再硬编码
+    float currentLat = gps_lat;
+    float currentLng = gps_lng;
+
+    // 检查GPS是否有效
+    if (currentLat < 1.0 || currentLng < 1.0) {
+        Serial.println("[导航] GPS未定位，无法搜索目的地");
+        // 播报GPS未定位提示
+        StaticJsonDocument<256> doc;
+        doc["text"] = "GPS未定位，请等待卫星信号";
+        doc["priority"] = PRIO_NORMAL;
+        char buf[256];
+        size_t len = serializeJson(doc, buf, sizeof(buf));
+        mqtt.publish("blindstick/tts/request", buf, len);
+        return false;
+    }
+
+    Serial.printf("[导航] 当前位置: %.6f, %.6f\n", currentLat, currentLng);
 
     // 找到最近的地点
     float minDistance = 999999999;
@@ -1931,8 +1963,15 @@ bool searchNearestDestination(const char* keyword, float& outLat, float& outLng,
 bool planWalkingRoute(float destLat, float destLng, String& destName) {
     if (WiFi.status() != WL_CONNECTED) return false;
 
-    float originLat = gps_lat > 1.0 ? gps_lat : 30.229320;
-    float originLng = gps_lng > 1.0 ? gps_lng : 115.063977;
+    // 使用实时GPS数据，不再硬编码
+    float originLat = gps_lat;
+    float originLng = gps_lng;
+
+    // 检查GPS是否有效
+    if (originLat < 1.0 || originLng < 1.0) {
+        Serial.println("[导航] GPS未定位，无法规划路线");
+        return false;
+    }
 
     WiFiClientSecure client;
     client.setInsecure();
