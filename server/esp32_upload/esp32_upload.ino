@@ -1966,6 +1966,41 @@ volatile bool  is_ai_talking = false;
 volatile bool  is_tts_requesting = false;  // TTS请求状态标志，防止重复发送
 unsigned long  tts_request_start_time = 0;
 
+// TTS请求标志互斥锁（防止竞态条件）
+SemaphoreHandle_t ttsRequestMutex = NULL;
+
+// TTS请求标志的安全访问函数
+inline void setTTSRequesting(bool value) {
+    if (ttsRequestMutex != NULL) {
+        if (xSemaphoreTake(ttsRequestMutex, portMAX_DELAY) == pdTRUE) {
+            is_tts_requesting = value;
+            if (value) {
+                tts_request_start_time = millis();
+            }
+            xSemaphoreGive(ttsRequestMutex);
+        }
+    } else {
+        // 互斥锁未初始化时直接赋值（兼容旧代码）
+        is_tts_requesting = value;
+        if (value) {
+            tts_request_start_time = millis();
+        }
+    }
+}
+
+inline bool getTTSRequesting() {
+    bool value = false;
+    if (ttsRequestMutex != NULL) {
+        if (xSemaphoreTake(ttsRequestMutex, portMAX_DELAY) == pdTRUE) {
+            value = is_tts_requesting;
+            xSemaphoreGive(ttsRequestMutex);
+        }
+    } else {
+        value = is_tts_requesting;
+    }
+    return value;
+}
+
 int last_motor_pwm = 0;
 String last_motor_dir = "stop";
 
@@ -2366,7 +2401,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
             free(audio_buf);
 
             // 重置TTS请求标志
-            is_tts_requesting = false;
+            setTTSRequesting(false);
 
             // 恢复语音识别 - 确保在TTS完成后恢复
             if (VoiceTaskHandle != NULL) {
@@ -2394,20 +2429,10 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         }
 
     } else if (strcmp(topic, MQTT_TOPIC_TTS_REQ) == 0) {
-        // 收到TTS请求 - 转发给代理服务器进行流式合成
-        StaticJsonDocument<256> doc;
-        DeserializationError err = deserializeJson(doc, payload, length);
-        if (!err && doc.containsKey("text")) {
-            const char* text = doc["text"];
-            int priority = doc["priority"] | PRIO_NORMAL;
-            // 静默转发，不打印日志
-            StaticJsonDocument<256> reqDoc;
-            reqDoc["text"] = text;
-            reqDoc["priority"] = priority;
-            char buf[256];
-            size_t len = serializeJson(reqDoc, buf, sizeof(buf));
-            mqtt.publish("blindstick/tts/request", buf, len);
-        }
+        // 【注意】ESP32不再转发TTS请求到代理服务器
+        // 代理服务器直接订阅 blindstick/tts/request，无需ESP32转发
+        // 这避免了MQTT消息循环问题
+        // 如果需要本地处理TTS请求，可以在这里添加代码
     }
 }
 
@@ -2543,7 +2568,7 @@ void checkObstacleAndAlert() {
     // 只有检测到有障碍物且满足播报间隔时才播报
     if (has_obstacle) {
         // 如果正在播放语音或正在请求TTS，跳过
-        if (is_ai_talking || is_tts_requesting) {
+        if (is_ai_talking || getTTSRequesting()) {
             return;
         }
 
@@ -2558,7 +2583,7 @@ void checkObstacleAndAlert() {
         }
 
         // 设置TTS请求标志，防止重复发送
-        is_tts_requesting = true;
+        setTTSRequesting(true);
         tts_request_start_time = now;
 
         // 发送流式TTS请求（高优先级）
@@ -2575,7 +2600,7 @@ void checkObstacleAndAlert() {
             last_alert_text_time = now;
         } else {
             // 发送失败，重置标志
-            is_tts_requesting = false;
+            setTTSRequesting(false);
         }
     }
 }
@@ -2609,9 +2634,9 @@ void RadarMotorUploadTask(void* pvParameters) {
                 mqtt.loop();  // 保活
 
                 // 检查TTS请求超时（防止卡死）
-                if (is_tts_requesting && (millis() - tts_request_start_time > TTS_REQUEST_TIMEOUT_MS)) {
+                if (getTTSRequesting() && (millis() - tts_request_start_time > TTS_REQUEST_TIMEOUT_MS)) {
                     Serial.println("[TTS] 请求超时，重置标志");
-                    is_tts_requesting = false;
+                    setTTSRequesting(false);
                 }
 
                 // 障碍物检测和语音告警（独立控制频率）
@@ -3049,6 +3074,11 @@ void setup() {
     current_step_idx = 0; current_progress = 0; nav_active = false;
 
     audioMutex = xSemaphoreCreateMutex();
+
+    // 初始化TTS请求标志互斥锁
+    ttsRequestMutex = xSemaphoreCreateMutex();
+    if (ttsRequestMutex == NULL) {
+        Serial.println("[警告] TTS互斥锁创建失败");
 
     // 初始化流式TTS
     initStreamingTTS();
@@ -3542,7 +3572,7 @@ void handleTTSUrl(const char* payload, int length) {
         Serial.printf("[TTS-URL] 下载不完整: %d/%d\n", totalRead, len);
         free(audioBuffer);
         // 重置TTS请求标志
-        is_tts_requesting = false;
+        setTTSRequesting(false);
         if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
         return;
     }
@@ -3560,7 +3590,7 @@ void handleTTSUrl(const char* payload, int length) {
     Serial.println("[TTS-URL] 播放完成");
 
     // 重置TTS请求标志（播放完成，可以发送下一个请求）
-    is_tts_requesting = false;
+    setTTSRequesting(false);
 
     // 恢复语音识别 - 确保正确恢复
     if (VoiceTaskHandle != NULL) {
