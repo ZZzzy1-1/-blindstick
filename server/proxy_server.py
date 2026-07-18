@@ -202,7 +202,11 @@ class MQTTAudioSender:
                 priority = data.get("priority", 0)
 
                 if text:
-                    print(f"[MQTT] TTS快速接收: '{text[:30]}...' 优先级={priority}")
+                    print(f"[MQTT] TTS请求来自: {msg.retain and '保留消息' or '实时消息'}, 内容: '{text[:30]}...'")
+                    # 跳过开机语音，因为ESP32已本地播放
+                    if "系统启动" in text or "启动成功" in text:
+                        print(f"[MQTT] 跳过开机语音TTS请求: '{text[:30]}...'")
+                        return
                     # 使用线程异步处理，不阻塞MQTT回调
                     import threading
                     t = threading.Thread(

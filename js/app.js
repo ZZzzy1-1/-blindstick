@@ -333,7 +333,7 @@ function connectMQTT() {
             clientId: MQTT_CONFIG.clientId,
             username: MQTT_CONFIG.username,
             password: MQTT_CONFIG.password,
-            clean: true,
+            clean: true,  // 清理会话，不接收保留消息
             reconnectPeriod: 5000,
             connectTimeout: 10000
         });
