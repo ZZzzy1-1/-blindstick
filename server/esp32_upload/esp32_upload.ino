@@ -3499,16 +3499,17 @@ void handleTTSUrl(const char* payload, int length) {
     // HTTP下载音频 - 优化超时设置
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(8000);  // 减少到8秒
+    client.setTimeout(20000);  // 增加到20秒，给大文件足够时间
 
     HTTPClient http;
     if (!http.begin(client, url)) {
         Serial.println("[TTS-URL] HTTP初始化失败");
+        setTTSRequesting(false);  // 重置标志
         if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
         return;
     }
 
-    http.setTimeout(10000);  // 减少到10秒
+    http.setTimeout(25000);  // 增加到25秒
     int httpCode = http.GET();
 
     if (httpCode != 200) {
@@ -3546,31 +3547,94 @@ void handleTTSUrl(const char* payload, int length) {
     // 读取数据 - 使用更大的缓冲区
     WiFiClient* stream = http.getStreamPtr();
     int totalRead = 0;
-    int bufferSize = 1024;  // 1KB缓冲区
+    int bufferSize = 8192;  // 增大到8KB缓冲区，提高下载效率
     unsigned long downloadStart = millis();
+    unsigned long lastDataTime = millis();  // 上次收到数据的时间
+    const unsigned long DOWNLOAD_TIMEOUT_MS = 30000;  // 增加到30秒总超时
+    const unsigned long DATA_TIMEOUT_MS = 10000;      // 10秒无数据超时
+
+    Serial.printf("[TTS-URL] 开始下载，大小:%d字节\n", len);
 
     while (totalRead < len) {
+        // 检查连接状态
+        if (!stream->connected()) {
+            Serial.println("[TTS-URL] 连接断开");
+            break;
+        }
+
         int available = stream->available();
         if (available > 0) {
             int toRead = min(available, min(bufferSize, len - totalRead));
             int r = stream->readBytes(audioBuffer + totalRead, toRead);
             if (r > 0) {
                 totalRead += r;
+                lastDataTime = millis();  // 更新最后数据时间
+
+                // 每下载10KB打印进度
+                if (totalRead % 10240 == 0 || totalRead == len) {
+                    Serial.printf("[TTS-URL] 下载进度: %d/%d (%.1f%%)\n",
+                        totalRead, len, (float)totalRead / len * 100);
+                }
             }
+        } else {
+            // 没有数据可用，短暂等待
+            delay(5);
         }
-        // 超时检查
-        if (millis() - downloadStart > 15000) {
-            Serial.println("[TTS-URL] 下载超时");
+
+        // 总超时检查
+        if (millis() - downloadStart > DOWNLOAD_TIMEOUT_MS) {
+            Serial.printf("[TTS-URL] 下载总超时(>%ds)，已下载:%d/%d\n",
+                DOWNLOAD_TIMEOUT_MS/1000, totalRead, len);
             break;
         }
+
+        // 无数据超时检查（防止卡在半途中）
+        if (millis() - lastDataTime > DATA_TIMEOUT_MS) {
+            Serial.printf("[TTS-URL] 数据接收超时(>%ds无数据)，已下载:%d/%d\n",
+                DATA_TIMEOUT_MS/1000, totalRead, len);
+            break;
+        }
+
         if (totalRead >= len) break;
-        delay(1);  // 让出CPU
+
+        // 喂狗，防止看门狗复位
+        yield();
     }
 
     http.end();
 
     if (totalRead != len) {
-        Serial.printf("[TTS-URL] 下载不完整: %d/%d\n", totalRead, len);
+        float percent = (float)totalRead / len * 100;
+        Serial.printf("[TTS-URL] 下载不完整: %d/%d (%.1f%%)\n", totalRead, len, percent);
+
+        // 如果下载了超过80%，尝试播放已下载的部分
+        if (totalRead > len * 0.8 && totalRead > 10240) {
+            Serial.println("[TTS-URL] 下载超过80%，尝试播放...");
+
+            // 跳过WAV头并播放
+            int offset = 0;
+            if (totalRead > 44 && audioBuffer[0] == 'R' && audioBuffer[1] == 'I') {
+                offset = 44;
+            }
+            playPcmData(audioBuffer + offset, totalRead - offset);
+
+            free(audioBuffer);
+            Serial.println("[TTS-URL] 播放完成(部分下载)");
+
+            // 重置TTS请求标志
+            setTTSRequesting(false);
+
+            // 恢复语音识别
+            if (VoiceTaskHandle != NULL) {
+                eTaskState taskState = eTaskGetState(VoiceTaskHandle);
+                if (taskState == eSuspended) {
+                    vTaskResume(VoiceTaskHandle);
+                }
+            }
+            return;
+        }
+
+        // 下载太少，放弃并释放内存
         free(audioBuffer);
         // 重置TTS请求标志
         setTTSRequesting(false);
