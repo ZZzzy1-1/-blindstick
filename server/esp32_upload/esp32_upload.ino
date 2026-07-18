@@ -59,11 +59,6 @@ volatile bool    tts_rx_ready = false;
 volatile unsigned long tts_rx_start = 0;
 #define TTS_RX_TIMEOUT_MS  5000
 
-// ==================== 高德地图参数 ====================
-const String AMAP_KEY     = "90a13b148658cc0a0525f959202a4063";
-const String NAV_DEST_NAME    = "湖北师范大学教育大楼";
-const String NAV_ORIGIN       = "115.063977,30.229320";
-
 // ==================== 百度语音 API 配置（仅用于语音识别）====================
 const String BAIDU_API_KEY        = "Xbxnhkwb2sxtB6HbH5BUTlUG";
 const String BAIDU_SECRET_KEY     = "Tw485P2BFGpPu8WeOVP6hy4S1BHqG4ON";
@@ -258,8 +253,6 @@ String home_city = "黄石市";
 
 // 开机语音播报标志（只播报一次）
 volatile bool startup_announced = false;
-
-volatile bool amap_fused = false;
 
 enum LidarState { WAIT_HEADER_AA, WAIT_HEADER_55, READ_CT, READ_LSN, READ_PAYLOAD };
 volatile LidarState lidar_state = WAIT_HEADER_AA;
@@ -525,74 +518,6 @@ void parseGPSNMEA() {
             }
         }
     }
-}
-
-bool fetchAmapRoute() {
-    if (amap_fused) {
-        nav_total_steps = 3;
-        nav_steps[0] = "前方直行，跟随电机牵引和雷达避障";
-        nav_steps[1] = "前方进入开阔路段，保持安全直行";
-        nav_steps[2] = "已接近湖北师范大学目的地附近";
-        return false;
-    }
-    static volatile bool is_fetching = false;
-    if (is_fetching) return false;
-    is_fetching = true;
-    if (WiFi.status() != WL_CONNECTED) { is_fetching = false; return false; }
-    String originCoord = NAV_ORIGIN;
-    if (gps_lat > 1.0 && gps_lng > 1.0) originCoord = String(gps_lng, 6) + "," + String(gps_lat, 6);
-    HTTPClient http;
-    String destCoord = "";
-    String geoUrl = "https://restapi.amap.com/v3/geocode/geo?address=" + NAV_DEST_NAME + "&city=黄石&key=" + AMAP_KEY;
-    http.begin(geoUrl);
-    int geoCode = http.GET();
-    if (geoCode == 200) {
-        StaticJsonDocument<1024> geoDoc;
-        String resp = http.getString();
-        if (resp.indexOf("402") != -1 || resp.indexOf("INVALID_USER_KEY") != -1) {
-            Serial.println("\n[熔断] 高德限制，切换本地看护模式");
-            amap_fused = true; http.end(); is_fetching = false; return false;
-        }
-        if (deserializeJson(geoDoc, resp) == DeserializationError::Ok) {
-            if (geoDoc["status"] == "1" && geoDoc["geocodes"].size() > 0)
-                destCoord = geoDoc["geocodes"][0]["location"].as<String>();
-        }
-    }
-    http.end();
-    if (destCoord.isEmpty()) destCoord = "115.040000,30.220000";
-    String routeUrl = "https://restapi.amap.com/v3/direction/walking?origin=" + originCoord + "&destination=" + destCoord + "&key=" + AMAP_KEY;
-    http.begin(routeUrl);
-    int code = http.GET();
-    if (code == 200) {
-        String responseStr = http.getString();
-        if (responseStr.indexOf("402") != -1 || responseStr.indexOf("USERKEY_PLAT_NOMATCH") != -1 || responseStr.indexOf("INVALID_USER_KEY") != -1) {
-            Serial.println("\n[熔断] 高德402，本地看护模式");
-            amap_fused = true;
-            nav_total_steps = 3;
-            nav_steps[0] = "前方直行，跟随电机牵引和雷达避障";
-            nav_steps[1] = "前方进入开阔路段，保持安全直行";
-            nav_steps[2] = "已接近湖北师范大学目的地附近";
-            current_step_idx = 0; current_progress = 0;
-            http.end(); is_fetching = false; return false;
-        }
-        DynamicJsonDocument doc(4096);
-        if (deserializeJson(doc, responseStr) == DeserializationError::Ok && doc["status"] == "1") {
-            JsonArray steps = doc["route"]["paths"][0]["steps"].as<JsonArray>();
-            nav_total_steps = 0;
-            for (JsonObject step : steps) {
-                nav_steps[nav_total_steps] = step["instruction"].as<String>();
-                nav_total_steps++; if (nav_total_steps >= 10) break;
-            }
-            current_step_idx = 0; current_progress = 0;
-            http.end(); is_fetching = false; return true;
-        }
-    }
-    http.end();
-    nav_total_steps = 2;
-    nav_steps[0] = "前方直行，请注意雷达避障";
-    nav_steps[1] = "继续朝着目的地前行";
-    current_step_idx = 0; current_progress = 0;
-    is_fetching = false; return false;
 }
 
 // ==================== MQTT 重连 ====================
