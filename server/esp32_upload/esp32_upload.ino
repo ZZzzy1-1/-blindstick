@@ -122,7 +122,7 @@ HardwareSerial gpsSerial(2);
 #define I2S_DATA_PIN    6  // SPK_OUT
 #define I2S_PORT_OUT    I2S_NUM_1
 
-#define VOLUME_GAIN     0.6
+#define VOLUME_GAIN     0.85  // 音量增益 (0.0-1.0)，增大音量
 
 // ==================== 音频采样参数 ====================
 #define SAMPLE_RATE     16000  // 16kHz 采样率
