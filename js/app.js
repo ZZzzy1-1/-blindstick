@@ -277,23 +277,6 @@ async function interruptTTS(newPriority = TTS_PRIORITY.HIGH) {
 }
 
 /**
- * 发送雷达告警语音（高优先级，立即打断）
- * @param {number} distance - 距离（厘米）
- * @param {string} direction - 方向
- */
-async function announceObstacle(distance, direction) {
-    let text;
-    if (distance < 150) {
-        text = `注意！前方${Math.round(distance)}厘米有障碍物，请立即避让！`;
-    } else {
-        text = `前方${Math.round(distance)}厘米有${direction}障碍物`;
-    }
-
-    console.log('[雷达告警]', text);
-    await streamTTS(text, TTS_PRIORITY.HIGH);
-}
-
-/**
  * 发送导航语音（普通优先级）
  * @param {string} text - 导航文本
  */
@@ -1115,15 +1098,16 @@ async function playStartupSound() {
     }
 }
 
-// ================= 新增：障碍物检测（只发送文本给ESP32播放）====================
+// ================= 障碍物检测（仅用于统计和显示，不播报）====================
 
 /**
- * 处理五向雷达障碍物检测 - 只发送文本，由ESP32功放播放
+ * 处理五向雷达障碍物检测 - 仅用于统计和显示
+ * 播报由ESP32硬件端处理，避免重复
  * @param {Object} radarData - 雷达数据 {front, frontLeft, frontRight, left, right}
  */
 async function handleObstacleDetection(radarData) {
     const { front, frontLeft, frontRight, left, right } = radarData;
-    const OBSTACLE_THRESHOLD = 180; // 障碍物告警阈值（厘米）
+    const OBSTACLE_THRESHOLD = 100; // 与ESP32一致
 
     // 找出最近的障碍物
     const distances = [
@@ -1135,68 +1119,26 @@ async function handleObstacleDetection(radarData) {
     ];
 
     let minDist = Infinity;
-    let minDir = '';
 
     for (const item of distances) {
         if (item.dist < minDist) {
             minDist = item.dist;
-            minDir = item.dir;
         }
     }
 
-    // 如果最近障碍物在阈值内，且状态变化，则发送播报请求给ESP32
+    // 只在状态变化时更新计数（用于统计）
     if (minDist < OBSTACLE_THRESHOLD && !AppState.lastObstacleState) {
         AppState.reportData.obstacleCount++;
         document.getElementById('obstacleCount').textContent = AppState.reportData.obstacleCount;
         AppState.lastObstacleState = true;
-
-        // 发送文本给ESP32，由ESP32自己合成并播放
-        await announceObstacleWithDistance(Math.round(minDist), minDir);
-
-    } else if (minDist >= 200) {
+        console.log('[障碍物] 检测到障碍物，距离:', Math.round(minDist), 'cm');
+    } else if (minDist >= OBSTACLE_THRESHOLD + 20) {
+        // 增加20cm迟滞，避免频繁切换
         AppState.lastObstacleState = false;
     }
 }
 
-/**
- * 发送障碍物告警文本给ESP32（由ESP32功放播放）
- * @param {number} distance - 障碍物距离（厘米）
- * @param {string} direction - 方向（如'前方'、'左前方'等）
- */
-async function announceObstacleWithDistance(distance, direction = '前方') {
-    console.log('[障碍物告警] 发送文本给ESP32:', direction, distance, 'cm');
-
-    let alertText = '';
-
-    // 根据距离生成不同的告警文本
-    if (distance < 50) {
-        alertText = `${direction}${distance}厘米有障碍物，请立即避让！`;
-    } else if (distance < 100) {
-        alertText = `${direction}${distance}厘米有障碍物，请注意避让`;
-    } else if (distance < 200) {
-        alertText = `${direction}${distance}厘米有障碍物`;
-    } else {
-        alertText = `${direction}${Math.round(distance / 100)}米处有障碍物`;
-    }
-
-    console.log('障碍物', alertText);
-
-    // 通过MQTT发送文本给ESP32，让ESP32自己合成语音并由功放播放
-    if (mqttClient && AppState.mqttConnected) {
-        const msg = JSON.stringify({
-            type: 'obstacle_alert',
-            text: alertText,
-            distance: distance,
-            direction: direction
-        });
-        mqttClient.publish(MQTT_CONFIG.topics.ttsReq, msg);
-        console.log('[障碍物告警] 已发送文本给ESP32:', alertText);
-    } else {
-        console.error('[障碍物告警] MQTT未连接');
-    }
-}
-
-// ================= 新增：语音导航处理（改进版 - ESP32播放）====================
+// ================= 语音导航处理（改进版 - ESP32播放）====================
 
 /**
  * 处理语音导航指令（改进版）- 由ESP32功放播放语音
@@ -1272,7 +1214,6 @@ if (typeof window !== 'undefined') {
     window.extractDestinationAdvanced = extractDestinationAdvanced;
     window.planRouteToNearest = planRouteToNearest;
     window.playStartupSound = playStartupSound;
-    window.announceObstacleWithDistance = announceObstacleWithDistance;
     window.handleVoiceNavigationAdvanced = handleVoiceNavigationAdvanced;
 }
 
