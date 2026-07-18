@@ -531,27 +531,22 @@ async function handleMqttMessage(topic, payload) {
         }
 
         // --- TTS 请求（ESP32通过MQTT代理请求TTS） ---
+        // 注意：此主题的消息是给 proxy_server 的，前端只需记录日志
+        // 不要转发，否则会形成循环（前端→MQTT→前端→MQTT...）
         if (topic === MQTT_CONFIG.topics.ttsReq) {
             try {
                 const msg = JSON.parse(payload.toString());
-                console.log('[TTS-MQTT] 收到TTS请求:', msg.text);
+                console.log('[TTS-MQTT] 收到TTS请求（仅记录）:', msg.text);
 
-                // 只要有text字段就调用TTS（ESP32发送的消息可能没有type字段）
-                if (msg.text) {
-                    // 根据type确定优先级，默认NORMAL(1)
-                    let priority = msg.priority !== undefined ? msg.priority : TTS_PRIORITY.NORMAL;
-                    if (msg.type === 'obstacle_alert' || msg.type === 'radar_alert') {
-                        priority = TTS_PRIORITY.HIGH;
-                    } else if (msg.type === 'navigation') {
-                        priority = TTS_PRIORITY.LOW;
-                    }
-                    console.log(`[TTS-MQTT] 调用streamTTS: "${msg.text.substring(0, 30)}..." 优先级=${priority}`);
-                    await streamTTS(msg.text, priority);
-                } else {
-                    console.log('[TTS-MQTT] 消息无text字段，忽略');
+                // 只记录日志，不转发
+                // proxy_server 会处理这个请求并发送 tts/url 给 ESP32
+
+                // 显示在事件记录中（可选）
+                if (msg.text && msg.text.includes('启动')) {
+                    console.log('系统', `设备启动: ${msg.text.substring(0, 20)}`);
                 }
             } catch (e) {
-                console.error('[TTS-MQTT] 处理失败:', e);
+                console.error('[TTS-MQTT] 解析失败:', e);
             }
             return;
         }
