@@ -408,24 +408,21 @@ async function handleMqttMessage(topic, payload) {
             };
             updateModuleStatus(deviceStatus);
 
-            // 雷达数据（五向）- 简化为短字段名
+            // 雷达数据（三向）- 正前/左方/右方
             if (msg.radar) {
                 // 强制转换为数字，处理字符串或 undefined 情况
                 const front = Number(msg.radar.f ?? msg.radar.front ?? 400);
-                const frontLeft = Number(msg.radar.fl ?? msg.radar.frontLeft ?? 400);
-                const frontRight = Number(msg.radar.fr ?? msg.radar.frontRight ?? 400);
                 const left = Number(msg.radar.l ?? msg.radar.left ?? 400);
                 const right = Number(msg.radar.r ?? msg.radar.right ?? 400);
 
                 // 详细调试输出
                 console.log('[雷达原始]', JSON.stringify(msg.radar));
-                console.log('[雷达原始r值]', msg.radar.r, '类型:', typeof msg.radar.r);
-                console.log('[雷达解析] F:%d FL:%d FR:%d L:%d R:%d', front, frontLeft, frontRight, left, right);
+                console.log('[雷达解析] F:%d L:%d R:%d', front, left, right);
 
-                updateRadarCircles(front, frontLeft, frontRight, left, right);
+                updateRadarCircles(front, left, right);
 
                 // 使用新的障碍物检测和播报功能
-                handleObstacleDetection({ front, frontLeft, frontRight, left, right });
+                handleObstacleDetection({ front, left, right });
             }
 
             // GPS
@@ -577,35 +574,29 @@ function updateModuleStatus(modules) {
     }
 }
 
-function updateRadarCircles(front, frontLeft, frontRight, left, right) {
+// ==================== 三向雷达 UI 更新 ====================
+function updateRadarCircles(front, left, right) {
     const valFront = document.getElementById('valFront');
-    const valFrontLeft = document.getElementById('valFrontLeft');
-    const valFrontRight = document.getElementById('valFrontRight');
     const valLeft = document.getElementById('valLeft');
     const valRight = document.getElementById('valRight');
     const barFront = document.getElementById('barFront');
-    const barFrontLeft = document.getElementById('barFrontLeft');
-    const barFrontRight = document.getElementById('barFrontRight');
     const barLeft = document.getElementById('barLeft');
     const barRight = document.getElementById('barRight');
 
-    // 调试：检查元素是否存在
-    if (!valRight) console.warn('[雷达UI] valRight 元素不存在!');
-
     if (valFront) valFront.textContent = Math.round(front) + 'cm';
-    if (valFrontLeft) valFrontLeft.textContent = Math.round(frontLeft) + 'cm';
-    if (valFrontRight) valFrontRight.textContent = Math.round(frontRight) + 'cm';
     if (valLeft) valLeft.textContent = Math.round(left) + 'cm';
     if (valRight) valRight.textContent = Math.round(right) + 'cm';
 
     if (barFront) updateRadarBar(barFront, front);
-    if (barFrontLeft) updateRadarBar(barFrontLeft, frontLeft);
-    if (barFrontRight) updateRadarBar(barFrontRight, frontRight);
     if (barLeft) updateRadarBar(barLeft, left);
     if (barRight) updateRadarBar(barRight, right);
 
     // 调试：确认更新后的值
-    console.log('[雷达UI更新] 右侧显示:', valRight ? valRight.textContent : 'N/A');
+    console.log('[雷达UI更新] 前:%s 左:%s 右:%s',
+        valFront?.textContent || 'N/A',
+        valLeft?.textContent || 'N/A',
+        valRight?.textContent || 'N/A'
+    );
 }
 
 function updateRadarBar(bar, distance) {
@@ -1166,21 +1157,19 @@ async function playStartupSound() {
 // ================= 障碍物检测（仅用于统计和显示，不播报）====================
 
 /**
- * 处理五向雷达障碍物检测 - 仅用于统计和显示
+ * 处理三向雷达障碍物检测 - 仅用于统计和显示
  * 播报由ESP32硬件端处理，避免重复
- * @param {Object} radarData - 雷达数据 {front, frontLeft, frontRight, left, right}
+ * @param {Object} radarData - 雷达数据 {front, left, right}
  */
 async function handleObstacleDetection(radarData) {
-    const { front, frontLeft, frontRight, left, right } = radarData;
+    const { front, left, right } = radarData;
     const OBSTACLE_THRESHOLD = 100; // 与ESP32一致
 
     // 找出最近的障碍物
     const distances = [
         { dist: front, dir: '正前方' },
-        { dist: frontLeft, dir: '左前方' },
-        { dist: frontRight, dir: '右前方' },
-        { dist: left, dir: '左侧' },
-        { dist: right, dir: '右侧' }
+        { dist: left, dir: '左方' },
+        { dist: right, dir: '右方' }
     ];
 
     let minDist = Infinity;

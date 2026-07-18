@@ -2029,18 +2029,19 @@ TaskHandle_t VoiceTaskHandle = NULL;
 TaskHandle_t TTSPlayerTaskHandle = NULL;
 
 // ==================== 五向雷达 + EMA平滑 ====================
-#define NUM_DIR     5
+#define NUM_DIR     3
 #define SMOOTH_A    0.50f
 
-volatile float dir_raw[NUM_DIR] = {400.0f, 400.0f, 400.0f, 400.0f, 400.0f};
-volatile float dir_smt[NUM_DIR] = {400.0f, 400.0f, 400.0f, 400.0f, 400.0f};
+volatile float dir_raw[NUM_DIR] = {400.0f, 400.0f, 400.0f};
+volatile float dir_smt[NUM_DIR] = {400.0f, 400.0f, 400.0f};
 
 // ==================== 本地完整语音系统（无需网络，<100ms响应）====================
 // 【使用方法】
 // 1. 运行 generate_local_voices.py 生成语音数据
 // 2. 将生成的数据保存为 local_voices.h 放在同目录
 // 3. 取消下面这行的注释：
-// #define USE_LOCAL_VOICES
+#define USE_LOCAL_VOICES
+#define LOCAL_VOICE_ENABLED  // 同时启用避障本地语音
 
 #ifdef USE_LOCAL_VOICES
 #include "local_voices.h"  // 包含真实语音数据
@@ -2102,32 +2103,6 @@ void playLocalVoiceByText(const String& alert_text) {
 #endif
 }
 
-// 根据告警文本选择并播放本地语音
-void playLocalVoiceByText(const String& alert_text) {
-#ifdef LOCAL_VOICE_ENABLED
-    // 根据文本内容匹配对应的本地语音
-    if (alert_text.indexOf("左侧") >= 0) {
-        playLocalVoice(voice_leftside, voice_leftside_len);
-    } else if (alert_text.indexOf("右侧") >= 0) {
-        playLocalVoice(voice_rightside, voice_rightside_len);
-    } else if (alert_text.indexOf("左前方") >= 0) {
-        playLocalVoice(voice_frontleft, voice_frontleft_len);
-    } else if (alert_text.indexOf("右前方") >= 0) {
-        playLocalVoice(voice_frontright, voice_frontright_len);
-    } else if (alert_text.indexOf("向左") >= 0) {
-        playLocalVoice(voice_left, voice_left_len);
-    } else if (alert_text.indexOf("向右") >= 0) {
-        playLocalVoice(voice_right, voice_right_len);
-    } else {
-        // 默认播放前方注意
-        playLocalVoice(voice_front, voice_front_len);
-    }
-#else
-    // 本地语音未启用，使用网络TTS
-    Serial.println("[本地语音] 未启用，使用网络TTS");
-#endif
-}
-
 // 兼容旧接口
 void playAlertTone(int direction) {
     // 不再使用简单提示音
@@ -2165,27 +2140,29 @@ void motorControl(int steerPower) {
 // ==================== 避障决策（智能转向，判断目标方向空间是否充足）====================
 // 【优化】电机立即执行，本地音效立即播放，TTS异步延迟触发
 void smartAvoidDecision() {
-    float f  = dir_smt[0];
-    float fR = dir_smt[1];
-    float fL = dir_smt[2];
-    float R  = dir_smt[3];
-    float L  = dir_smt[4];
+    // 三向雷达: [0]=正前方, [1]=左方, [2]=右方
+    float f = dir_smt[0];  // 正前方
+    float L = dir_smt[1];  // 左方
+    float R = dir_smt[2];  // 右方
+
     static unsigned long turnStartMs = 0;
     static bool was_turning = false;
     static int turn_direction = 0;  // 0=无, 1=左转, -1=右转
-    static unsigned long lastAlertToneMs = 0;  // 上次本地音效时间
+    static unsigned long lastAlertToneMs = 0;
     unsigned long now = millis();
 
     // 阈值定义
     const float FRONT_BLOCK_CM = 80.0f;
-    const float SIDE_BLOCK_CM = 40.0f;
+    const float SIDE_BLOCK_CM = 50.0f;
     const float TURN_CLEAR_CM = 100.0f;
     const float TURN_TIMEOUT_MS = 2500;
-    const float ALERT_TONE_INTERVAL_MS = 2000;  // 本地音效最小间隔2秒
+    const float ALERT_TONE_INTERVAL_MS = 2000;
 
-    bool front_blocked = (f < FRONT_BLOCK_CM) || (fL < FRONT_BLOCK_CM) || (fR < FRONT_BLOCK_CM);
-    bool side_alert    = (L < SIDE_BLOCK_CM)  || (R < SIDE_BLOCK_CM);
-    is_blocked = front_blocked || side_alert;
+    // 判断是否有障碍物
+    bool front_blocked = (f < FRONT_BLOCK_CM);
+    bool left_blocked = (L < SIDE_BLOCK_CM);
+    bool right_blocked = (R < SIDE_BLOCK_CM);
+    is_blocked = front_blocked || left_blocked || right_blocked;
 
     // AI说话时停止电机
     if (is_ai_talking) {
@@ -2193,56 +2170,36 @@ void smartAvoidDecision() {
         return;
     }
 
-    // 【关键优化】电机立即执行避障，本地音效简单提示
-    // 前方被阻挡，需要转向
+    // 【关键】前方被阻挡，需要转向
     if (front_blocked) {
-        // 计算最近障碍物距离和方向
-        float minDist = f;
-        int alertDir = 0;  // 0=前, 1=左, 2=右
-        if (fL < minDist) { minDist = fL; alertDir = 1; }
-        if (fR < minDist) { minDist = fR; alertDir = 2; }
-
-        // 仅在紧急情况(<50cm)且间隔足够时播放简单提示音
-        if (minDist < 50 && now - lastAlertToneMs > ALERT_TONE_INTERVAL_MS) {
+        // 紧急情况下播放简单提示音
+        if (f < 50 && now - lastAlertToneMs > ALERT_TONE_INTERVAL_MS) {
             lastAlertToneMs = now;
-            playAlertTone(alertDir);  // 简单500ms提示
+            playAlertTone(0);  // 前方告警
         }
 
-        // 判断转向方向（原有逻辑）
-        bool should_turn_left = false;
-        bool should_turn_right = false;
+        // 判断转向方向：选择空间更大的一侧
+        bool should_turn_left = (L > R && L > TURN_CLEAR_CM);
+        bool should_turn_right = (R > L && R > TURN_CLEAR_CM);
 
-        if (fL > fR && fL > TURN_CLEAR_CM) {
-            should_turn_left = true;
-        } else if (L > R && L > TURN_CLEAR_CM) {
-            should_turn_left = true;
-        }
-
-        if (fR > fL && fR > TURN_CLEAR_CM) {
-            should_turn_right = true;
-        } else if (R > L && R > TURN_CLEAR_CM) {
-            should_turn_right = true;
-        }
-
-        // 执行转向决策（立即执行）
+        // 执行转向决策
         if (should_turn_left && !should_turn_right) {
             turnStartMs = now;
             was_turning = true;
             turn_direction = 1;
-            motorControl(-STEER_MAX_PWM);  // 立即左转
+            motorControl(-STEER_MAX_PWM);  // 左转
             return;
         } else if (should_turn_right && !should_turn_left) {
             turnStartMs = now;
             was_turning = true;
             turn_direction = -1;
-            motorControl(STEER_MAX_PWM);   // 立即右转
+            motorControl(STEER_MAX_PWM);   // 右转
             return;
         } else if (should_turn_left && should_turn_right) {
-            float left_space = max(fL, L);
-            float right_space = max(fR, R);
+            // 两边都够空间，选更大的
             turnStartMs = now;
             was_turning = true;
-            if (left_space > right_space) {
+            if (L > R) {
                 turn_direction = 1;
                 motorControl(-STEER_MAX_PWM);
             } else {
@@ -2255,34 +2212,17 @@ void smartAvoidDecision() {
         motorControl(0);
         return;
     }
-            float left_space = max(fL, L);
-            float right_space = max(fR, R);
-            turnStartMs = now;
-            was_turning = true;
-            if (left_space > right_space) {
-                turn_direction = 1;
-                motorControl(-STEER_MAX_PWM);  // 负数=左转
-            } else {
-                turn_direction = -1;
-                motorControl(STEER_MAX_PWM);   // 正数=右转
-            }
-            return;
-        }
-        // 两边都不够空间，不转向，只停止（避免撞墙）
-        motorControl(0);
-        return;
-    }
 
     // 正在转向后的恢复逻辑
     if (was_turning) {
         // 判断转向目标方向是否已经有足够空间
         bool escape_clear = false;
         if (turn_direction == 1) {
-            // 之前向左转，检查左侧和左前方
-            escape_clear = (fL > TURN_CLEAR_CM && f > FRONT_BLOCK_CM);
+            // 之前向左转，检查左方和前方
+            escape_clear = (L > TURN_CLEAR_CM && f > FRONT_BLOCK_CM);
         } else if (turn_direction == -1) {
-            // 之前向右转，检查右侧和右前方
-            escape_clear = (fR > TURN_CLEAR_CM && f > FRONT_BLOCK_CM);
+            // 之前向右转，检查右方和前方
+            escape_clear = (R > TURN_CLEAR_CM && f > FRONT_BLOCK_CM);
         }
         bool timeout = (now - turnStartMs) > TURN_TIMEOUT_MS;
 
@@ -2292,27 +2232,35 @@ void smartAvoidDecision() {
         } else {
             // 继续转向
             if (turn_direction == 1) {
-                motorControl(-STEER_MAX_PWM);  // 负数=左转
+                motorControl(-STEER_MAX_PWM);
             } else if (turn_direction == -1) {
-                motorControl(STEER_MAX_PWM);   // 正数=右转
+                motorControl(STEER_MAX_PWM);
             }
             return;
         }
     }
 
     // 侧边告警微调（保持安全距离）
-    if (side_alert) {
-        float leftPull  = (SIDE_BLOCK_CM - L) * 3.0f;
-        float rightPull = (SIDE_BLOCK_CM - R) * 3.0f;
-        motorControl((int)(leftPull - rightPull));
+    if (left_blocked || right_blocked) {
+        float leftPull = left_blocked ? (SIDE_BLOCK_CM - L) * 3.0f : 0;
+        float rightPull = right_blocked ? (SIDE_BLOCK_CM - R) * 3.0f : 0;
+        // 左边有障碍，向右转（正值）；右边有障碍，向左转（负值）
+        motorControl((int)(rightPull - leftPull));
         return;
     }
 
-    // 右侧沿墙走模式（保持与右侧墙壁的安全距离）
-    if (R < 200.0f) {
+    // 沿墙走模式（保持与侧方墙壁的安全距离）
+    if (R < 200.0f && R < L) {
+        // 沿右墙走
         float err = R - 90.0f;
         err = constrain(err, -50.0f, 60.0f);
         motorControl((int)(err * 0.4f));
+        return;
+    } else if (L < 200.0f && L < R) {
+        // 沿左墙走
+        float err = L - 90.0f;
+        err = constrain(err, -50.0f, 60.0f);
+        motorControl((int)(-err * 0.4f));  // 反向
         return;
     }
 
@@ -2322,23 +2270,22 @@ void smartAvoidDecision() {
 
 // ==================== 雷达处理 ====================
 static inline int point_to_dir(float ang) {
-    // 如果雷达装反了（旋转180°），进行角度修正
+    // 角度修正（雷达装反时旋转180°）
     float corrected_ang = ang + 180.0f;
     if (corrected_ang >= 360.0f) corrected_ang -= 360.0f;
-    
-    // 用修正后的角度进行方向映射
-    if (corrected_ang >= 340.0f || corrected_ang <= 20.0f) {
+
+    // 三向雷达角度映射: 前方、左方、右方
+    // 前方: 正前方 ±30° (330-30°)
+    // 左方: 左前方到左后方 (30-150°)
+    // 右方: 右前方到右后方 (210-330°)
+    if (corrected_ang >= 330.0f || corrected_ang <= 30.0f) {
         return 0;  // 正前方
-    } else if (corrected_ang > 20.0f && corrected_ang <= 60.0f) {
-        return 2;  // 左前方
-    } else if (corrected_ang > 60.0f && corrected_ang <= 120.0f) {
-        return 4;  // 左侧
-    } else if (corrected_ang >= 240.0f && corrected_ang <= 300.0f) {
-        return 3;  // 右侧
-    } else if (corrected_ang > 300.0f && corrected_ang < 340.0f) {
-        return 1;  // 右前方
+    } else if (corrected_ang > 30.0f && corrected_ang <= 150.0f) {
+        return 1;  // 左方（包含左前、正左、左后）
+    } else if (corrected_ang > 210.0f && corrected_ang < 330.0f) {
+        return 2;  // 右方（包含右前、正右、右后）
     } else {
-        return -1; // 无效方向（后方）
+        return -1; // 无效方向（正后方150-210°，忽略）
     }
 }
 
@@ -2585,24 +2532,22 @@ static unsigned long last_alert_text_time = 0;
 #define TTS_TRIGGER_DISTANCE_CM 60     // 距离小于60cm触发紧急播报
 #define TTS_TRIGGER_COUNT 2            // 连续检测到2次触发（更快响应）
 
-// ==================== 障碍物检测和播报（优化版）====================
+// ==================== 障碍物检测和播报（三向雷达版）====================
 void checkObstacleAndAlert() {
-    float f  = dir_smt[0];  // 正前方
-    float fR = dir_smt[1];  // 右前方
-    float fL = dir_smt[2];  // 左前方
-    float R  = dir_smt[3];  // 右侧
-    float L  = dir_smt[4];  // 左侧
+    // 三向雷达: [0]=正前方, [1]=左方, [2]=右方
+    float f = dir_smt[0];
+    float L = dir_smt[1];
+    float R = dir_smt[2];
 
-    // 使用与避障决策相同的阈值
+    // 阈值定义
     const float FRONT_ALERT_CM = 80.0f;
-    const float SIDE_ALERT_CM = 40.0f;
+    const float SIDE_ALERT_CM = 50.0f;
 
     unsigned long now = millis();
 
     // 找出最近的障碍物
-    float minDist = min(f, min(fL, min(fR, min(L, R))));
-    static int consecutiveAlerts = 0;  // 连续检测计数
-    static float lastMinDist = 400.0f;
+    float minDist = min(f, min(L, R));
+    static int consecutiveAlerts = 0;
 
     // 判断哪个方向有障碍物
     bool has_obstacle = false;
@@ -2610,78 +2555,51 @@ void checkObstacleAndAlert() {
 
     if (f < FRONT_ALERT_CM) {
         has_obstacle = true;
-        if (fL > fR && fL > FRONT_ALERT_CM) {
-            alert_text = "前方有障碍物，请向左绕行";
-        } else if (fR > fL && fR > FRONT_ALERT_CM) {
-            alert_text = "前方有障碍物，请向右绕行";
-        } else if (L > R && L > SIDE_ALERT_CM) {
-            alert_text = "前方有障碍物，请向左绕行";
+        if (L > R && L > SIDE_ALERT_CM) {
+            alert_text = "前方有障碍物，请向左绕行";  // -> voice_left
         } else if (R >= L && R > SIDE_ALERT_CM) {
-            alert_text = "前方有障碍物，请向右绕行";
+            alert_text = "前方有障碍物，请向右绕行";  // -> voice_right
         } else {
-            alert_text = "前方有障碍物，请注意避让";
-        }
-    }
-    else if (fL < FRONT_ALERT_CM && fL < fR) {
-        has_obstacle = true;
-        if (fR > FRONT_ALERT_CM || R > SIDE_ALERT_CM) {
-            alert_text = "左前方有障碍物，请向右绕行";
-        } else {
-            alert_text = "左前方有障碍物，请注意避让";
-        }
-    }
-    else if (fR < FRONT_ALERT_CM) {
-        has_obstacle = true;
-        if (fL > FRONT_ALERT_CM || L > SIDE_ALERT_CM) {
-            alert_text = "右前方有障碍物，请向左绕行";
-        } else {
-            alert_text = "右前方有障碍物，请注意避让";
+            alert_text = "前方有障碍物，请注意避让";  // -> voice_front
         }
     }
     else if (L < SIDE_ALERT_CM && L < R) {
         has_obstacle = true;
-        if (R > SIDE_ALERT_CM) {
-            alert_text = "左侧有障碍物，请向右绕行";
+        if (R > SIDE_ALERT_CM && f > FRONT_ALERT_CM) {
+            alert_text = "左侧有障碍物，请向右绕行";  // -> voice_leftside
         } else {
-            alert_text = "左侧有障碍物，请注意避让";
+            alert_text = "前方有障碍物，请注意避让";  // -> voice_front (默认)
         }
     }
     else if (R < SIDE_ALERT_CM) {
         has_obstacle = true;
-        if (L > SIDE_ALERT_CM) {
-            alert_text = "右侧有障碍物，请向左绕行";
+        if (L > SIDE_ALERT_CM && f > FRONT_ALERT_CM) {
+            alert_text = "右侧有障碍物，请向左绕行";  // -> voice_rightside
         } else {
-            alert_text = "右侧有障碍物，请注意避让";
+            alert_text = "前方有障碍物，请注意避让";  // -> voice_front (默认)
         }
     }
 
-    // 【关键优化】连续检测计数
+    // 连续检测计数
     if (has_obstacle) {
         consecutiveAlerts++;
     } else {
         consecutiveAlerts = 0;
     }
 
-    // 只有满足以下条件才触发TTS：
-    // 1. 有障碍物
-    // 2. 连续检测到3次以上（避免瞬时误报）
-    // 3. 距离很近（<50cm）或者已经满足间隔时间
-    // 4. 没有正在播放的语音
-    // 5. 间隔至少12秒
-
+    // 触发条件检查
     if (has_obstacle && consecutiveAlerts >= TTS_TRIGGER_COUNT) {
         // 基础检查
         if (is_ai_talking || getTTSRequesting()) {
             return;
         }
 
-        // 【策略1】距离很近（<60cm）立即播报
+        // 策略1：距离很近（<60cm）立即播报
         bool isUrgent = minDist < TTS_TRIGGER_DISTANCE_CM;
 
-        // 【策略2】普通情况间隔8秒
+        // 策略2：普通情况间隔8秒
         bool timeOK = (now - last_alert_time >= ALERT_INTERVAL_MS);
 
-        // 【策略3】紧急情况可以打断（但要检查是否可以打断）
         if (!isUrgent && !timeOK) {
             return;
         }
@@ -2751,11 +2669,10 @@ void publishSensorData() {
     StaticJsonDocument<384> doc;
     doc["device_id"] = "blind_stick_001";
     JsonObject radar = doc.createNestedObject("radar");
-    radar["f"]  = dir_smt[0];  // 正前
-    radar["fl"] = dir_smt[2];  // 前左
-    radar["fr"] = dir_smt[1];  // 前右
-    radar["l"]  = dir_smt[4];  // 左侧
-    radar["r"]  = dir_smt[3];  // 右侧
+    // 三向雷达: [0]=正前方, [1]=左方, [2]=右方
+    radar["f"] = dir_smt[0];  // 正前
+    radar["l"] = dir_smt[1];  // 左方
+    radar["r"] = dir_smt[2];  // 右方
     doc["blocked"] = is_blocked;
     doc["nav"] = nav_active;
     JsonObject gps = doc.createNestedObject("gps");
