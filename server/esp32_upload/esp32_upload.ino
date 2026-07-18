@@ -2035,6 +2035,30 @@ TaskHandle_t TTSPlayerTaskHandle = NULL;
 volatile float dir_raw[NUM_DIR] = {400.0f, 400.0f, 400.0f, 400.0f, 400.0f};
 volatile float dir_smt[NUM_DIR] = {400.0f, 400.0f, 400.0f, 400.0f, 400.0f};
 
+// ==================== 本地告警音效（无需网络，立即播放）====================
+// 使用简单的蜂鸣器音效，不需要TTS，响应时间 < 50ms
+void playAlertTone(int direction) {
+    // direction: 0=前方, 1=左, 2=右
+    const int sample_rate = 16000;
+    const int duration_ms = 300;  // 300ms短促提示
+    const int num_samples = sample_rate * duration_ms / 1000;
+    int16_t tone_buffer[4800];  // 300ms @ 16kHz
+
+    // 根据方向使用不同频率
+    int freq = (direction == 0) ? 1500 : (direction == 1) ? 1200 : 1800;
+
+    for (int i = 0; i < num_samples; i++) {
+        float t = (float)i / sample_rate;
+        // 添加衰减效果
+        float envelope = 1.0f - (float)i / num_samples;
+        float sample = sin(2 * PI * freq * t) * 4000.0f * envelope;
+        tone_buffer[i] = (int16_t)sample;
+    }
+
+    size_t written = 0;
+    i2s_write(I2S_PORT_OUT, tone_buffer, num_samples * 2, &written, portMAX_DELAY);
+}
+
 // ==================== 电机控制 ====================
 void motorControl(int steerPower) {
     if (is_ai_talking) {
@@ -2054,10 +2078,10 @@ void motorControl(int steerPower) {
         digitalWrite(MOTOR_IN1, LOW); digitalWrite(MOTOR_IN2, LOW);
         analogWrite(MOTOR_PWM, 0); last_motor_dir = "stop";
     }
-    // 电机状态只在变化时打印（在调用处控制）
 }
 
 // ==================== 避障决策（智能转向，判断目标方向空间是否充足）====================
+// 【优化】电机立即执行，本地音效立即播放，TTS异步延迟触发
 void smartAvoidDecision() {
     float f  = dir_smt[0];
     float fR = dir_smt[1];
@@ -2067,13 +2091,15 @@ void smartAvoidDecision() {
     static unsigned long turnStartMs = 0;
     static bool was_turning = false;
     static int turn_direction = 0;  // 0=无, 1=左转, -1=右转
+    static unsigned long lastAlertToneMs = 0;  // 上次本地音效时间
     unsigned long now = millis();
 
-    // 阈值定义 - 降低阈值让电机更容易响应
-    const float FRONT_BLOCK_CM = 80.0f;    // 前方阻挡阈值 从100降到80
-    const float SIDE_BLOCK_CM = 40.0f;     // 侧边阻挡阈值 从50降到40
-    const float TURN_CLEAR_CM = 100.0f;    // 转向目标方向需要至少100cm 从120降到100
-    const float TURN_TIMEOUT_MS = 2500;    // 转向超时时间
+    // 阈值定义
+    const float FRONT_BLOCK_CM = 80.0f;
+    const float SIDE_BLOCK_CM = 40.0f;
+    const float TURN_CLEAR_CM = 100.0f;
+    const float TURN_TIMEOUT_MS = 2500;
+    const float ALERT_TONE_INTERVAL_MS = 2000;  // 本地音效最小间隔2秒
 
     bool front_blocked = (f < FRONT_BLOCK_CM) || (fL < FRONT_BLOCK_CM) || (fR < FRONT_BLOCK_CM);
     bool side_alert    = (L < SIDE_BLOCK_CM)  || (R < SIDE_BLOCK_CM);
@@ -2085,43 +2111,67 @@ void smartAvoidDecision() {
         return;
     }
 
+    // 【关键优化1】电机立即执行避障，不等待语音
     // 前方被阻挡，需要转向
     if (front_blocked) {
-        // 智能判断：选择空间更大的一边，但只有当目标方向有足够空间时才转向
+        // 【关键优化2】立即播放本地音效提示（< 50ms延迟）
+        if (now - lastAlertToneMs > ALERT_TONE_INTERVAL_MS) {
+            lastAlertToneMs = now;
+            // 根据最近障碍物方向选择音效
+            int minDistDir = 0;  // 0=前, 1=右, 2=左
+            float minDist = f;
+            if (fL < minDist) { minDist = fL; minDistDir = 1; }
+            if (fR < minDist) { minDist = fR; minDistDir = 2; }
+            playAlertTone(minDistDir);
+        }
+
+        // 判断转向方向（原有逻辑）
         bool should_turn_left = false;
         bool should_turn_right = false;
 
-        // 判断左转条件：左前方或左侧有足够空间
         if (fL > fR && fL > TURN_CLEAR_CM) {
             should_turn_left = true;
         } else if (L > R && L > TURN_CLEAR_CM) {
             should_turn_left = true;
         }
 
-        // 判断右转条件：右前方或右侧有足够空间
         if (fR > fL && fR > TURN_CLEAR_CM) {
             should_turn_right = true;
         } else if (R > L && R > TURN_CLEAR_CM) {
             should_turn_right = true;
         }
 
-        // 执行转向决策
+        // 执行转向决策（立即执行）
         if (should_turn_left && !should_turn_right) {
-            // 只能左转 - 传入负数
             turnStartMs = now;
             was_turning = true;
             turn_direction = 1;
-            motorControl(-STEER_MAX_PWM);  // 负数=左转
+            motorControl(-STEER_MAX_PWM);  // 立即左转
             return;
         } else if (should_turn_right && !should_turn_left) {
-            // 只能右转 - 传入正数
             turnStartMs = now;
             was_turning = true;
             turn_direction = -1;
-            motorControl(STEER_MAX_PWM);   // 正数=右转
+            motorControl(STEER_MAX_PWM);   // 立即右转
             return;
         } else if (should_turn_left && should_turn_right) {
-            // 两边都可以，选择空间更大的
+            float left_space = max(fL, L);
+            float right_space = max(fR, R);
+            turnStartMs = now;
+            was_turning = true;
+            if (left_space > right_space) {
+                turn_direction = 1;
+                motorControl(-STEER_MAX_PWM);
+            } else {
+                turn_direction = -1;
+                motorControl(STEER_MAX_PWM);
+            }
+            return;
+        }
+        // 两边都不够空间，停止
+        motorControl(0);
+        return;
+    }
             float left_space = max(fL, L);
             float right_space = max(fR, R);
             turnStartMs = now;
@@ -2446,9 +2496,143 @@ float last_alert_dist = 0;
 // 避障语音去重：记录上次播报的文本和时间
 static String last_alert_text = "";
 static unsigned long last_alert_text_time = 0;
-#define ALERT_TEXT_DUPLICATE_MS 8000  // 相同文本8秒内不重复
+#define ALERT_TEXT_DUPLICATE_MS 12000  // 增加到12秒，减少TTS频率
 
-#define TTS_REQUEST_TIMEOUT_MS 10000  // TTS请求超时时间10秒
+// 【优化】TTS触发阈值 - 只有严重情况才触发TTS
+#define TTS_TRIGGER_DISTANCE_CM 50     // 距离小于50cm才触发详细TTS
+#define TTS_TRIGGER_COUNT 3            // 连续检测到3次才触发
+
+// ==================== 障碍物检测和播报（优化版）====================
+void checkObstacleAndAlert() {
+    float f  = dir_smt[0];  // 正前方
+    float fR = dir_smt[1];  // 右前方
+    float fL = dir_smt[2];  // 左前方
+    float R  = dir_smt[3];  // 右侧
+    float L  = dir_smt[4];  // 左侧
+
+    // 使用与避障决策相同的阈值
+    const float FRONT_ALERT_CM = 80.0f;
+    const float SIDE_ALERT_CM = 40.0f;
+
+    unsigned long now = millis();
+
+    // 找出最近的障碍物
+    float minDist = min(f, min(fL, min(fR, min(L, R))));
+    static int consecutiveAlerts = 0;  // 连续检测计数
+    static float lastMinDist = 400.0f;
+
+    // 判断哪个方向有障碍物
+    bool has_obstacle = false;
+    String alert_text = "";
+
+    if (f < FRONT_ALERT_CM) {
+        has_obstacle = true;
+        if (fL > fR && fL > FRONT_ALERT_CM) {
+            alert_text = "前方有障碍物，请向左绕行";
+        } else if (fR > fL && fR > FRONT_ALERT_CM) {
+            alert_text = "前方有障碍物，请向右绕行";
+        } else if (L > R && L > SIDE_ALERT_CM) {
+            alert_text = "前方有障碍物，请向左绕行";
+        } else if (R >= L && R > SIDE_ALERT_CM) {
+            alert_text = "前方有障碍物，请向右绕行";
+        } else {
+            alert_text = "前方有障碍物，请注意避让";
+        }
+    }
+    else if (fL < FRONT_ALERT_CM && fL < fR) {
+        has_obstacle = true;
+        if (fR > FRONT_ALERT_CM || R > SIDE_ALERT_CM) {
+            alert_text = "左前方有障碍物，请向右绕行";
+        } else {
+            alert_text = "左前方有障碍物，请注意避让";
+        }
+    }
+    else if (fR < FRONT_ALERT_CM) {
+        has_obstacle = true;
+        if (fL > FRONT_ALERT_CM || L > SIDE_ALERT_CM) {
+            alert_text = "右前方有障碍物，请向左绕行";
+        } else {
+            alert_text = "右前方有障碍物，请注意避让";
+        }
+    }
+    else if (L < SIDE_ALERT_CM && L < R) {
+        has_obstacle = true;
+        if (R > SIDE_ALERT_CM) {
+            alert_text = "左侧有障碍物，请向右绕行";
+        } else {
+            alert_text = "左侧有障碍物，请注意避让";
+        }
+    }
+    else if (R < SIDE_ALERT_CM) {
+        has_obstacle = true;
+        if (L > SIDE_ALERT_CM) {
+            alert_text = "右侧有障碍物，请向左绕行";
+        } else {
+            alert_text = "右侧有障碍物，请注意避让";
+        }
+    }
+
+    // 【关键优化】连续检测计数
+    if (has_obstacle) {
+        consecutiveAlerts++;
+    } else {
+        consecutiveAlerts = 0;
+    }
+
+    // 只有满足以下条件才触发TTS：
+    // 1. 有障碍物
+    // 2. 连续检测到3次以上（避免瞬时误报）
+    // 3. 距离很近（<50cm）或者已经满足间隔时间
+    // 4. 没有正在播放的语音
+    // 5. 间隔至少12秒
+
+    if (has_obstacle && consecutiveAlerts >= TTS_TRIGGER_COUNT) {
+        // 基础检查
+        if (is_ai_talking || getTTSRequesting()) {
+            return;
+        }
+
+        // 【策略1】只有严重情况（<50cm）才立即播报
+        bool isUrgent = minDist < TTS_TRIGGER_DISTANCE_CM;
+
+        // 【策略2】普通情况间隔12秒
+        bool timeOK = (now - last_alert_time >= ALERT_INTERVAL_MS);
+
+        // 【策略3】紧急情况可以打断（但要检查是否可以打断）
+        if (!isUrgent && !timeOK) {
+            return;
+        }
+
+        // 去重检查
+        if (alert_text == last_alert_text && (now - last_alert_text_time) < ALERT_TEXT_DUPLICATE_MS) {
+            return;
+        }
+
+        // 发送TTS请求
+        setTTSRequesting(true);
+        tts_request_start_time = now;
+
+        // 发送流式TTS请求（高优先级）
+        StaticJsonDocument<256> doc;
+        doc["text"] = alert_text;
+        doc["priority"] = PRIO_HIGH;
+        char buf[256];
+        size_t len = serializeJson(doc, buf, sizeof(buf));
+        bool published = mqtt.publish("blindstick/tts/request", buf, len);
+
+        if (published) {
+            last_alert_time = now;
+            last_alert_text = alert_text;
+            last_alert_text_time = now;
+            consecutiveAlerts = 0;  // 重置计数
+            Serial.printf("[障碍物] TTS请求已发送: %s\n", alert_text.c_str());
+        } else {
+            setTTSRequesting(false);
+        }
+    }
+}
+// ==================== TTS请求超时时间 ====================
+#define TTS_REQUEST_TIMEOUT_MS 10000
 
 // ==================== 辅助函数：使用PSRAM或普通内存分配 ====================
 void* allocateBuffer(size_t size) {
@@ -2488,123 +2672,6 @@ void publishSensorData() {
 
     mqtt.publish(MQTT_TOPIC_SENSORS, json_buffer, n);
 }
-
-/**
- * 障碍物检测和播报 - 与避障决策使用相同阈值
- * 统一播报格式：方向 + 转向建议，不播报具体距离
- * 5秒内只播报一次，相同文本不重复
- */
-void checkObstacleAndAlert() {
-    // 检查各个方向的障碍物
-    float f  = dir_smt[0];  // 正前方
-    float fR = dir_smt[1];  // 右前方
-    float fL = dir_smt[2];  // 左前方
-    float R  = dir_smt[3];  // 右侧
-    float L  = dir_smt[4];  // 左侧
-
-    // 使用与避障决策相同的阈值（已降低以更快响应）
-    const float FRONT_ALERT_CM = 80.0f;    // 前方告警阈值（与FRONT_BLOCK_CM一致）
-    const float SIDE_ALERT_CM = 40.0f;     // 侧边告警阈值（与SIDE_BLOCK_CM一致）
-
-    unsigned long now = millis();
-
-    // 判断哪个方向有障碍物（优先级：正前方 > 左前方 > 右前方 > 左侧 > 右侧）
-    bool has_obstacle = false;
-    String alert_text = "";
-
-    // 正前方障碍物（最高优先级）
-    if (f < FRONT_ALERT_CM) {
-        has_obstacle = true;
-        // 判断应该向哪边避让：哪边空间大就往哪边转
-        if (fL > fR && fL > FRONT_ALERT_CM) {
-            alert_text = "前方有障碍物，请向左绕行";
-        } else if (fR > fL && fR > FRONT_ALERT_CM) {
-            alert_text = "前方有障碍物，请向右绕行";
-        } else if (L > R && L > SIDE_ALERT_CM) {
-            alert_text = "前方有障碍物，请向左绕行";
-        } else if (R >= L && R > SIDE_ALERT_CM) {
-            alert_text = "前方有障碍物，请向右绕行";
-        } else {
-            alert_text = "前方有障碍物，请注意避让";
-        }
-    }
-    // 左前方障碍物
-    else if (fL < FRONT_ALERT_CM && fL < fR) {
-        has_obstacle = true;
-        if (fR > FRONT_ALERT_CM || R > SIDE_ALERT_CM) {
-            alert_text = "左前方有障碍物，请向右绕行";
-        } else {
-            alert_text = "左前方有障碍物，请注意避让";
-        }
-    }
-    // 右前方障碍物
-    else if (fR < FRONT_ALERT_CM) {
-        has_obstacle = true;
-        if (fL > FRONT_ALERT_CM || L > SIDE_ALERT_CM) {
-            alert_text = "右前方有障碍物，请向左绕行";
-        } else {
-            alert_text = "右前方有障碍物，请注意避让";
-        }
-    }
-    // 左侧障碍物
-    else if (L < SIDE_ALERT_CM && L < R) {
-        has_obstacle = true;
-        if (R > SIDE_ALERT_CM) {
-            alert_text = "左侧有障碍物，请向右绕行";
-        } else {
-            alert_text = "左侧有障碍物，请注意避让";
-        }
-    }
-    // 右侧障碍物
-    else if (R < SIDE_ALERT_CM) {
-        has_obstacle = true;
-        if (L > SIDE_ALERT_CM) {
-            alert_text = "右侧有障碍物，请向左绕行";
-        } else {
-            alert_text = "右侧有障碍物，请注意避让";
-        }
-    }
-
-    // 只有检测到有障碍物且满足播报间隔时才播报
-    if (has_obstacle) {
-        // 如果正在播放语音或正在请求TTS，跳过
-        if (is_ai_talking || getTTSRequesting()) {
-            return;
-        }
-
-        // 检查播报间隔（8秒）
-        if (now - last_alert_time < ALERT_INTERVAL_MS) {
-            return;
-        }
-
-        // 去重检查（8秒内相同文本不重复）
-        if (alert_text == last_alert_text && (now - last_alert_text_time) < ALERT_TEXT_DUPLICATE_MS) {
-            return;
-        }
-
-        // 设置TTS请求标志，防止重复发送
-        setTTSRequesting(true);
-        tts_request_start_time = now;
-
-        // 发送流式TTS请求（高优先级）
-        StaticJsonDocument<256> doc;
-        doc["text"] = alert_text;
-        doc["priority"] = PRIO_HIGH;
-        char buf[256];
-        size_t len = serializeJson(doc, buf, sizeof(buf));
-        bool published = mqtt.publish("blindstick/tts/request", buf, len);
-
-        if (published) {
-            last_alert_time = now;
-            last_alert_text = alert_text;
-            last_alert_text_time = now;
-        } else {
-            // 发送失败，重置标志
-            setTTSRequesting(false);
-        }
-    }
-}
-// ==================== Core 0 守护线程 ====================
 void RadarMotorUploadTask(void* pvParameters) {
     Serial1.begin(115200, SERIAL_8N1, RADAR_RX_PIN, -1);
     gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
