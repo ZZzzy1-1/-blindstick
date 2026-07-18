@@ -5,10 +5,9 @@
 #include <HardwareSerial.h>
 #include <PubSubClient.h>
 #include <driver/i2s.h>
-#include <WebSocketsClient.h>  // 流式语音识别需要
-#include <freertos/FreeRTOS.h>  // FreeRTOS任务控制
+#include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <esp_heap_caps.h>      // PSRAM内存分配
+#include <esp_heap_caps.h>
 
 // ==================== 网络参数 ====================
 const char* WIFI_SSID     = "ZZY";
@@ -1873,24 +1872,17 @@ const char* getPrioName(int p);
 
 // 流式语音识别相关
 void VoiceRecognitionTask(void* pvParameters);
-void startStreamingASR();
-void stopStreamingASR();
-void sendAudioChunk();
-void webSocketEvent(WStype_t type, uint8_t* payload, size_t length);
-String doRESTASR();
+String doVoiceRecognition();
+String getBaiduToken();
 void handleVoiceCommand(const char* text);
 void webSocketEvent(WStype_t type, uint8_t* payload, size_t length);
 String doRESTASR();  // REST API备选方案
 String base64Encode(const uint8_t* data, size_t len);  // Base64编码
 
-// 流式语音识别相关
+// 语音识别相关
 void VoiceRecognitionTask(void* pvParameters);
-volatile bool asrConnected = false;
-volatile bool asrFinished = false;
-String asrResult = "";
-WebSocketsClient webSocket;  // WebSocket客户端（用于流式语音识别）
-
-#define ASR_CHUNK_SIZE 5120  // 160ms PCM数据 @ 16kHz 16bit
+String doVoiceRecognition();
+String getBaiduToken();
 
 // ==================== 工具函数实现 ====================
 
@@ -2778,135 +2770,6 @@ void playLocalStartupTone() {
     i2s_zero_dma_buffer(I2S_PORT_OUT);
 }
 
-// ==================== 流式语音识别（WebSocket）====================
-
-/**
- * WebSocket事件回调
- */
-void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
-    switch (type) {
-        case WStype_DISCONNECTED: {
-            asrConnected = false;
-            break;
-        }
-
-        case WStype_CONNECTED: {
-            asrConnected = true;
-            asrFinished = false;
-            asrResult = "";
-
-            // 发送开始参数帧
-            StaticJsonDocument<512> doc;
-            doc["type"] = "START";
-            JsonObject data = doc.createNestedObject("data");
-            data["appid"] = 123607377;
-            data["appkey"] = BAIDU_API_KEY.c_str();
-            data["dev_pid"] = 15372;
-            data["cuid"] = "esp32_blindstick";
-            data["format"] = "pcm";
-            data["sample"] = 16000;
-
-            String startMsg;
-            serializeJson(doc, startMsg);
-            webSocket.sendTXT(startMsg);
-            break;
-        }
-
-        case WStype_TEXT: {
-            // 收到识别结果
-            String response((char*)payload);
-            StaticJsonDocument<1024> respDoc;
-            DeserializationError error = deserializeJson(respDoc, response);
-
-            if (!error) {
-                const char* msgType = respDoc["type"] | "";
-                if (strcmp(msgType, "FIN_TEXT") == 0 && respDoc["err_no"] == 0) {
-                    asrResult = respDoc["result"].as<String>();
-                }
-            }
-            break;
-        }
-
-        case WStype_ERROR: {
-            asrConnected = false;
-            break;
-        }
-
-        default:
-            break;
-    }
-}
-
-/**
- * 发送音频数据块
- */
-void sendAudioChunk() {
-    if (!asrConnected) return;
-
-    // 读取160ms音频数据 (5120字节)
-    size_t bytesRead = 0;
-    uint8_t buffer[ASR_CHUNK_SIZE];
-
-    esp_err_t err = i2s_read(I2S_PORT, buffer, ASR_CHUNK_SIZE, &bytesRead, 50 / portTICK_PERIOD_MS);
-
-    if (err == ESP_OK && bytesRead > 0) {
-        // 发送二进制音频帧
-        webSocket.sendBIN(buffer, bytesRead);
-    }
-}
-
-/**
- * 停止流式识别
- */
-void stopStreamingASR() {
-    if (asrConnected) {
-        // 发送结束帧
-        String finishMsg = "{\"type\":\"FINISH\"}";
-        webSocket.sendTXT(finishMsg);
-
-        // 等待最终结果
-        unsigned long start = millis();
-        while (millis() - start < 2000) {
-            webSocket.loop();
-            if (asrResult.length() > 0) break;
-            delay(10);
-        }
-
-        webSocket.disconnect();
-        asrConnected = false;
-    }
-}
-
-/**
- * 开始流式识别
- */
-void startStreamingASR() {
-    // 生成随机sn
-    String sn = "esp32-" + String(millis()) + "-" + String(random(1000, 9999));
-
-    // 连接WebSocket
-    String wsUrl = "/realtime_asr?sn=" + sn;
-    webSocket.beginSSL("vop.baidu.com", 443, wsUrl.c_str(), "", "wss");
-    webSocket.onEvent(webSocketEvent);
-    webSocket.setReconnectInterval(5000);
-    // 跳过证书验证（开发阶段）
-    webSocket.setAuthorization("");
-
-    // 等待连接成功
-    unsigned long start = millis();
-    while (!asrConnected && millis() - start < 10000) {
-        webSocket.loop();
-        delay(10);
-    }
-
-    if (!asrConnected) {
-        return;
-    }
-
-    asrResult = "";
-    asrFinished = false;
-}
-
 /**
  * 流式语音识别任务（开机就开始，边录边传）
  */
@@ -2926,70 +2789,194 @@ void VoiceRecognitionTask(void* pvParameters) {
         return;
     }
 
-    // 初始化WebSocket
-    webSocket.onEvent(webSocketEvent);
+    // 等待开机语音播放完成（最多等30秒）
+    int waitStartup = 0;
+    while (!startup_announced && waitStartup < 30) {
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        waitStartup++;
+    }
 
+    if (startup_announced) {
+        Serial.println("[语音识别] 开机语音已播放，开始监听...");
+    } else {
+        Serial.println("[语音识别] 开始监听...");
+    }
+
+    // 主循环：录音4秒 -> 识别 -> 处理结果
     while (true) {
         if (WiFi.status() != WL_CONNECTED) {
             vTaskDelay(5000 / portTICK_PERIOD_MS);
             continue;
         }
 
-        // 开始一次识别会话
-        startStreamingASR();
+        // 录音并识别（4秒）
+        String result = doVoiceRecognition();
 
-        if (!asrConnected) {
-            // 使用REST API识别（备选方案）
-            String result = doRESTASR();
-            if (result.length() > 0) {
-                Serial.printf("[语音识别] 识别: %s\n", result.c_str());
-                handleVoiceCommand(result.c_str());
-                vTaskDelay(5000 / portTICK_PERIOD_MS);
-            }
-            vTaskDelay(3000 / portTICK_PERIOD_MS);
-            continue;
-        }
-
-        // 持续录音并发送，最多10秒
-        unsigned long sessionStart = millis();
-        int chunkCount = 0;
-
-        while (asrConnected && millis() - sessionStart < 10000) {
-            sendAudioChunk();
-            webSocket.loop();
-            chunkCount++;
-
-            // 每160ms发送一帧
-            vTaskDelay(160 / portTICK_PERIOD_MS);
-
-            // 检查是否已有结果
-            if (asrResult.length() > 0) {
-                break;
-            }
-        }
-
-        // 停止识别
-        stopStreamingASR();
-
-        // 处理识别结果
-        if (asrResult.length() > 0) {
-            Serial.printf("[语音识别] 识别: %s\n", asrResult.c_str());
-            handleVoiceCommand(asrResult.c_str());
-            asrResult = "";  // 清空结果，避免重复处理
+        if (result.length() > 0) {
+            Serial.printf("[语音识别] 识别: %s\n", result.c_str());
+            handleVoiceCommand(result.c_str());
             // 等待TTS播报完成
-            vTaskDelay(5000 / portTICK_PERIOD_MS);
+            vTaskDelay(6000 / portTICK_PERIOD_MS);
+        } else {
+            // 未识别到语音，短暂等待后继续
+            vTaskDelay(500 / portTICK_PERIOD_MS);
         }
-
-        // 短暂间隔后开始下一次识别
-        vTaskDelay(500 / portTICK_PERIOD_MS);
     }
 }
 
 /**
- * REST API语音识别备选方案（与Python后端一致）
- * 录音2秒 -> Base64编码 -> POST到百度ASR API -> 返回结果
+ * 语音识别主函数（录音4秒，REST API）
+ * 返回值：识别到的文本，空字符串表示未识别
  */
-String doRESTASR() {
+String doVoiceRecognition() {
+    // 录音4秒 = 128KB (16000Hz * 2字节 * 4秒)
+    const int RECORD_SIZE = 16000 * 2 * 4;
+    uint8_t* buffer = NULL;
+
+    // 优先使用PSRAM
+    if (ESP.getPsramSize() > 0) {
+        buffer = (uint8_t*)ps_malloc(RECORD_SIZE);
+    } else {
+        buffer = (uint8_t*)malloc(RECORD_SIZE);
+    }
+
+    if (!buffer) {
+        Serial.println("[ASR] 内存分配失败");
+        return "";
+    }
+
+    // 录音4秒
+    size_t totalRead = 0;
+    unsigned long startTime = millis();
+    while (millis() - startTime < 4000 && totalRead < RECORD_SIZE) {
+        size_t bytesRead = 0;
+        i2s_read(I2S_PORT, buffer + totalRead, RECORD_SIZE - totalRead, &bytesRead, 50);
+        totalRead += bytesRead;
+    }
+
+    // 检查录音数据是否有效（避免静音）
+    int16_t* samples = (int16_t*)buffer;
+    int nonZeroCount = 0;
+    for (int i = 0; i < totalRead / 2; i++) {
+        if (samples[i] > 100 || samples[i] < -100) nonZeroCount++;
+    }
+
+    if (nonZeroCount < 100) {
+        // 录音数据几乎是静音，跳过识别
+        free(buffer);
+        return "";
+    }
+
+    // 获取百度Token
+    String token = getBaiduToken();
+    if (token.length() == 0) {
+        free(buffer);
+        return "";
+    }
+
+    // Base64编码
+    String base64Audio = base64Encode(buffer, totalRead);
+    free(buffer);
+
+    if (base64Audio.length() == 0) {
+        return "";
+    }
+
+    // 发送ASR请求
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(15000);
+
+    HTTPClient http;
+    if (!http.begin(client, "https://vop.baidu.com/server_api")) {
+        return "";
+    }
+
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(15000);
+
+    // 构建JSON请求（使用手动拼接避免内存问题）
+    String jsonPayload;
+    jsonPayload.reserve(base64Audio.length() + 200);
+    jsonPayload = "{\"format\":\"pcm\",\"rate\":16000,\"channel\":1,\"cuid\":\"esp32_blindstick\",\"token\":\"";
+    jsonPayload += token;
+    jsonPayload += "\",\"dev_pid\":1537,\"speech\":\"";
+    jsonPayload += base64Audio;
+    jsonPayload += "\",\"len\":";
+    jsonPayload += totalRead;
+    jsonPayload += "}";
+
+    int httpCode = http.POST(jsonPayload);
+    String result = "";
+
+    if (httpCode == 200) {
+        String response = http.getString();
+        StaticJsonDocument<1024> respDoc;
+        DeserializationError error = deserializeJson(respDoc, response);
+
+        if (!error && respDoc["err_no"] == 0) {
+            JsonArray results = respDoc["result"];
+            if (results.size() > 0) {
+                result = results[0].as<String>();
+                // 去除标点符号
+                result.replace("。", "");
+                result.replace("，", "");
+                result.replace("？", "");
+                result.replace("！", "");
+                result.trim();
+            }
+        }
+    }
+
+    http.end();
+    return result;
+}
+
+/**
+ * 获取百度Access Token（带缓存）
+ */
+String getBaiduToken() {
+    // 检查缓存的token是否有效（提前5分钟过期）
+    static String cached_token = "";
+    static unsigned long expire_time = 0;
+
+    if (cached_token.length() > 0 && millis() < expire_time - 300000) {
+        return cached_token;
+    }
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(10000);
+
+    HTTPClient http;
+    String url = "https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials";
+    url += "&client_id=" + BAIDU_API_KEY;
+    url += "&client_secret=" + BAIDU_SECRET_KEY;
+
+    if (!http.begin(client, url)) {
+        return "";
+    }
+
+    http.setTimeout(10000);
+    int httpCode = http.GET();
+
+    if (httpCode == 200) {
+        String response = http.getString();
+        StaticJsonDocument<512> doc;
+        DeserializationError error = deserializeJson(doc, response);
+
+        if (!error && doc.containsKey("access_token")) {
+            cached_token = doc["access_token"].as<String>();
+            int expiresIn = doc["expires_in"] | 2592000;
+            expire_time = millis() + (expiresIn * 1000);
+            http.end();
+            return cached_token;
+        }
+    }
+
+    http.end();
+    return "";
+}
     Serial.println("[ASR-REST] 开始录音...");
 
     // 检查PSRAM
