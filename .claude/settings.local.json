@@ -71,7 +71,8 @@
       "PowerShell(Set-Content *)",
       "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\20610\\\\Desktop\\\\1\" | Select-Object Name, Extension, @{N=\"Size\";E={\"{0:N0} KB\" -f \\($_.Length/1KB\\)}}, @{N=\"Type\";E={if\\($_.PSIsContainer\\){\"目录\"}else{\"文件\"}}})",
       "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\20610\\\\Desktop\\\\1\\\\server\" -Recurse | Select-Object FullName, @{N=\"Size\";E={\"{0:N0} KB\" -f \\($_.Length/1KB\\)}} | Format-Table -AutoSize)",
-      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\20610\\\\Desktop\\\\1\\\\css\", \"C:\\\\Users\\\\20610\\\\Desktop\\\\1\\\\js\" | Select-Object Name, @{N=\"Size\";E={\"{0:N1} KB\" -f \\($_.Length/1KB\\)}})"
+      "PowerShell(Get-ChildItem -Path \"C:\\\\Users\\\\20610\\\\Desktop\\\\1\\\\css\", \"C:\\\\Users\\\\20610\\\\Desktop\\\\1\\\\js\" | Select-Object Name, @{N=\"Size\";E={\"{0:N1} KB\" -f \\($_.Length/1KB\\)}})",
+      "Bash(/c/Users/20610/AppData/Local/Programs/Python/Python310/python *)"
     ]
   }
 }

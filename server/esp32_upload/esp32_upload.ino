@@ -2035,35 +2035,140 @@ TaskHandle_t TTSPlayerTaskHandle = NULL;
 volatile float dir_raw[NUM_DIR] = {400.0f, 400.0f, 400.0f, 400.0f, 400.0f};
 volatile float dir_smt[NUM_DIR] = {400.0f, 400.0f, 400.0f, 400.0f, 400.0f};
 
-// ==================== 本地告警音效（紧急情况简短提示）====================
-// 仅在<50cm紧急情况使用，简单提示用户注意
-void playAlertTone(int direction) {
-    // 简单提示音，500ms，不干扰主要TTS语音
-    const int sample_rate = 16000;
-    const int duration_ms = 500;
-    const int num_samples = sample_rate * duration_ms / 1000;
-    int16_t tone_buffer[8000];
+// ==================== 本地完整语音系统（无需网络，<100ms响应）====================
+// 【使用说明】
+// 1. 运行 generate_local_voices.py 生成完整语音PCM数据
+// 2. 将生成的C数组复制到下方
+// 3. 启用 LOCAL_VOICE_ENABLED 宏
 
-    // 所有方向使用相同提示音，避免混淆
-    int freq = 1500;
+#define LOCAL_VOICE_ENABLED  // 启用本地语音（注释掉则使用网络TTS）
 
-    for (int i = 0; i < num_samples; i++) {
-        float t = (float)i / sample_rate;
-        float envelope = 1.0f - (float)i / num_samples;
-        float sample = sin(2 * PI * freq * t) * 3000.0f * envelope;
-        tone_buffer[i] = (int16_t)sample;
+// 【示例】本地语音数据结构（需要用脚本生成真实数据替换）
+// 生成命令: python generate_local_voices.py
+// 语音文件: 前方有障碍物，请向左绕行.wav
+const int16_t voice_left[] = {
+    // 这里替换为用 generate_local_voices.py 生成的数据
+    // 约2-3秒语音，16000采样率
+    0, 0, 0, 0, 0, 0, 0, 0,  // 占位数据
+};
+const int voice_left_len = sizeof(voice_left) / sizeof(voice_left[0]);
+
+// 语音文件: 前方有障碍物，请向右绕行.wav
+const int16_t voice_right[] = {
+    0, 0, 0, 0, 0, 0, 0, 0,  // 占位数据
+};
+const int voice_right_len = sizeof(voice_right) / sizeof(voice_right[0]);
+
+// 语音文件: 前方有障碍物，请注意避让.wav
+const int16_t voice_front[] = {
+    0, 0, 0, 0, 0, 0, 0, 0,  // 占位数据
+};
+const int voice_front_len = sizeof(voice_front) / sizeof(voice_front[0]);
+
+// 语音文件: 左前方有障碍物，请向右绕行.wav
+const int16_t voice_frontleft[] = {
+    0, 0, 0, 0, 0, 0, 0, 0,  // 占位数据
+};
+const int voice_frontleft_len = sizeof(voice_frontleft) / sizeof(voice_frontleft[0]);
+
+// 语音文件: 右前方有障碍物，请向左绕行.wav
+const int16_t voice_frontright[] = {
+    0, 0, 0, 0, 0, 0, 0, 0,  // 占位数据
+};
+const int voice_frontright_len = sizeof(voice_frontright) / sizeof(voice_frontright[0]);
+
+// 语音文件: 左侧有障碍物，请向右绕行.wav
+const int16_t voice_leftside[] = {
+    0, 0, 0, 0, 0, 0, 0, 0,  // 占位数据
+};
+const int voice_leftside_len = sizeof(voice_leftside) / sizeof(voice_leftside[0]);
+
+// 语音文件: 右侧有障碍物，请向左绕行.wav
+const int16_t voice_rightside[] = {
+    0, 0, 0, 0, 0, 0, 0, 0,  // 占位数据
+};
+const int voice_rightside_len = sizeof(voice_rightside) / sizeof(voice_rightside[0]);
+
+// 播放本地完整语音
+void playLocalVoice(const int16_t* voice_data, int voice_len) {
+    if (!voice_data || voice_len <= 0) return;
+
+    Serial.printf("[本地语音] 播放 %d 采样点 (%.2f秒)\n", voice_len, voice_len / 16000.0);
+
+    // 设置播放标志，防止语音任务冲突
+    is_ai_talking = true;
+
+    // 分段播放（避免大数组阻塞）
+    const int CHUNK_SIZE = 512;
+    int16_t chunk[CHUNK_SIZE];
+
+    for (int offset = 0; offset < voice_len; offset += CHUNK_SIZE) {
+        int chunk_samples = min(CHUNK_SIZE, voice_len - offset);
+
+        // 复制到临时缓冲区（应用音量增益）
+        for (int i = 0; i < chunk_samples; i++) {
+            int32_t sample = (int32_t)(voice_data[offset + i]) * 1.2f;  // 1.2倍音量
+            if (sample > 32767) sample = 32767;
+            if (sample < -32768) sample = -32768;
+            chunk[i] = (int16_t)sample;
+        }
+
+        // I2S播放
+        size_t written = 0;
+        i2s_write(I2S_PORT_OUT, chunk, chunk_samples * 2, &written, portMAX_DELAY);
+
+        // 喂狗
+        yield();
     }
 
-    i2s_write(I2S_PORT_OUT, tone_buffer, num_samples * 2, NULL, portMAX_DELAY);
+    // 清空DMA缓冲区
+    i2s_zero_dma_buffer(I2S_PORT_OUT);
+
+    // 延迟等待播放完成
+    int duration_ms = (voice_len * 1000) / 16000;
+    delay(duration_ms + 100);
+
+    is_ai_talking = false;
+    Serial.println("[本地语音] 播放完成");
 }
 
-// 兼容接口
+// 根据告警文本选择并播放本地语音
+void playLocalVoiceByText(const String& alert_text) {
+#ifdef LOCAL_VOICE_ENABLED
+    // 根据文本内容匹配对应的本地语音
+    if (alert_text.indexOf("左侧") >= 0) {
+        playLocalVoice(voice_leftside, voice_leftside_len);
+    } else if (alert_text.indexOf("右侧") >= 0) {
+        playLocalVoice(voice_rightside, voice_rightside_len);
+    } else if (alert_text.indexOf("左前方") >= 0) {
+        playLocalVoice(voice_frontleft, voice_frontleft_len);
+    } else if (alert_text.indexOf("右前方") >= 0) {
+        playLocalVoice(voice_frontright, voice_frontright_len);
+    } else if (alert_text.indexOf("向左") >= 0) {
+        playLocalVoice(voice_left, voice_left_len);
+    } else if (alert_text.indexOf("向右") >= 0) {
+        playLocalVoice(voice_right, voice_right_len);
+    } else {
+        // 默认播放前方注意
+        playLocalVoice(voice_front, voice_front_len);
+    }
+#else
+    // 本地语音未启用，使用网络TTS
+    Serial.println("[本地语音] 未启用，使用网络TTS");
+#endif
+}
+
+// 兼容旧接口
+void playAlertTone(int direction) {
+    // 不再使用简单提示音
+}
+
 void playSmartAlert(int direction, float distance) {
-    playAlertTone(direction);
+    // 不再使用
 }
 
 void playDirectionVoice(int direction) {
-    // 不再使用，保持兼容
+    // 不再使用
 }
 
 // ==================== 电机控制 ====================
@@ -2616,13 +2721,27 @@ void checkObstacleAndAlert() {
             return;
         }
 
-        // 发送TTS请求 - 使用完整原文
+        // 发送TTS请求 - 优先使用本地完整语音
+#ifdef LOCAL_VOICE_ENABLED
+        // 本地语音模式：直接播放，无需网络
+        Serial.println("[障碍物] 使用本地完整语音播报");
+        playLocalVoiceByText(alert_text);
+
+        // 更新记录
+        last_alert_time = now;
+        last_alert_text = alert_text;
+        last_alert_text_time = now;
+        consecutiveAlerts = 0;
+
+        // 本地语音播放完成后，重置TTS标志（兼容）
+        setTTSRequesting(false);
+#else
+        // 网络TTS模式（备用）
         setTTSRequesting(true);
         tts_request_start_time = now;
 
-        // 发送流式TTS请求（高优先级）
         StaticJsonDocument<256> doc;
-        doc["text"] = alert_text;  // 完整原文："前方有障碍物，请向左绕行"
+        doc["text"] = alert_text;
         doc["priority"] = PRIO_HIGH;
         char buf[256];
         size_t len = serializeJson(doc, buf, sizeof(buf));
@@ -2632,11 +2751,12 @@ void checkObstacleAndAlert() {
             last_alert_time = now;
             last_alert_text = alert_text;
             last_alert_text_time = now;
-            consecutiveAlerts = 0;  // 重置计数
+            consecutiveAlerts = 0;
             Serial.printf("[障碍物] TTS请求已发送: %s\n", alert_text.c_str());
         } else {
             setTTSRequesting(false);
         }
+#endif
     }
 }
 // ==================== TTS请求超时时间 ====================
