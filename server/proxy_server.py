@@ -369,6 +369,7 @@ def static_files(filename):
 
 @app.route('/audio/<filename>')
 def serve_audio(filename):
+    """提供TTS音频文件下载（ESP32通过URL下载）"""
     if '..' in filename or filename.startswith('/'):
         return "Invalid filename", 400
     filepath = os.path.join(AUDIO_CACHE_DIR, filename)
@@ -376,80 +377,14 @@ def serve_audio(filename):
         return "Audio file not found", 404
     return send_from_directory(AUDIO_CACHE_DIR, filename, mimetype='audio/wav')
 
-# ==================== API Endpoints ====================
-@app.route('/api/tts/push', methods=['POST'])
-def tts_push():
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        text = data.get('text', '')
-        priority = data.get('priority', 0)
-        if not text:
-            return jsonify({"error": "Missing text parameter"}), 400
-        print(f"[API] Push TTS: '{text[:30]}...' priority={priority}")
-        if not mqtt_sender.connected:
-            mqtt_sender.connect()
-            time.sleep(0.5)
-        token = get_baidu_token()
-        if not token:
-            return jsonify({"error": "Cannot get token"}), 500
-        url = "https://tsn.baidu.com/text2audio"
-        payload = {"tex": text, "tok": token, "cuid": "blindstick_proxy", "ctp": 1, "lan": "zh", "spd": 5, "pit": 5, "vol": 9, "per": 1, "aue": 6}
-        resp = requests.post(url, data=payload, timeout=15, verify=False)
-        if 'audio' in resp.headers.get('Content-Type', ''):
-            audio_data = resp.content
-            print(f"[TTS] Synthesis success: {len(audio_data)} bytes")
-            # 添加时间戳确保文件名唯一，避免重复播放问题
-            timestamp = int(time.time())
-            file_hash = hashlib.md5(text.encode()).hexdigest()[:8]
-            filename = f"tts_{timestamp}_{file_hash}.wav"
-            filepath = os.path.join(AUDIO_CACHE_DIR, filename)
-            os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
-            with open(filepath, 'wb') as f:
-                f.write(audio_data)
-            print(f"[TTS] Audio saved: {filepath}")
-            full_url = f"https://blindstick-4.onrender.com/audio/{filename}"
-            url_payload = json.dumps({"type": "tts_url", "url": full_url, "text": text[:30]})
-            mqtt_sender.client.publish("blindstick/tts/url", url_payload)
-            print(f"[MQTT] Sent TTS URL: {full_url}")
-            return jsonify({"status": "ok", "url": full_url, "message": "URL pushed"})
-        else:
-            print(f"[TTS] Synthesis failed: {resp.text[:200]}")
-            return jsonify({"error": "TTS synthesis failed"}), 500
-    except Exception as e:
-        print(f"[TTS Push] Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/api/asr', methods=['POST'])
-def speech_to_text():
-    try:
-        pcm_data = request.data
-        if len(pcm_data) < 1000:
-            return jsonify({"error": "Audio data too short"}), 400
-        print(f"[ASR] Received audio: {len(pcm_data)} bytes")
-        token = get_baidu_token()
-        if not token:
-            return jsonify({"error": "Cannot get token"}), 500
-        import base64
-        url = "https://vop.baidu.com/server_api"
-        payload = {"format": "pcm", "rate": 16000, "channel": 1, "cuid": "blindstick_proxy", "token": token, "dev_pid": 1537, "speech": base64.b64encode(pcm_data).decode('utf-8'), "len": len(pcm_data)}
-        resp = requests.post(url, json=payload, timeout=30, verify=False)
-        result = resp.json()
-        if result.get("err_no") == 0:
-            text = result.get("result", [""])[0]
-            print(f"[ASR] Result: {text}")
-            return jsonify({"text": text})
-        else:
-            print(f"[ASR] Error: {result.get('err_msg')}")
-            return jsonify({"error": result.get("err_msg")}), 400
-    except Exception as e:
-        print(f"[ASR] Error: {e}")
-        return jsonify({"error": str(e)}), 500
-
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({"status": "ok", "mqtt_connected": mqtt_sender.connected})
+    """健康检查接口"""
+    return jsonify({
+        "status": "ok",
+        "mqtt_connected": mqtt_sender.connected,
+        "mode": "mqtt_only"
+    })
 
 # ==================== Main ====================
 if __name__ == '__main__':
@@ -458,7 +393,7 @@ if __name__ == '__main__':
 
     port = int(os.environ.get('PORT', 8090))
     print("=" * 50)
-    print("Baidu API Proxy Server - TTS Version")
+    print("Baidu API Proxy Server - TTS Version (MQTT Only)")
     print("=" * 50)
     print(f"Running at: http://0.0.0.0:{port}")
     print("=" * 50)
@@ -474,7 +409,7 @@ if __name__ == '__main__':
             print("[MQTT] Connection established successfully")
         else:
             print("[MQTT] Failed to connect after maximum retries")
-            print("[MQTT] TTS push will not work, but API endpoints are still available")
+            print("[MQTT] TTS service will not work without MQTT connection")
 
     # 在后台线程启动 MQTT 连接
     import threading

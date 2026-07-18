@@ -218,7 +218,7 @@ let currentTTSSession = {
 };
 
 /**
- * 发送TTS请求到代理服务器进行流式合成
+ * 发送TTS请求到代理服务器进行流式合成（纯MQTT方式）
  * @param {string} text - 要合成的文本
  * @param {number} priority - 优先级 0=低(导航) 1=中(对话) 2=高(雷达告警)
  * @returns {Promise<boolean>}
@@ -232,25 +232,20 @@ async function streamTTS(text, priority = TTS_PRIORITY.NORMAL) {
     }
 
     try {
-        // 调用代理服务器的推送接口
-        const response = await fetch(`${API_BASE}/api/tts/push`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text, priority })
+        // 直接通过MQTT发送请求到代理服务器
+        const msg = JSON.stringify({
+            type: 'tts_request',
+            text: text,
+            priority: priority,
+            ts: Date.now()
         });
 
-        const result = await response.json();
-        if (result.status === 'ok') {
-            console.log('[流式TTS] 已推送到ESP32:', text.substring(0, 30));
-            return true;
-        } else {
-            console.error('[流式TTS] 推送失败:', result.message);
-            return false;
-        }
+        mqttClient.publish('blindstick/tts/request', msg);
+        console.log('[流式TTS] 已通过MQTT发送请求:', text.substring(0, 30));
+        return true;
     } catch (e) {
-        console.error('[流式TTS] 请求异常:', e.message);
-        // 降级到普通TTS
-        return baiduTTS(text);
+        console.error('[流式TTS] 发送失败:', e.message);
+        return false;
     }
 }
 
@@ -261,12 +256,19 @@ async function streamTTS(text, priority = TTS_PRIORITY.NORMAL) {
 async function interruptTTS(newPriority = TTS_PRIORITY.HIGH) {
     console.log(`[流式TTS] 打断请求，新优先级=${newPriority}`);
 
+    if (!mqttClient || !AppState.mqttConnected) {
+        console.error('[流式TTS] MQTT未连接');
+        return;
+    }
+
     try {
-        await fetch(`${API_BASE}/api/tts/interrupt`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ priority: newPriority })
+        const msg = JSON.stringify({
+            type: 'tts_interrupt',
+            priority: newPriority,
+            ts: Date.now()
         });
+        mqttClient.publish('blindstick/tts/control', msg);
+        console.log('[流式TTS] 已发送打断请求');
     } catch (e) {
         console.error('[流式TTS] 打断请求失败:', e.message);
     }
