@@ -19,7 +19,7 @@ const char* WIFI_PASSWORD = "zzy060630";
 // 1883 - MQTT over TCP（明文，不需要证书，但不是所有EMQX实例都开放）
 // 8883 - MQTT over TLS（需要证书处理）
 const char* MQTT_BROKER   = "u72a7838.ala.asia-southeast1.emqxsl.com";
-const int   MQTT_PORT     = 8883;  // 如果8883不行，尝试改成1883
+const int   MQTT_PORT     = 8883;
 const char* MQTT_USER     = "blindstick";
 const char* MQTT_PASSWORD = "2026";
 const char* MQTT_CLIENT_ID = "blindstick_esp32_001";
@@ -840,6 +840,11 @@ float last_alert_dist = 0;
 // 开机语音播报标志（只播报一次）
 volatile bool startup_announced = false;
 
+// 避障语音去重：记录上次播报的文本和时间
+static String last_alert_text = "";
+static unsigned long last_alert_text_time = 0;
+#define ALERT_TEXT_DUPLICATE_MS 5000  // 相同文本5秒内不重复
+
 // ==================== 辅助函数：使用PSRAM或普通内存分配 ====================
 void* allocateBuffer(size_t size) {
     if (ESP.getPsramSize() > 0) {
@@ -992,6 +997,13 @@ void checkObstacleAndAlert() {
     }
 
     if (has_obstacle) {
+        // 去重检查：相同文本5秒内不重复播报
+        unsigned long now = millis();
+        if (alert_text == last_alert_text && (now - last_alert_text_time) < ALERT_TEXT_DUPLICATE_MS) {
+            Serial.printf("[障碍物播报] 去重：5秒内已播报过相同内容\n");
+            return;
+        }
+
         Serial.printf("[障碍物播报] %s\n", alert_text.c_str());
 
         // 发送流式TTS请求（高优先级）
@@ -1003,6 +1015,8 @@ void checkObstacleAndAlert() {
         mqtt.publish("blindstick/tts/request", buf, len);
 
         last_alert_time = now;
+        last_alert_text = alert_text;  // 记录上次播报的文本
+        last_alert_text_time = now;     // 记录时间
     }
 }
 // ==================== Core 0 守护线程 ====================
@@ -1752,16 +1766,23 @@ void setup() {
         mqtt_reconnect();
 
         // WiFi 已连接，使用MQTT代理播报启动成功（只播报一次）
-        if (!startup_announced) {
+        // 使用静态变量确保即使在mqtt_reconnect中也不会重复发送
+        static bool startup_sent = false;
+        if (!startup_announced && !startup_sent) {
             delay(500);
             StaticJsonDocument<256> doc;
             doc["text"] = "导盲杖系统启动成功，欢迎使用";
             doc["priority"] = PRIO_NORMAL;
             char buf[256];
             size_t len = serializeJson(doc, buf, sizeof(buf));
-            mqtt.publish("blindstick/tts/request", buf, len);
-            Serial.println("[系统] 启动播报请求已发送");
-            startup_announced = true;
+            bool published = mqtt.publish("blindstick/tts/request", buf, len);
+            if (published) {
+                Serial.println("[系统] 启动播报请求已发送");
+                startup_announced = true;
+                startup_sent = true;  // 静态变量，确保只发送一次
+            } else {
+                Serial.println("[系统] 启动播报发送失败，将在下次连接重试");
+            }
         }
     } else {
         Serial.println("[WiFi] 离线模式，MQTT不可用，跳过启动播报");
