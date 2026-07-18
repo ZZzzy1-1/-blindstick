@@ -2036,100 +2036,70 @@ volatile float dir_raw[NUM_DIR] = {400.0f, 400.0f, 400.0f, 400.0f, 400.0f};
 volatile float dir_smt[NUM_DIR] = {400.0f, 400.0f, 400.0f, 400.0f, 400.0f};
 
 // ==================== 本地完整语音系统（无需网络，<100ms响应）====================
-// 【使用说明】
-// 1. 运行 generate_local_voices.py 生成完整语音PCM数据
-// 2. 将生成的C数组复制到下方
-// 3. 启用 LOCAL_VOICE_ENABLED 宏
+// 【使用方法】
+// 1. 运行 generate_local_voices.py 生成语音数据
+// 2. 将生成的数据保存为 local_voices.h 放在同目录
+// 3. 取消下面这行的注释：
+// #define USE_LOCAL_VOICES
 
-#define LOCAL_VOICE_ENABLED  // 启用本地语音（注释掉则使用网络TTS）
-
-// 【示例】本地语音数据结构（需要用脚本生成真实数据替换）
-// 生成命令: python generate_local_voices.py
-// 语音文件: 前方有障碍物，请向左绕行.wav
-const int16_t voice_left[] = {
-    // 这里替换为用 generate_local_voices.py 生成的数据
-    // 约2-3秒语音，16000采样率
-    0, 0, 0, 0, 0, 0, 0, 0,  // 占位数据
-};
-const int voice_left_len = sizeof(voice_left) / sizeof(voice_left[0]);
-
-// 语音文件: 前方有障碍物，请向右绕行.wav
-const int16_t voice_right[] = {
-    0, 0, 0, 0, 0, 0, 0, 0,  // 占位数据
-};
-const int voice_right_len = sizeof(voice_right) / sizeof(voice_right[0]);
-
-// 语音文件: 前方有障碍物，请注意避让.wav
-const int16_t voice_front[] = {
-    0, 0, 0, 0, 0, 0, 0, 0,  // 占位数据
-};
-const int voice_front_len = sizeof(voice_front) / sizeof(voice_front[0]);
-
-// 语音文件: 左前方有障碍物，请向右绕行.wav
-const int16_t voice_frontleft[] = {
-    0, 0, 0, 0, 0, 0, 0, 0,  // 占位数据
-};
-const int voice_frontleft_len = sizeof(voice_frontleft) / sizeof(voice_frontleft[0]);
-
-// 语音文件: 右前方有障碍物，请向左绕行.wav
-const int16_t voice_frontright[] = {
-    0, 0, 0, 0, 0, 0, 0, 0,  // 占位数据
-};
-const int voice_frontright_len = sizeof(voice_frontright) / sizeof(voice_frontright[0]);
-
-// 语音文件: 左侧有障碍物，请向右绕行.wav
-const int16_t voice_leftside[] = {
-    0, 0, 0, 0, 0, 0, 0, 0,  // 占位数据
-};
-const int voice_leftside_len = sizeof(voice_leftside) / sizeof(voice_leftside[0]);
-
-// 语音文件: 右侧有障碍物，请向左绕行.wav
-const int16_t voice_rightside[] = {
-    0, 0, 0, 0, 0, 0, 0, 0,  // 占位数据
-};
-const int voice_rightside_len = sizeof(voice_rightside) / sizeof(voice_rightside[0]);
+#ifdef USE_LOCAL_VOICES
+#include "local_voices.h"  // 包含真实语音数据
+#endif
 
 // 播放本地完整语音
 void playLocalVoice(const int16_t* voice_data, int voice_len) {
+#ifndef USE_LOCAL_VOICES
+    return;  // 未启用本地语音
+#else
     if (!voice_data || voice_len <= 0) return;
 
     Serial.printf("[本地语音] 播放 %d 采样点 (%.2f秒)\n", voice_len, voice_len / 16000.0);
-
-    // 设置播放标志，防止语音任务冲突
     is_ai_talking = true;
 
-    // 分段播放（避免大数组阻塞）
     const int CHUNK_SIZE = 512;
     int16_t chunk[CHUNK_SIZE];
 
     for (int offset = 0; offset < voice_len; offset += CHUNK_SIZE) {
         int chunk_samples = min(CHUNK_SIZE, voice_len - offset);
-
-        // 复制到临时缓冲区（应用音量增益）
         for (int i = 0; i < chunk_samples; i++) {
-            int32_t sample = (int32_t)(voice_data[offset + i]) * 1.2f;  // 1.2倍音量
+            int32_t sample = (int32_t)(voice_data[offset + i]) * 1.2f;
             if (sample > 32767) sample = 32767;
             if (sample < -32768) sample = -32768;
             chunk[i] = (int16_t)sample;
         }
-
-        // I2S播放
-        size_t written = 0;
-        i2s_write(I2S_PORT_OUT, chunk, chunk_samples * 2, &written, portMAX_DELAY);
-
-        // 喂狗
+        i2s_write(I2S_PORT_OUT, chunk, chunk_samples * 2, NULL, portMAX_DELAY);
         yield();
     }
 
-    // 清空DMA缓冲区
     i2s_zero_dma_buffer(I2S_PORT_OUT);
-
-    // 延迟等待播放完成
-    int duration_ms = (voice_len * 1000) / 16000;
-    delay(duration_ms + 100);
-
+    delay((voice_len * 1000) / 16000 + 100);
     is_ai_talking = false;
     Serial.println("[本地语音] 播放完成");
+#endif
+}
+
+// 根据告警文本选择并播放本地语音
+void playLocalVoiceByText(const String& alert_text) {
+#ifndef USE_LOCAL_VOICES
+    Serial.println("[本地语音] 未启用");
+    return;
+#else
+    if (alert_text.indexOf("左侧") >= 0) {
+        playLocalVoice(voice_leftside, voice_leftside_len);
+    } else if (alert_text.indexOf("右侧") >= 0) {
+        playLocalVoice(voice_rightside, voice_rightside_len);
+    } else if (alert_text.indexOf("左前方") >= 0) {
+        playLocalVoice(voice_frontleft, voice_frontleft_len);
+    } else if (alert_text.indexOf("右前方") >= 0) {
+        playLocalVoice(voice_frontright, voice_frontright_len);
+    } else if (alert_text.indexOf("向左") >= 0) {
+        playLocalVoice(voice_left, voice_left_len);
+    } else if (alert_text.indexOf("向右") >= 0) {
+        playLocalVoice(voice_right, voice_right_len);
+    } else {
+        playLocalVoice(voice_front, voice_front_len);
+    }
+#endif
 }
 
 // 根据告警文本选择并播放本地语音

@@ -1,24 +1,16 @@
 #!/usr/bin/env python3
 """
-生成本地完整语音数据
-将常用告警语音预存到ESP32，实现<100ms响应
-
-使用方法:
-1. 确保安装了requests: pip install requests
-2. 运行: python generate_local_voices.py
-3. 复制生成的C数组到 esp32_upload.ino 中替换占位数据
-4. 确保定义了 LOCAL_VOICE_ENABLED 宏
+生成本地完整语音数据头文件 local_voices.h
+将生成的文件放在 esp32_upload.ino 同目录
 """
 
 import requests
 import urllib3
 urllib3.disable_warnings()
 
-# 百度API配置
 BAIDU_API_KEY = "Xbxnhkwb2sxtB6HbH5BUTlUG"
 BAIDU_SECRET_KEY = "Tw485P2BFGpPu8WeOVP6hy4S1BHqG4ON"
 
-# 要生成的完整语音列表
 VOICES = [
     ("前方有障碍物，请向左绕行", "voice_left"),
     ("前方有障碍物，请向右绕行", "voice_right"),
@@ -30,137 +22,70 @@ VOICES = [
 ]
 
 def get_token():
-    """获取百度Access Token"""
     url = "https://aip.baidubce.com/oauth/2.0/token"
-    params = {
-        "grant_type": "client_credentials",
-        "client_id": BAIDU_API_KEY,
-        "client_secret": BAIDU_SECRET_KEY
-    }
+    params = {"grant_type": "client_credentials", "client_id": BAIDU_API_KEY, "client_secret": BAIDU_SECRET_KEY}
     try:
         resp = requests.post(url, params=params, timeout=10, verify=False)
         return resp.json().get("access_token")
-    except Exception as e:
-        print(f"[错误] 获取Token失败: {e}")
+    except:
         return None
 
 def generate_voice(text, array_name, token):
-    """生成语音并转换为C数组"""
     url = "https://tsn.baidu.com/text2audio"
-    payload = {
-        "tex": text,
-        "tok": token,
-        "cuid": "blindstick",
-        "ctp": 1,
-        "lan": "zh",
-        "spd": 5,    # 语速适中
-        "pit": 5,    # 音调适中
-        "vol": 9,    # 音量较大
-        "per": 1,    # 女声
-        "aue": 6     # WAV格式
-    }
-
-    print(f"\n[生成] '{text}' -> {array_name}")
-
+    payload = {"tex": text, "tok": token, "cuid": "blindstick", "ctp": 1, "lan": "zh", "spd": 5, "pit": 5, "vol": 9, "per": 1, "aue": 6}
+    print(f"[生成] {text}")
     try:
         resp = requests.post(url, data=payload, timeout=20, verify=False)
-
-        if 'audio' not in resp.headers.get('Content-Type', ''):
-            print(f"[错误] TTS合成失败: {resp.text[:200]}")
+        if "audio" not in resp.headers.get("Content-Type", ""):
             return None
-
-        # 去掉WAV头，获取PCM数据
         data = resp.content[44:]
-
-        # 转换为16位有符号整数
         samples = []
         for i in range(0, len(data), 2):
             if i + 1 < len(data):
-                sample = data[i] | (data[i+1] << 8)
-                if sample > 32767:
-                    sample -= 65536
-                samples.append(sample)
-
-        duration = len(samples) / 16000
-        print(f"[成功] 采样点: {len(samples)}, 时长: {duration:.2f}秒")
-
-        # 生成C数组代码
-        lines = []
-        lines.append(f"// {text}")
-        lines.append(f"// 时长: {duration:.2f}秒, 采样点: {len(samples)}")
-        lines.append(f"const int16_t {array_name}[] = {{")
-
-        # 每行6个数据（便于复制粘贴）
+                s = data[i] | (data[i+1] << 8)
+                if s > 32767: s -= 65536
+                samples.append(s)
+        lines = [f"// {text}", f"const int16_t {array_name}[] = {{"]
         for i in range(0, len(samples), 6):
             row = samples[i:i+6]
-            row_str = ", ".join(f"{s:6d}" for s in row)
-            lines.append(f"    {row_str},")
-
+            lines.append("    " + ", ".join(f"{s:6d}" for s in row) + ",")
         lines.append(f"}};")
         lines.append(f"const int {array_name}_len = sizeof({array_name}) / sizeof({array_name}[0]);\n")
-
-        return "\n".join(lines)
-
+        return "\n".join(lines), len(samples)
     except Exception as e:
-        print(f"[错误] 请求异常: {e}")
-        return None
+        print(f"[错误] {e}")
+        return None, 0
 
 def main():
-    print("="*70)
-    print("       本地完整语音生成工具")
-    print("="*70)
-    print("\n步骤:")
-    print("1. 连接网络")
-    print("2. 运行此脚本")
-    print("3. 复制生成的C数组")
-    print("4. 粘贴到 esp32_upload.ino 替换占位数据")
-    print("5. 确保定义了 LOCAL_VOICE_ENABLED")
-    print("="*70)
-
-    # 获取Token
-    print("\n[步骤1] 获取百度Token...")
+    print("="*60)
+    print("生成本地语音数据头文件")
+    print("="*60)
     token = get_token()
     if not token:
-        print("[失败] 无法获取Token，请检查API Key")
+        print("Token获取失败")
         return
-    print("[成功] Token获取成功")
-
-    # 生成所有语音
-    print(f"\n[步骤2] 生成 {len(VOICES)} 条语音...")
-
     all_voices = []
+    total_samples = 0
     for text, name in VOICES:
-        code = generate_voice(text, name, token)
+        code, num = generate_voice(text, name, token)
         if code:
             all_voices.append(code)
-
+            total_samples += num
+            print(f"[成功] {name}: {num}采样点")
     if not all_voices:
-        print("\n[失败] 没有生成任何语音")
+        print("生成失败")
         return
-
-    # 保存到文件
-    print("\n[步骤3] 保存到文件...")
-    output = "local_voice_data.txt"
+    # 生成头文件内容
+    header = ["#ifndef LOCAL_VOICES_H", "#define LOCAL_VOICES_H", "", "#include <Arduino.h>", ""]
+    for v in all_voices:
+        header.append(v)
+    header.append("#endif // LOCAL_VOICES_H")
+    output = "local_voices.h"
     with open(output, "w", encoding="utf-8") as f:
-        f.write("// ==================== 本地完整语音数据 ====================\n")
-        f.write("// 将此文件内容复制到 esp32_upload.ino 替换占位数据\n")
-        f.write("// ========================================================\n\n")
-        for voice in all_voices:
-            f.write(voice + "\n")
-
-    print(f"[成功] 已保存到: {output}")
-
-    # 打印摘要
-    print("\n" + "="*70)
-    print("生成摘要:")
-    print(f"- 成功生成: {len(all_voices)}/{len(VOICES)} 条语音")
-    print(f"- 输出文件: {output}")
-    print("\n下一步:")
-    print(f"1. 打开 {output}")
-    print("2. 复制所有内容")
-    print("3. 粘贴到 esp32_upload.ino 中替换占位数据")
-    print("4. 上传ESP32代码")
-    print("="*70)
+        f.write("\n".join(header))
+    print(f"\n[完成] 已保存到: {output}")
+    print(f"总采样点: {total_samples} ({total_samples/16000:.1f}秒)")
+    print(f"预估Flash占用: {total_samples*2/1024:.1f}KB")
 
 if __name__ == "__main__":
     main()
