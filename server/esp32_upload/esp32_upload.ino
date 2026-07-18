@@ -2746,9 +2746,6 @@ void i2s_out_init() {
     }
 }
 
-    Serial.println("[I2S-OUT] MAX98357功放初始化成功");
-}
-
 // 简单的启动提示音
 void playLocalStartupTone() {
     const int sample_rate = 16000;
@@ -2972,125 +2969,6 @@ String getBaiduToken() {
 
     http.end();
     return "";
-}
-    Serial.println("[ASR-REST] 开始录音...");
-
-    // 检查PSRAM
-    size_t psramSize = ESP.getPsramSize();
-    size_t freePsram = ESP.getFreePsram();
-    Serial.printf("[ASR-REST] PSRAM: 总共%dKB, 可用%dKB\n", psramSize/1024, freePsram/1024);
-
-    // 录音2秒 (64KB)
-    const int RECORD_SIZE = 16000 * 2 * 2;
-    uint8_t* buffer = NULL;
-
-    // 优先使用PSRAM
-    if (psramSize > 0) {
-        buffer = (uint8_t*)ps_malloc(RECORD_SIZE);
-        Serial.println("[ASR-REST] 使用PSRAM分配录音缓冲区");
-    } else {
-        buffer = (uint8_t*)malloc(RECORD_SIZE);
-        Serial.println("[ASR-REST] 使用普通内存分配录音缓冲区");
-    }
-
-    if (!buffer) {
-        Serial.println("[ASR-REST] 内存分配失败");
-        return "";
-    }
-
-    // 录音
-    size_t totalRead = 0;
-    unsigned long startTime = millis();
-    while (millis() - startTime < 2000 && totalRead < RECORD_SIZE) {
-        size_t bytesRead = 0;
-        i2s_read(I2S_PORT, buffer + totalRead, RECORD_SIZE - totalRead, &bytesRead, 50);
-        totalRead += bytesRead;
-    }
-
-    Serial.printf("[ASR-REST] 录音完成: %d字节\n", totalRead);
-
-    // 获取Token - 直接请求
-    String token = "";
-    {
-        WiFiClientSecure tokenClient;
-        tokenClient.setInsecure();
-        tokenClient.setTimeout(10000);
-        HTTPClient tokenHttp;
-        String url = String("https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials&client_id=") + BAIDU_API_KEY + "&client_secret=" + BAIDU_SECRET_KEY;
-        if (tokenHttp.begin(tokenClient, url)) {
-            tokenHttp.setTimeout(10000);
-            int code = tokenHttp.GET();
-            if (code == 200) {
-                String resp = tokenHttp.getString();
-                StaticJsonDocument<512> doc;
-                if (!deserializeJson(doc, resp)) {
-                    token = doc["access_token"].as<String>();
-                }
-            }
-            tokenHttp.end();
-        }
-    }
-
-    if (token.length() == 0) {
-        Serial.println("[ASR-REST] 无法获取Token");
-        free(buffer);
-        return "";
-    }
-
-    // Base64编码
-    String base64Audio = base64Encode(buffer, totalRead);
-    free(buffer);
-
-    // 发送ASR请求（与Python一致）
-    WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(15000);
-
-    HTTPClient http;
-    if (!http.begin(client, "https://vop.baidu.com/server_api")) {
-        return "";
-    }
-
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(15000);
-
-    // 构建JSON（与Python一致）
-    StaticJsonDocument<4096> doc;
-    doc["format"] = "pcm";
-    doc["rate"] = 16000;
-    doc["channel"] = 1;
-    doc["cuid"] = "esp32_blindstick";
-    doc["token"] = token;
-    doc["dev_pid"] = 1537;  // 与Python一致：中文普通话，弱标点
-    doc["speech"] = base64Audio;
-    doc["len"] = totalRead;
-
-    String jsonPayload;
-    serializeJson(doc, jsonPayload);
-
-    Serial.println("[ASR-REST] 发送识别请求...");
-    int httpCode = http.POST(jsonPayload);
-
-    String result = "";
-    if (httpCode == 200) {
-        String response = http.getString();
-        StaticJsonDocument<1024> respDoc;
-        DeserializationError error = deserializeJson(respDoc, response);
-
-        if (!error && respDoc["err_no"] == 0) {
-            JsonArray results = respDoc["result"];
-            if (results.size() > 0) {
-                result = results[0].as<String>();
-            }
-        } else {
-            Serial.printf("[ASR-REST] 识别错误: %d\n", (int)respDoc["err_no"]);
-        }
-    } else {
-        Serial.printf("[ASR-REST] HTTP错误: %d\n", httpCode);
-    }
-
-    http.end();
-    return result;
 }
 
 /**
