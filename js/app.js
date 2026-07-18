@@ -1078,8 +1078,8 @@ async function planRouteToNearest(destination, currentLat, currentLng) {
 // ================= 新增：事件记录功能 =================
 
 /**
- * 添加事件记录到网页大屏
- * @param {string} category - 事件类别：'系统', '导航', '障碍物', '语音'
+ * 添加事件记录到网页大屏 - 使用原有CSS样式
+ * @param {string} category - 事件类别：'系统', '导航', '障碍物', '语音', '雷达'
  * @param {string} message - 事件消息
  */
 function addEventLog(category, message) {
@@ -1089,34 +1089,26 @@ function addEventLog(category, message) {
         return;
     }
 
-    // 根据类别设置颜色
-    const colorMap = {
-        '系统': '#00d4ff',
-        '导航': '#2ed573',
-        '障碍物': '#ff4757',
-        '语音': '#ffa502',
-        '雷达': '#ff6348'
+    // 根据类别设置样式类
+    const classMap = {
+        '系统': 'info',
+        '导航': 'success',
+        '障碍物': 'danger',
+        '语音': 'info',
+        '雷达': 'danger'
     };
-    const color = colorMap[category] || '#ffffff';
-
-    // 创建事件项
-    const item = document.createElement('div');
-    item.className = 'event-item';
-    item.style.cssText = `
-        padding: 8px 12px;
-        margin-bottom: 6px;
-        background: rgba(255,255,255,0.05);
-        border-radius: 6px;
-        border-left: 3px solid ${color};
-        font-size: 13px;
-        line-height: 1.4;
-        animation: fadeIn 0.3s ease;
-    `;
-
+    const itemClass = classMap[category] || 'info';
     const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+    // 创建事件项 - 使用原有CSS样式
+    const item = document.createElement('div');
+    item.className = `event-item ${itemClass}`;
     item.innerHTML = `
-        <div style="color: ${color}; font-weight: 600; margin-bottom: 2px;">${category} · ${time}</div>
-        <div style="color: rgba(255,255,255,0.9);">${message}</div>
+        <div class="event-time">${time}</div>
+        <div class="event-content">
+            <div class="event-title">${category}</div>
+            <div class="event-desc">${message}</div>
+        </div>
     `;
 
     // 插入到列表顶部
