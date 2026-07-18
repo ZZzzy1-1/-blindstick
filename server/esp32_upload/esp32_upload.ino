@@ -2363,6 +2363,9 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
             playPcmData(audio_buf + offset, length - offset);
             free(audio_buf);
 
+            // 重置TTS请求标志
+            is_tts_requesting = false;
+
             // 恢复语音识别 - 确保在TTS完成后恢复
             if (VoiceTaskHandle != NULL) {
                 eTaskState taskState = eTaskGetState(VoiceTaskHandle);
@@ -2410,13 +2413,18 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
 bool last_blocked = false;
 unsigned long last_alert_time = 0;
 float last_alert_dist = 0;
-#define ALERT_INTERVAL_MS 2000        // 障碍物告警间隔 2 秒（减少延迟）
-#define ALERT_DIST_CHANGE 30          // 距离变化超过30cm才重新播报（从50减少到30）
+#define ALERT_INTERVAL_MS 8000        // 障碍物告警间隔 8 秒（避免过于频繁）
+#define ALERT_DIST_CHANGE 30          // 距离变化超过30cm才重新播报
 
 // 避障语音去重：记录上次播报的文本和时间
 static String last_alert_text = "";
 static unsigned long last_alert_text_time = 0;
-#define ALERT_TEXT_DUPLICATE_MS 3000  // 相同文本3秒内不重复（从5秒减少到3秒，提高响应速度）
+#define ALERT_TEXT_DUPLICATE_MS 8000  // 相同文本8秒内不重复
+
+// TTS请求状态标志（防止重复发送）
+static volatile bool is_tts_requesting = false;
+static unsigned long tts_request_start_time = 0;
+#define TTS_REQUEST_TIMEOUT_MS 10000  // TTS请求超时时间10秒
 
 // ==================== 辅助函数：使用PSRAM或普通内存分配 ====================
 void* allocateBuffer(size_t size) {
@@ -2535,15 +2543,24 @@ void checkObstacleAndAlert() {
 
     // 只有检测到有障碍物且满足播报间隔时才播报
     if (has_obstacle) {
-        // 检查播报间隔
+        // 如果正在播放语音或正在请求TTS，跳过
+        if (is_ai_talking || is_tts_requesting) {
+            return;
+        }
+
+        // 检查播报间隔（8秒）
         if (now - last_alert_time < ALERT_INTERVAL_MS) {
             return;
         }
 
-        // 去重检查
+        // 去重检查（8秒内相同文本不重复）
         if (alert_text == last_alert_text && (now - last_alert_text_time) < ALERT_TEXT_DUPLICATE_MS) {
             return;
         }
+
+        // 设置TTS请求标志，防止重复发送
+        is_tts_requesting = true;
+        tts_request_start_time = now;
 
         // 发送流式TTS请求（高优先级）
         StaticJsonDocument<256> doc;
@@ -2551,11 +2568,16 @@ void checkObstacleAndAlert() {
         doc["priority"] = PRIO_HIGH;
         char buf[256];
         size_t len = serializeJson(doc, buf, sizeof(buf));
-        mqtt.publish("blindstick/tts/request", buf, len);
+        bool published = mqtt.publish("blindstick/tts/request", buf, len);
 
-        last_alert_time = now;
-        last_alert_text = alert_text;
-        last_alert_text_time = now;
+        if (published) {
+            last_alert_time = now;
+            last_alert_text = alert_text;
+            last_alert_text_time = now;
+        } else {
+            // 发送失败，重置标志
+            is_tts_requesting = false;
+        }
     }
 }
 // ==================== Core 0 守护线程 ====================
@@ -2586,6 +2608,12 @@ void RadarMotorUploadTask(void* pvParameters) {
 
         if (mqtt.connected()) {
                 mqtt.loop();  // 保活
+
+                // 检查TTS请求超时（防止卡死）
+                if (is_tts_requesting && (millis() - tts_request_start_time > TTS_REQUEST_TIMEOUT_MS)) {
+                    Serial.println("[TTS] 请求超时，重置标志");
+                    is_tts_requesting = false;
+                }
 
                 // 障碍物检测和语音告警（独立控制频率）
                 checkObstacleAndAlert();
@@ -3501,7 +3529,7 @@ void handleTTSUrl(const char* payload, int length) {
             }
         }
         // 超时检查
-        if (millis() - downloadStart > 8000) {
+        if (millis() - downloadStart > 15000) {
             Serial.println("[TTS-URL] 下载超时");
             break;
         }
@@ -3514,6 +3542,8 @@ void handleTTSUrl(const char* payload, int length) {
     if (totalRead != len) {
         Serial.printf("[TTS-URL] 下载不完整: %d/%d\n", totalRead, len);
         free(audioBuffer);
+        // 重置TTS请求标志
+        is_tts_requesting = false;
         if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
         return;
     }
@@ -3530,12 +3560,14 @@ void handleTTSUrl(const char* payload, int length) {
     free(audioBuffer);
     Serial.println("[TTS-URL] 播放完成");
 
+    // 重置TTS请求标志（播放完成，可以发送下一个请求）
+    is_tts_requesting = false;
+
     // 恢复语音识别 - 确保正确恢复
     if (VoiceTaskHandle != NULL) {
         eTaskState taskState = eTaskGetState(VoiceTaskHandle);
         if (taskState == eSuspended) {
             vTaskResume(VoiceTaskHandle);
-            Serial.println("[TTS-URL] 语音识别已恢复");
         }
     }
 }
