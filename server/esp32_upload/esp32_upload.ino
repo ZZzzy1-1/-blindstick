@@ -3079,6 +3079,7 @@ void setup() {
     ttsRequestMutex = xSemaphoreCreateMutex();
     if (ttsRequestMutex == NULL) {
         Serial.println("[警告] TTS互斥锁创建失败");
+    }
 
     // 初始化流式TTS
     initStreamingTTS();
