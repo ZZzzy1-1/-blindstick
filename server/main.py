@@ -27,14 +27,16 @@ import sys
 
 # ==================== 📡 0. 串口输出配置（发送给 ESP32）====================
 try:
-    from machine import UART
-    K230_UART_ID = 1          # UART1（TX=IO5, RX=IO6 — 按实际接线调整）
+    from machine import UART, FPIOA
+
+    # 使用UART2，GPIO5/6
+    K230_UART_ID = 2          # UART2（不是UART1）
     K230_UART_BAUD = 115200
-    K230_UART_TX_PIN = 5      # 默认 IO5
-    K230_UART_RX_PIN = 6      # 默认 IO6
+    K230_UART_TX_PIN = 5      # GPIO5
+    K230_UART_RX_PIN = 6      # GPIO6
     uart = UART(K230_UART_ID, K230_UART_BAUD, tx=K230_UART_TX_PIN, rx=K230_UART_RX_PIN)
     K230_UART_AVAILABLE = True
-    print(f"[串口] UART{K230_UART_ID} 初始化 TX=IO{K230_UART_TX_PIN} RX=IO{K230_UART_RX_PIN} 波特={K230_UART_BAUD}")
+    print(f"[串口] UART{K230_UART_ID} 初始化 TX=GPIO{K230_UART_TX_PIN} RX=GPIO{K230_UART_RX_PIN} 波特={K230_UART_BAUD}")
 except Exception as e:
     K230_UART_AVAILABLE = False
     print(f"[串口] 初始化失败: {e}，K230无法输出检测结果")

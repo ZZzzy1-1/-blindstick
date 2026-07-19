@@ -426,12 +426,15 @@ async function handleMqttMessage(topic, payload) {
                 handleObstacleDetection({ front, left, right });
             }
 
-            // GPS
+            // GPS - 兼容新旧字段名
             if (msg.gps && msg.gps.lat > 1.0 && msg.gps.lng > 1.0) {
-                updateGPS(msg.gps.lng, msg.gps.lat, msg.gps.speed || 0);
+                const speed = msg.gps.speed !== undefined ? msg.gps.speed : (msg.gps.s || 0);
+                updateGPS(msg.gps.lng, msg.gps.lat, speed);
             }
-            if (msg.gps && msg.gps.satellites !== undefined) {
-                updateSatellites(msg.gps.satellites);
+            // 兼容 satellites 和 sats 两种字段名
+            const satelliteCount = msg.gps.satellites !== undefined ? msg.gps.satellites : msg.gps.sats;
+            if (satelliteCount !== undefined) {
+                updateSatellites(satelliteCount);
             }
 
             // ====== K230 视觉检测数据 ======
@@ -671,6 +674,14 @@ function updateDetectionStats(counts) {
         const el = document.querySelector(`.stat[data-class="${g.key}"] .stat-count`);
         if (el) el.textContent = counts[g.key] || 0;
     });
+
+    // 更新 FPS/检测状态显示
+    const fpsEl = document.getElementById('fpsDisplay');
+    if (fpsEl) {
+        const hasDetections = Object.values(counts).some(c => c > 0);
+        fpsEl.textContent = hasDetections ? '检测中' : '等待中';
+        fpsEl.className = 'tag tag-fps ' + (hasDetections ? 'active' : '');
+    }
 }
 
 // ================= 地图 =================
