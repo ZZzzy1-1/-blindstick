@@ -3105,6 +3105,8 @@ String doVoiceRecognition() {
         size_t bytesRead = 0;
         i2s_read(I2S_PORT, buffer + totalRead, RECORD_SIZE - totalRead, &bytesRead, 50);
         totalRead += bytesRead;
+        // 喂看门狗，防止复位
+        vTaskDelay(1 / portTICK_PERIOD_MS);
     }
 
     // 检查录音数据是否有效（避免静音）
@@ -3112,6 +3114,8 @@ String doVoiceRecognition() {
     int nonZeroCount = 0;
     for (int i = 0; i < totalRead / 2; i++) {
         if (samples[i] > 100 || samples[i] < -100) nonZeroCount++;
+        // 每1000个样本喂一次看门狗
+        if (i % 1000 == 0) vTaskDelay(1 / portTICK_PERIOD_MS);
     }
 
     if (nonZeroCount < 100) {
