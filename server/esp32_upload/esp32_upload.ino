@@ -3163,11 +3163,17 @@ String doVoiceRecognition() {
     jsonPayload += totalRead;
     jsonPayload += "}";
 
+    // 喂看门狗，防止HTTP请求阻塞导致复位
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+
     int httpCode = http.POST(jsonPayload);
     String result = "";
 
     if (httpCode == 200) {
         String response = http.getString();
+        // 喂看门狗
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+
         StaticJsonDocument<1024> respDoc;
         DeserializationError error = deserializeJson(respDoc, response);
 
@@ -3215,10 +3221,16 @@ String getBaiduToken() {
     }
 
     http.setTimeout(10000);
+    // 喂看门狗
+    vTaskDelay(1 / portTICK_PERIOD_MS);
+
     int httpCode = http.GET();
 
     if (httpCode == 200) {
         String response = http.getString();
+        // 喂看门狗
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+
         StaticJsonDocument<512> doc;
         DeserializationError error = deserializeJson(doc, response);
 
@@ -3258,6 +3270,11 @@ String base64Encode(const uint8_t* data, size_t len) {
         encoded += (remain > 2) ? base64Chars[temp[2] & 0x3F] : '=';
 
         i += 3;
+
+        // 每编码3000字节喂一次看门狗
+        if (i % 3000 == 0) {
+            vTaskDelay(1 / portTICK_PERIOD_MS);
+        }
     }
 
     return encoded;
