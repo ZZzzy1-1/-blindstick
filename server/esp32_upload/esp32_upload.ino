@@ -534,7 +534,18 @@ void mqtt_reconnect() {
     mqtt.setBufferSize(131072);
 
     int retryCount = 0;
+    unsigned long startTime = millis();
+
     while (!mqtt.connected()) {
+        // 超时检查：如果连接超过30秒还没成功，先退出让系统运行
+        if (millis() - startTime > 30000) {
+            Serial.println("[MQTT] 连接超时，稍后重试");
+            break;
+        }
+
+        // 喂看门狗，防止阻塞导致复位
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+
         // 每次重试前重新配置TLS
         espClient.setInsecure();
         espClient.setHandshakeTimeout(12);
@@ -1059,6 +1070,8 @@ void playLocalStartupTone() {
         float t = (float)i / sample_rate;
         float sample = sin(2 * PI * 1000 * t) * 8000.0f;
         tone_buffer[i] = (int16_t)sample;
+        // 每1000个样本喂一次看门狗
+        if (i % 1000 == 0) vTaskDelay(1 / portTICK_PERIOD_MS);
     }
     size_t written = 0;
     i2s_zero_dma_buffer(I2S_PORT_OUT);
