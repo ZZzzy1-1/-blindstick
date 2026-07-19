@@ -93,11 +93,6 @@ static const uint8_t YDLIDAR_CMD_RESET[] = { 0xA5, 0x40, 0x00, 0x40, 0x01, 0x00,
 #define GPS_TX_PIN      17
 HardwareSerial gpsSerial(2);
 
-// ==================== K230视觉模块引脚（软串口）====================
-#define K230_SOFT_RX_PIN    37   // 接K230 TX (软串口RX)
-#define K230_SOFT_TX_PIN    38   // 接K230 RX (软串口TX，可选)
-SoftwareSerial k230Serial(K230_SOFT_RX_PIN, K230_SOFT_TX_PIN);  // 软串口
-
 #define RECORD_BUTTON_PIN  0
 
 // ==================== I2S麦克风引脚 (INMP441) ====================
@@ -318,38 +313,6 @@ TaskHandle_t NavTaskHandle = NULL;
 TaskHandle_t VoiceTaskHandle = NULL;
 TaskHandle_t TTSPlayerTaskHandle = NULL;
 
-// ==================== K230视觉检测配置 ====================
-// 需要播报的目标列表
-const char* K230_ALERT_TARGETS[] = {
-    "red_light",    // 红灯
-    "green_light",  // 绿灯
-    "yellow_light", // 黄灯
-    "stairs",       // 台阶
-    "person",       // 人
-    "ashcan",       // 垃圾桶
-    "curb"          // 路缘石
-};
-const int K230_ALERT_TARGET_COUNT = 7;
-
-// 5秒防重复播报机制
-unsigned long k230_lastAlertTime[7] = {0};
-const unsigned long K230_ALERT_COOLDOWN_MS = 5000;
-
-// K230串口接收缓冲区
-String k230_receiveBuffer = "";
-
-// K230最新检测数据（用于上传到大屏）
-struct K230_Detection {
-    String targetClass;     // 目标类别英文名
-    String targetLabel;     // 目标类别中文名
-    int x, y, w, h;         // 边界框坐标
-    float confidence;       // 置信度
-    unsigned long timestamp; // 检测时间戳
-};
-#define MAX_K230_DETECTIONS 5
-K230_Detection k230_detections[MAX_K230_DETECTIONS];
-int k230_detection_count = 0;
-
 // ==================== 五向雷达 + EMA平滑 ====================
 #define NUM_DIR     3
 #define SMOOTH_A    0.50f
@@ -455,169 +418,6 @@ void smartAvoid() {
 }
 
 // ==================== 雷达处理 ====================
-
-// ==================== K230视觉检测处理 ====================
-int getK230TargetIndex(const char* targetName) {
-    for (int i = 0; i < K230_ALERT_TARGET_COUNT; i++) {
-        if (strcmp(targetName, K230_ALERT_TARGETS[i]) == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-const char* getK230ChineseName(const char* targetName) {
-    if (strcmp(targetName, "red_light") == 0) return "红灯";
-    if (strcmp(targetName, "green_light") == 0) return "绿灯";
-    if (strcmp(targetName, "yellow_light") == 0) return "黄灯";
-    if (strcmp(targetName, "stairs") == 0) return "台阶";
-    if (strcmp(targetName, "person") == 0) return "行人";
-    if (strcmp(targetName, "ashcan") == 0) return "垃圾桶";
-    if (strcmp(targetName, "curb") == 0) return "路缘石";
-    if (strcmp(targetName, "blind_track") == 0) return "盲道";
-    if (strcmp(targetName, "crosswalk") == 0) return "斑马线";
-    if (strcmp(targetName, "pole") == 0) return "立柱";
-    if (strcmp(targetName, "reflective_cone") == 0) return "反光锥";
-    if (strcmp(targetName, "stop_sign") == 0) return "标志牌";
-    if (strcmp(targetName, "vehicle") == 0) return "车辆";
-    if (strcmp(targetName, "puddle") == 0) return "水坑";
-    return targetName;
-}
-
-// 解析K230多目标检测数据 DETS:class,conf,x,y,w,h;...
-void parseK230MultiDetections(String& data) {
-    k230_detection_count = 0;
-    // 去除 "DETS:" 前缀
-    String payload = data.substring(5);
-
-    // 按分号分割多个目标
-    int start = 0;
-    while (start < payload.length() && k230_detection_count < MAX_K230_DETECTIONS) {
-        int end = payload.indexOf(';', start);
-        if (end == -1) end = payload.length();
-
-        String targetStr = payload.substring(start, end);
-        // 按逗号分割: class,conf,x,y,w,h
-        int comma1 = targetStr.indexOf(',');
-        int comma2 = targetStr.indexOf(',', comma1 + 1);
-        int comma3 = targetStr.indexOf(',', comma2 + 1);
-        int comma4 = targetStr.indexOf(',', comma3 + 1);
-        int comma5 = targetStr.indexOf(',', comma4 + 1);
-
-        if (comma1 > 0 && comma2 > comma1 && comma3 > comma2 && comma4 > comma3 && comma5 > comma4) {
-            String cls = targetStr.substring(0, comma1);
-            float conf = targetStr.substring(comma1 + 1, comma2).toFloat();
-            int x = targetStr.substring(comma2 + 1, comma3).toInt();
-            int y = targetStr.substring(comma3 + 1, comma4).toInt();
-            int w = targetStr.substring(comma4 + 1, comma5).toInt();
-            int h = targetStr.substring(comma5 + 1).toInt();
-
-            k230_detections[k230_detection_count].targetClass = cls;
-            k230_detections[k230_detection_count].targetLabel = getK230ChineseName(cls.c_str());
-            k230_detections[k230_detection_count].x = x;
-            k230_detections[k230_detection_count].y = y;
-            k230_detections[k230_detection_count].w = w;
-            k230_detections[k230_detection_count].h = h;
-            k230_detections[k230_detection_count].confidence = conf;
-            k230_detections[k230_detection_count].timestamp = millis();
-            k230_detection_count++;
-        }
-
-        start = end + 1;
-    }
-
-    Serial.printf("[K230] 解析到 %d 个目标\n", k230_detection_count);
-}
-
-// 解析K230单目标检测数据 DET:class
-void parseK230SingleDetection(String& data) {
-    k230_detection_count = 0;
-    String cls = data.substring(4); // 去除 "DET:" 前缀
-
-    k230_detections[0].targetClass = cls;
-    k230_detections[0].targetLabel = getK230ChineseName(cls.c_str());
-    k230_detections[0].x = 160;  // 默认中心位置
-    k230_detections[0].y = 160;
-    k230_detections[0].w = 100;  // 默认尺寸
-    k230_detections[0].h = 100;
-    k230_detections[0].confidence = 0.85;
-    k230_detections[0].timestamp = millis();
-    k230_detection_count = 1;
-}
-
-void sendK230_TTSRequest(const char* targetName) {
-    if (!mqtt.connected()) return;
-
-    StaticJsonDocument<256> ttsDoc;
-    char buf[256];
-
-    char alertText[64];
-    const char* chineseName = getK230ChineseName(targetName);
-    snprintf(alertText, sizeof(alertText), "前方有%s", chineseName);
-
-    ttsDoc["text"] = alertText;
-    ttsDoc["priority"] = PRIO_NORMAL;
-
-    size_t len = serializeJson(ttsDoc, buf, sizeof(buf));
-    mqtt.publish(MQTT_TOPIC_TTS_REQ, buf, len);
-
-    Serial.printf("[K230] TTS播报: %s\n", alertText);
-}
-
-void processK230Data() {
-    while (k230Serial.available() > 0) {
-        char c = k230Serial.read();
-        if (c == '\n') {
-            k230_receiveBuffer.trim();
-            if (k230_receiveBuffer.length() > 0) {
-                Serial.printf("[K230] 收到: %s\n", k230_receiveBuffer.c_str());
-
-                if (k230_receiveBuffer.startsWith("DET:")) {
-                    // 单目标格式
-                    parseK230SingleDetection(k230_receiveBuffer);
-                    String targetName = k230_receiveBuffer.substring(4);
-                    int targetIndex = getK230TargetIndex(targetName.c_str());
-
-                    if (targetIndex >= 0) {
-                        unsigned long now = millis();
-                        if (now - k230_lastAlertTime[targetIndex] >= K230_ALERT_COOLDOWN_MS) {
-                            sendK230_TTSRequest(targetName.c_str());
-                            k230_lastAlertTime[targetIndex] = now;
-                        } else {
-                            Serial.printf("[K230] %s 冷却中，跳过\n", targetName.c_str());
-                        }
-                    } else {
-                        Serial.printf("[K230] 不播报: %s\n", targetName.c_str());
-                    }
-                }
-                else if (k230_receiveBuffer.startsWith("DETS:")) {
-                    // 多目标格式
-                    parseK230MultiDetections(k230_receiveBuffer);
-
-                    // 检查是否有需要播报的目标
-                    for (int i = 0; i < k230_detection_count; i++) {
-                        int targetIndex = getK230TargetIndex(k230_detections[i].targetClass.c_str());
-                        if (targetIndex >= 0) {
-                            unsigned long now = millis();
-                            if (now - k230_lastAlertTime[targetIndex] >= K230_ALERT_COOLDOWN_MS) {
-                                sendK230_TTSRequest(k230_detections[i].targetClass.c_str());
-                                k230_lastAlertTime[targetIndex] = now;
-                                break; // 每帧只播报一个目标
-                            }
-                        }
-                    }
-                }
-                else if (k230_receiveBuffer == "NONE") {
-                    // 无检测目标
-                    k230_detection_count = 0;
-                }
-                k230_receiveBuffer = "";
-            }
-        } else {
-            k230_receiveBuffer += c;
-        }
-    }
-}
 
 void processRadarPacket() {
     uint16_t fsa = payload_buf[0] | (payload_buf[1] << 8);
@@ -1049,23 +849,6 @@ void publishSensorData() {
     gps["satellites"] = gps_satellites;  // 统一字段名与前端一致
     gps["speed"] = gps_speed;            // 添加速度字段
 
-    // K230视觉检测数据 - 发送最新检测到的目标（取第一个）
-    if (k230_detection_count > 0 && millis() - k230_detections[0].timestamp < 5000) {
-        doc["k230_class"] = k230_detections[0].targetClass;
-        doc["k230_label"] = k230_detections[0].targetLabel;
-        // 是否属于危险目标（用于前端红色高亮）
-        bool isDanger = (k230_detections[0].targetClass == "red_light" ||
-                        k230_detections[0].targetClass == "person" ||
-                        k230_detections[0].targetClass == "vehicle" ||
-                        k230_detections[0].targetClass == "stairs" ||
-                        k230_detections[0].targetClass == "puddle");
-        doc["k230_danger"] = isDanger;
-    } else {
-        doc["k230_class"] = "none";
-        doc["k230_label"] = "";
-        doc["k230_danger"] = false;
-    }
-
     size_t n = serializeJson(doc, json_buffer, sizeof(json_buffer));
     if (n == 0 || n >= sizeof(json_buffer)) {
         return;
@@ -1076,8 +859,6 @@ void publishSensorData() {
 void RadarMotorUploadTask(void* pvParameters) {
     Serial1.begin(115200, SERIAL_8N1, RADAR_RX_PIN, -1);
     gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-    k230Serial.begin(115200);  // 软串口初始化
-    Serial.println("[K230] 软串口初始化完成 RX=GPIO37 TX=GPIO38");
 
     unsigned long lastUpload = 0;
     while (true) {
@@ -1092,7 +873,6 @@ void RadarMotorUploadTask(void* pvParameters) {
             }
         }
         parseGPSNMEA();
-        processK230Data();
         unsigned long now = millis();
         smartAvoid();
 
