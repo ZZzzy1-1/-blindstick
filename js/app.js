@@ -1277,6 +1277,49 @@ async function handleVoiceNavigationAdvanced(text) {
     addNavHistory(route.destination, route.steps);
 }
 
+// ================= 停止导航功能 =================
+
+/**
+ * 停止当前导航
+ * 发送停止指令到 ESP32，并更新前端状态
+ */
+function stopNavigation() {
+    if (!mqttClient || !AppState.mqttConnected) {
+        showToast('MQTT未连接，无法发送停止指令');
+        return;
+    }
+
+    // 发送停止导航指令
+    const stopMsg = {
+        nav_active: false,
+        status: 'stop',
+        steps: [],
+        current_step: 0,
+        destination: null,
+        timestamp: Date.now()
+    };
+
+    mqttClient.publish(MQTT_CONFIG.topics.navSteps, JSON.stringify(stopMsg), (err) => {
+        if (err) {
+            console.error('[导航] 停止指令发送失败:', err);
+            showToast('停止导航失败，请重试');
+        } else {
+            console.log('[导航] 停止指令已发送');
+
+            // 更新前端状态
+            updateNavigationSteps({
+                nav_active: false,
+                steps: [],
+                current_step: 0,
+                destination: null
+            });
+
+            showToast('导航已停止');
+            addEventLog('用户手动停止导航', 'info');
+        }
+    });
+}
+
 // ================= 新增：初始化时播放开机播报 =================
 
 // 导出函数供外部使用（如果需要）
@@ -1289,6 +1332,7 @@ if (typeof window !== 'undefined') {
     window.clearEventLog = clearEventLog;
     window.clearChatHistory = clearChatHistory;
     window.clearNavHistory = clearNavHistory;
+    window.stopNavigation = stopNavigation;  // 导出停止导航函数
 }
 
 // ================= 新增：常住地设置功能 =================
