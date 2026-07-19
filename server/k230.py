@@ -1,10 +1,10 @@
 '''
-实验名称：14类物体检测（YOLOv8）+ 官方 AIBase 骨架（完美融合版）
+实验名称：14类物体检测（YOLOv8）+ 串口输出到ESP32
 运行说明：
   1. 适配 14 类自定义目标检测模型。
-  2. 完美重写 NMS 算法，避开 ulab 库 Bug。
-  3. 集成 WiFi 联网及异步 HTTP 结果上报。
-  4. 集成串口输出，将检测结果发送给 ESP32。
+  2. 检测通过串口发送给ESP32。
+  3. ESP32通过MQTT上传到云端生成语音播报。
+  4. 数据流向：K230 → 串口 → ESP32 → MQTT → 云端TTS
 '''
 
 from libs.PipeLine import PipeLine, ScopedTiming
@@ -21,10 +21,9 @@ import image
 import gc
 import sys
 
-try:
-    import _thread
-except ImportError:
-    _thread = None
+# WiFi功能已禁用，数据通过串口传给ESP32处理
+# import network
+# import socket
 
 # ==================== 📡 0. 串口输出配置（发送给 ESP32）====================
 try:
@@ -38,30 +37,13 @@ try:
     print(f"[串口] UART{K230_UART_ID} 初始化 TX=IO{K230_UART_TX_PIN} RX=IO{K230_UART_RX_PIN} 波特={K230_UART_BAUD}")
 except Exception as e:
     K230_UART_AVAILABLE = False
-    print(f"[串口] 初始化失败: {e}，仅 WiFi 上报模式")
+    print(f"[串口] 初始化失败: {e}，K230无法输出检测结果")
 
-# ==================== 📡 1. WiFi 联网与数据上报配置 ====================
-import network
-import socket
+# ==================== 📡 1. WiFi 功能已禁用 ====================
+# 数据流向：K230 → 串口 → ESP32 → MQTT → 云端TTS
+# 不在K230端直接联网，所有检测通过串口发给ESP32处理
 
-WIFI_SSID     = "Edian"
-WIFI_PASSWORD = "Edian1234567890#"
-SERVER_HOST   = "192.168.3.24"
-SERVER_PORT   = 80800
-
-wlan = network.WLAN(network.STA_IF)
-try: wlan.active(True)
-except: pass
-
-print("[WiFi] 正在连接...")
-wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-retry = 0
-while retry < 20 and not wlan.isconnected():
-    time.sleep(0.5)
-    retry += 1
-
-if wlan.isconnected():
-    print("[WiFi] 成功获取 IP:", wlan.ifconfig()[0])
+print("[系统] K230仅通过串口输出，WiFi已禁用")
 
 # 【更新】14类特定场景字典定义
 LABEL_MAP = {
@@ -82,26 +64,10 @@ LABEL_MAP = {
 }
 
 def upload_detections(detections):
-    if not wlan.isconnected() or not detections: return
-    try:
-        payload = ujson.dumps({
-            "device_id": "k230_base",
-            "timestamp": time.ticks_ms(),
-            "detections": detections[:5],
-            "img_size": [320, 320],
-        })
-        addr = socket.getaddrinfo(SERVER_HOST, SERVER_PORT)[0][-1]
-        s = socket.socket()
-        s.settimeout(1.0)
-        s.connect(addr)
-        payload_bytes = payload.encode('utf-8')
-        request = ("POST /api/data HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n").format(SERVER_HOST, SERVER_PORT, len(payload_bytes))
-        s.send(request.encode('utf-8') + payload_bytes)
-        s.close()
-    except:
-        pass
-
-    # 同时通过串口发送给 ESP32
+    """
+    仅通过串口发送给ESP32，由ESP32负责MQTT上传
+    数据流向：K230 → 串口 → ESP32 → MQTT → 云端TTS
+    """
     send_detections_uart(detections)
 
 

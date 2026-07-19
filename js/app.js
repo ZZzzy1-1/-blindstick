@@ -399,16 +399,17 @@ async function handleMqttMessage(topic, payload) {
 
             // 设备状态 - 根据真实传感器数据推断
             // ESP32 没有直接发送 status 对象，需要根据各传感器数据推断
+            const hasVisionData = !!(msg.k230_class && msg.k230_class !== 'none' && msg.k230_class !== 'null');
             const deviceStatus = {
                 main: true,  // ESP32 在线（能收到MQTT消息就是在线）
-                vision: false,  // K230 暂时未接入，后面用户会提供
+                vision: hasVisionData,  // K230 有检测数据时显示在线
                 radar: !!(msg.radar && (msg.radar.f !== undefined || msg.radar.front !== undefined)),
                 gps: !!(msg.gps && msg.gps.sats > 0),
                 voice: true  // 语音模块在线（能处理TTS请求）
             };
             updateModuleStatus(deviceStatus);
 
-            // 雷达数据（三向）- 正前/左方/右方
+            // 雷达数据（三向）- 前方/左方/右方
             if (msg.radar) {
                 // 强制转换为数字，处理字符串或 undefined 情况
                 const front = Number(msg.radar.f ?? msg.radar.front ?? 400);
@@ -1165,9 +1166,9 @@ async function handleObstacleDetection(radarData) {
     const { front, left, right } = radarData;
     const OBSTACLE_THRESHOLD = 100; // 与ESP32一致
 
-    // 找出最近的障碍物
+    // 找出最近的障碍物（三向雷达：前方、左方、右方）
     const distances = [
-        { dist: front, dir: '正前方' },
+        { dist: front, dir: '前方' },
         { dist: left, dir: '左方' },
         { dist: right, dir: '右方' }
     ];
