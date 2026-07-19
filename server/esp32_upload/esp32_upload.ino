@@ -121,23 +121,23 @@ HardwareSerial gpsSerial(2);
 void playStartupVoice() {
     Serial.println("[开机] 播放启动提示音...");
 
+    // 使用简单的方波代替正弦波计算，减少CPU占用
+    const int freq = 1500;
     const int sample_rate = 16000;
-    const int beep_duration = 80;  // 80ms短促提示
-    const int freq = 1500;         // 1500Hz频率
+    const int samples = 1280;  // 80ms
+    const int samples_per_cycle = sample_rate / freq;  // 约10.6个样本每周期
 
-    int16_t beep_buffer[1280];  // 80ms @ 16kHz
-    for (int i = 0; i < 1280; i++) {
-        float t = (float)i / sample_rate;
-        float sample = sin(2 * PI * freq * t) * 8000.0f;
-        // 淡入淡出
-        if (i < 80) sample *= (i / 80.0f);
-        if (i > 1200) sample *= ((1280 - i) / 80.0f);
-        beep_buffer[i] = (int16_t)sample;
+    int16_t beep_buffer[1280];
+    for (int i = 0; i < samples; i++) {
+        // 方波生成，比sin快很多
+        beep_buffer[i] = ((i % samples_per_cycle) < (samples_per_cycle / 2)) ? 8000 : -8000;
+        // 每200个样本喂一次狗
+        if (i % 200 == 0) vTaskDelay(1 / portTICK_PERIOD_MS);
     }
 
     i2s_zero_dma_buffer(I2S_PORT_OUT);
-    i2s_write(I2S_PORT_OUT, beep_buffer, sizeof(beep_buffer), NULL, portMAX_DELAY);
-    delay(beep_duration);
+    i2s_write(I2S_PORT_OUT, beep_buffer, sizeof(beep_buffer), NULL, 100);  // 100ms超时
+    delay(80);
     i2s_zero_dma_buffer(I2S_PORT_OUT);
 
     Serial.println("[开机] 启动完成");
@@ -1402,24 +1402,6 @@ void setup() {
 
     // 播放测试音确认扬声器工作
     playLocalStartupTone();
-
-    // 麦克风硬件诊断测试
-    uint8_t test_buf[512];
-    size_t bytes_read = 0;
-    int test_non_zero = 0;
-    for (int test = 0; test < 3; test++) {
-        esp_err_t err = i2s_read(I2S_PORT, test_buf, sizeof(test_buf), &bytes_read, 100);
-        if (err == ESP_OK && bytes_read > 0) {
-            int16_t* samples = (int16_t*)test_buf;
-            for (int i = 0; i < bytes_read / 2; i++) {
-                if (samples[i] != 0 && samples[i] != -1) test_non_zero++;
-            }
-        }
-        delay(50);
-    }
-    if (test_non_zero == 0) {
-        Serial.println("[警告] 麦克风无数据");
-    }
 
     // 连接WiFi
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
