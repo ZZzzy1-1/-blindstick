@@ -1877,6 +1877,9 @@ String getBaiduToken();
 void handleVoiceCommand(const char* text);
 String base64Encode(const uint8_t* data, size_t len);  // Base64编码
 
+// 内存分配
+void* allocateBuffer(size_t size);
+
 // 语音识别相关
 void VoiceRecognitionTask(void* pvParameters);
 String getBaiduToken();
@@ -2120,60 +2123,6 @@ void smartAvoidDecision() {
     else {
         motorControl(0);
     }
-}
-            }
-            return;
-        }
-        // 两边都不够空间，不转向，只停止（避免撞墙）
-        motorControl(0);
-        return;
-    }
-
-    // 正在转向后的恢复逻辑
-    if (was_turning) {
-        // 判断转向目标方向是否已经有足够空间
-        bool escape_clear = false;
-        if (turn_direction == 1) {
-            // 之前向左转，检查左侧和左前方
-            escape_clear = (fL > TURN_CLEAR_CM && f > FRONT_BLOCK_CM);
-        } else if (turn_direction == -1) {
-            // 之前向右转，检查右侧和右前方
-            escape_clear = (fR > TURN_CLEAR_CM && f > FRONT_BLOCK_CM);
-        }
-        bool timeout = (now - turnStartMs) > TURN_TIMEOUT_MS;
-
-        if (escape_clear || timeout) {
-            was_turning = false;
-            turn_direction = 0;
-        } else {
-            // 继续转向
-            if (turn_direction == 1) {
-                motorControl(-STEER_MAX_PWM);  // 负数=左转
-            } else if (turn_direction == -1) {
-                motorControl(STEER_MAX_PWM);   // 正数=右转
-            }
-            return;
-        }
-    }
-
-    // 侧边告警微调（保持安全距离）
-    if (side_alert) {
-        float leftPull  = (SIDE_BLOCK_CM - L) * 3.0f;
-        float rightPull = (SIDE_BLOCK_CM - R) * 3.0f;
-        motorControl((int)(leftPull - rightPull));
-        return;
-    }
-
-    // 右侧沿墙走模式（保持与右侧墙壁的安全距离）
-    if (R < 200.0f) {
-        float err = R - 90.0f;
-        err = constrain(err, -50.0f, 60.0f);
-        motorControl((int)(err * 0.4f));
-        return;
-    }
-
-    // 无障碍，直行
-    motorControl(0);
 }
 
 // ==================== 雷达处理 ====================
