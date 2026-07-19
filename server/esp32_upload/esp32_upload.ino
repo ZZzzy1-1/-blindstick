@@ -2641,10 +2641,13 @@ void RadarMotorUploadTask(void* pvParameters) {
     }
 }
 
-// ==================== Core 1 导航任务（带路口播报）====================
+// ==================== Core 1 导航任务（基于真实GPS位置）====================
 void NavigationTask(void* pvParameters) {
-    Serial.println("[导航] 启动");
+    Serial.println("[导航] 启动（基于GPS位置）");
     static int last_step_idx = -1;
+    static float last_check_lat = 0;
+    static float last_check_lng = 0;
+    static unsigned long last_check_time = 0;
 
     while (true) {
         int total = nav_total_steps;
@@ -2652,6 +2655,9 @@ void NavigationTask(void* pvParameters) {
             // 检测是否进入新路段
             if (current_step_idx != last_step_idx) {
                 last_step_idx = current_step_idx;
+                last_check_lat = gps_lat;
+                last_check_lng = gps_lng;
+                last_check_time = millis();
 
                 // 播报当前路段指引
                 String current_instruction = nav_steps[current_step_idx];
@@ -2678,15 +2684,27 @@ void NavigationTask(void* pvParameters) {
                 }
             }
 
-            if (current_progress < 100) {
-                if (is_blocked || is_ai_talking) {
-                    vTaskDelay(200 / portTICK_PERIOD_MS);
-                    continue;
+            // 基于GPS位置判断是否完成当前步骤
+            // 检查是否移动了足够距离或到达下一步起点
+            if (gps_lat > 1.0 && gps_lng > 1.0 && last_check_lat > 1.0 && last_check_lng > 1.0) {
+                float moved_dist = calcDistance(last_check_lat, last_check_lng, gps_lat, gps_lng);
+
+                // 每5秒检查一次，如果移动超过10米，认为完成了当前步骤
+                if (millis() - last_check_time > 5000) {
+                    if (moved_dist > 10.0) {  // 移动超过10米
+                        current_progress = 100;  // 标记当前步骤完成
+                        last_check_lat = gps_lat;
+                        last_check_lng = gps_lng;
+                        last_check_time = millis();
+
+                        Serial.printf("[导航] GPS检测到移动 %.1f 米，进入下一步\n", moved_dist);
+                    } else {
+                        last_check_time = millis();  // 重置计时器
+                    }
                 }
-                // 每3秒增加5%进度，一步约60秒
-                vTaskDelay(3000 / portTICK_PERIOD_MS);
-                current_progress += 5;
-            } else {
+            }
+
+            if (current_progress >= 100) {
                 current_progress = 0;
                 current_step_idx++;
 
@@ -2707,15 +2725,15 @@ void NavigationTask(void* pvParameters) {
                         mqtt.publish("blindstick/tts/request", buf, len);
                     }
                 }
-                vTaskDelay(1000 / portTICK_PERIOD_MS);
             }
+
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
         } else {
             current_step_idx = 0;
             current_progress = 0;
             last_step_idx = -1;
             vTaskDelay(1000 / portTICK_PERIOD_MS);
         }
-        vTaskDelay(50 / portTICK_PERIOD_MS);
     }
 }
 
