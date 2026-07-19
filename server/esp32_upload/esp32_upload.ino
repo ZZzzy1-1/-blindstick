@@ -187,7 +187,7 @@ void publishData() {
     gps["lng"] = gps_lng;
     gps["sats"] = gps_sats;
     char buf[256];
-    size_t len = serializeJson(doc, buf);
+    size_t len = serializeJson(doc, buf, sizeof(buf));
     mqtt.publish("blindstick/sensors", buf, len);
 }
 
