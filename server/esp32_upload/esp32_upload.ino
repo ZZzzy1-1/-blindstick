@@ -48,9 +48,9 @@ volatile unsigned long stream_session_id = 0;   // 当前会话ID
 uint8_t* stream_buffer = NULL;
 volatile int stream_buf_used = 0;
 
-// 旧的TTS缓冲区（兼容旧版）
-#define TTS_AUDIO_BUF_SIZE  (120 * 1024)
-volatile uint8_t tts_rx_buf[TTS_AUDIO_BUF_SIZE];
+// TTS音频缓冲区（使用PSRAM动态分配，不占用主内存）
+#define TTS_AUDIO_BUF_SIZE  (80 * 1024)  // 减小到80KB，足够播放
+uint8_t* tts_rx_buf = NULL;  // 改为指针，动态分配
 volatile int     tts_rx_len = 0;
 volatile bool    tts_rx_ready = false;
 volatile unsigned long tts_rx_start = 0;
@@ -1335,12 +1335,24 @@ void VoiceRecognitionTask(void* pvParameters) {
 }
 
 /**
- * 语音识别主函数（录音4秒，REST API）
+ * 语音识别主函数（录音3秒，REST API）
  * 返回值：识别到的文本，空字符串表示未识别
  */
 String doVoiceRecognition() {
-    // 录音4秒 = 128KB (16000Hz * 2字节 * 4秒)
-    const int RECORD_SIZE = 16000 * 2 * 4;
+    // 录音3秒 = 96KB (16000Hz * 2字节 * 3秒)
+    const int RECORD_SIZE = 16000 * 2 * 3;
+
+    // 检查内存是否足够
+    size_t freeHeap = ESP.getFreeHeap();
+    size_t freePsram = ESP.getFreePsram();
+    if (ESP.getPsramSize() > 0 && freePsram < RECORD_SIZE + 5000) {
+        Serial.println("[ASR] PSRAM不足，跳过识别");
+        return "";
+    } else if (ESP.getPsramSize() == 0 && freeHeap < RECORD_SIZE + 30000) {
+        Serial.println("[ASR] 内存不足，跳过识别");
+        return "";
+    }
+
     uint8_t* buffer = NULL;
 
     // 优先使用PSRAM
@@ -1355,10 +1367,10 @@ String doVoiceRecognition() {
         return "";
     }
 
-    // 录音4秒
+    // 录音3秒
     size_t totalRead = 0;
     unsigned long startTime = millis();
-    while (millis() - startTime < 4000 && totalRead < RECORD_SIZE) {
+    while (millis() - startTime < 3000 && totalRead < RECORD_SIZE) {
         size_t bytesRead = 0;
         i2s_read(I2S_PORT, buffer + totalRead, RECORD_SIZE - totalRead, &bytesRead, 50);
         totalRead += bytesRead;
@@ -1527,6 +1539,28 @@ void setup() {
         size_t psram_total = ESP.getPsramSize();
         size_t psram_free = ESP.getFreePsram();
         Serial.printf("[系统] PSRAM: %dKB/%dKB\n", psram_free/1024, psram_total/1024);
+    }
+
+    // 初始化TTS音频缓冲区（优先使用PSRAM）
+    if (ESP.getPsramSize() > 0) {
+        tts_rx_buf = (uint8_t*)ps_malloc(TTS_AUDIO_BUF_SIZE);
+    } else {
+        tts_rx_buf = (uint8_t*)malloc(TTS_AUDIO_BUF_SIZE);
+    }
+    if (tts_rx_buf == NULL) {
+        Serial.printf("[警告] TTS缓冲区分配失败(%dKB)，尝试分配更小缓冲区\n", TTS_AUDIO_BUF_SIZE/1024);
+        // 尝试分配更小的缓冲区
+        int smaller_size = 40 * 1024;  // 40KB
+        if (ESP.getPsramSize() > 0) {
+            tts_rx_buf = (uint8_t*)ps_malloc(smaller_size);
+        } else {
+            tts_rx_buf = (uint8_t*)malloc(smaller_size);
+        }
+        if (tts_rx_buf) {
+            Serial.printf("[系统] 使用较小TTS缓冲区:%dKB\n", smaller_size/1024);
+        }
+    } else {
+        Serial.printf("[系统] TTS缓冲区分配成功:%dKB\n", TTS_AUDIO_BUF_SIZE/1024);
     }
 
     pinMode(MOTOR_IN1, OUTPUT); pinMode(MOTOR_IN2, OUTPUT); pinMode(MOTOR_PWM, OUTPUT);
@@ -1986,20 +2020,32 @@ void handleTTSUrl(const char* payload, int length) {
     }
 
     int len = http.getSize();
-    if (len <= 0 || len > 200000) {
-        Serial.printf("[TTS-URL] 音频大小无效: %d\n", len);
+    if (len <= 0 || len > 120000) {  // 限制最大120KB，避免内存不足
+        Serial.printf("[TTS-URL] 音频大小无效或太大: %d\n", len);
         http.end();
         if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
         return;
     }
 
-    Serial.printf("[TTS-URL] 音频%d字节，下载中...\n", len);
+    // 检查可用内存
+    size_t freeHeap = ESP.getFreeHeap();
+    size_t freePsram = ESP.getFreePsram();
+    Serial.printf("[TTS-URL] 可用内存: Heap=%d, PSRAM=%d, 需要=%d\n", freeHeap, freePsram, len);
 
     // 分配内存（优先使用PSRAM）
     uint8_t* audioBuffer = NULL;
-    if (ESP.getPsramSize() > 0) {
+    if (ESP.getPsramSize() > 0 && freePsram > len + 10000) {  // 确保PSRAM有足够空间
         audioBuffer = (uint8_t*)ps_malloc(len);
+        Serial.println("[TTS-URL] 使用PSRAM分配");
+    } else if (freeHeap > len + 50000) {  // 确保堆内存有足够空间（保留50KB给系统）
+        audioBuffer = (uint8_t*)malloc(len);
+        Serial.println("[TTS-URL] 使用堆内存分配");
     } else {
+        Serial.printf("[TTS-URL] 内存不足，跳过播放\n");
+        http.end();
+        if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
+        return;
+    }
         audioBuffer = (uint8_t*)malloc(len);
     }
 
