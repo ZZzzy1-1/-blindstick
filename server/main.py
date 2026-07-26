@@ -21,10 +21,6 @@ import image
 import gc
 import sys
 
-# WiFi功能已禁用，数据通过串口传给ESP32处理
-# import network
-# import socket
-
 # ==================== 📡 0. 串口输出配置（发送给 ESP32）====================
 try:
     from machine import UART, FPIOA
@@ -78,8 +74,7 @@ def send_detections_uart(detections):
     通过 UART 将检测结果发送给 ESP32
     单目标简单格式：DET:类名\n
     多目标扩展格式：DETS:类1,置信度1,x1,y1,w1,h1;类2,置信度2,x2,y2,w2,h2\n
-    无检测：NONE\n
-    """
+    无检测：NONE\n    """
     if not K230_UART_AVAILABLE: return
     try:
         if not detections or len(detections) == 0:
