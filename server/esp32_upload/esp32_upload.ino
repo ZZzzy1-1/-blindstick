@@ -2046,8 +2046,6 @@ void handleTTSUrl(const char* payload, int length) {
         if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
         return;
     }
-        audioBuffer = (uint8_t*)malloc(len);
-    }
 
     if (!audioBuffer) {
         Serial.println("[TTS-URL] 内存分配失败");
