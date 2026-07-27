@@ -299,6 +299,25 @@ String home_city = "黄石市";
 RTC_DATA_ATTR static bool startup_announced_rtc = false;
 volatile bool startup_announced = false;  // 运行时标志，用于防止同一运行周期内重复
 
+// ==================== 今日出行统计数据（RTC内存持久化）====================
+// 使用RTC内存保持统计数据，即使深度睡眠后也能保留
+RTC_DATA_ATTR static uint32_t rtc_total_mileage = 0;      // 总里程（米）
+RTC_DATA_ATTR static uint16_t rtc_nav_count = 0;          // 导航次数
+RTC_DATA_ATTR static uint16_t rtc_obstacle_count = 0;     // 障碍物提醒次数
+RTC_DATA_ATTR static uint16_t rtc_detour_count = 0;       // 路线调整次数
+RTC_DATA_ATTR static uint32_t rtc_last_gps_lat = 0;       // 上次GPS纬度（用于计算里程）
+RTC_DATA_ATTR static uint32_t rtc_last_gps_lng = 0;       // 上次GPS经度
+RTC_DATA_ATTR static bool rtc_has_last_pos = false;       // 是否有上次位置
+
+// 运行时统计变量
+float total_mileage = 0.0;        // 总里程（米）
+uint16_t nav_count = 0;           // 导航次数
+uint16_t obstacle_count = 0;      // 障碍物提醒次数
+uint16_t detour_count = 0;        // 路线调整次数
+float last_gps_lat_for_mileage = 0.0;  // 上次GPS纬度（用于计算里程）
+float last_gps_lng_for_mileage = 0.0;  // 上次GPS经度
+bool has_last_gps_pos = false;    // 是否有上次GPS位置
+
 enum LidarState { WAIT_HEADER_AA, WAIT_HEADER_55, READ_CT, READ_LSN, READ_PAYLOAD };
 volatile LidarState lidar_state = WAIT_HEADER_AA;
 volatile uint8_t packet_ct = 0, packet_lsn = 0;
@@ -411,33 +430,19 @@ void smartAvoid() {
 
     // 情况 1：正前方小于60cm，紧急全速避障
     if (frontDist < FRONT_CRITICAL) {
-        Serial.printf("🚨 前方紧急(%.1fcm)！全速闪避！", frontDist);
-
         if (leftDist > rightDist) {
-            // 左边更空，满功率左转
-            Serial.println("👈 左边更空，全速向左闪避！");
-            motorControl(-STEER_MAX_PWM);
+            motorControl(-STEER_MAX_PWM);  // 左边更空，满功率左转
         } else {
-            // 右边更空，满功率右转
-            Serial.println("👉 右边更空，全速向右闪避！");
-            motorControl(STEER_MAX_PWM);
+            motorControl(STEER_MAX_PWM);   // 右边更空，满功率右转
         }
-        return; // 紧急模式直接返回，不走低速逻辑
+        return;
     }
 
     // 情况 2：前方安全，仅侧边有障碍物 -> 低速微调
     if (leftForce > 0 || rightForce > 0) {
         float netSteerSignal = leftForce - rightForce;
-
-        // 关键：把合力映射到低速区间 STEER_SLOW_PWM，避免猛打方向
-        // 先算出原始最大可能推力：SIDE_WARNING * 4 = 320
-        // 按比例缩放到低速70以内
         float scaleRatio = STEER_SLOW_PWM / (SIDE_WARNING * 4.0f);
         int slowSteer = netSteerSignal * scaleRatio;
-
-        Serial.printf("⚠️ 侧边预警(低速) -> 左距:%.1fcm, 右距:%.1fcm | 输出低速:%d\n",
-                      leftDist, rightDist, slowSteer);
-
         motorControl(slowSteer);
     }
     // 情况 3：无障碍物，停机
@@ -517,8 +522,6 @@ void parseK230MultiDetections(String& data) {
 
         start = end + 1;
     }
-
-    Serial.printf("[K230] 解析到 %d 个目标\n", k230_detection_count);
 }
 
 // 解析K230单目标检测数据 DET:class
@@ -538,7 +541,6 @@ void parseK230SingleDetection(String& data) {
 }
 
 void sendK230_TTSRequest(const char* targetName) {
-    // 通过MQTT请求云端TTS
     if (!mqtt.connected()) return;
 
     StaticJsonDocument<256> ttsDoc;
@@ -552,8 +554,6 @@ void sendK230_TTSRequest(const char* targetName) {
 
     size_t len = serializeJson(ttsDoc, buf, sizeof(buf));
     mqtt.publish(MQTT_TOPIC_TTS_REQ, buf, len);
-
-    Serial.printf("[K230] TTS请求已发送: %s\n", alertText);
 }
 
 /**
@@ -566,10 +566,7 @@ void processK230Data() {
         if (c == '\n') {
             k230_receiveBuffer.trim();
             if (k230_receiveBuffer.length() > 0) {
-                Serial.printf("[K230] 收到: %s\n", k230_receiveBuffer.c_str());
-
                 if (k230_receiveBuffer.startsWith("DET:")) {
-                    // 单目标格式 - 解析并请求TTS
                     parseK230SingleDetection(k230_receiveBuffer);
                     String targetName = k230_receiveBuffer.substring(4);
                     int targetIndex = getK230TargetIndex(targetName.c_str());
@@ -579,18 +576,12 @@ void processK230Data() {
                         if (now - k230_lastAlertTime[targetIndex] >= K230_ALERT_COOLDOWN_MS) {
                             sendK230_TTSRequest(targetName.c_str());
                             k230_lastAlertTime[targetIndex] = now;
-                        } else {
-                            Serial.printf("[K230] %s 冷却中，跳过\n", targetName.c_str());
                         }
-                    } else {
-                        Serial.printf("[K230] 不播报: %s\n", targetName.c_str());
                     }
                 }
                 else if (k230_receiveBuffer.startsWith("DETS:")) {
-                    // 多目标格式 - 解析并检查是否需要播报
                     parseK230MultiDetections(k230_receiveBuffer);
 
-                    // 检查是否有需要播报的目标
                     for (int i = 0; i < k230_detection_count; i++) {
                         int targetIndex = getK230TargetIndex(k230_detections[i].targetClass.c_str());
                         if (targetIndex >= 0) {
@@ -598,13 +589,12 @@ void processK230Data() {
                             if (now - k230_lastAlertTime[targetIndex] >= K230_ALERT_COOLDOWN_MS) {
                                 sendK230_TTSRequest(k230_detections[i].targetClass.c_str());
                                 k230_lastAlertTime[targetIndex] = now;
-                                break; // 每帧只播报一个目标
+                                break;
                             }
                         }
                     }
                 }
                 else if (k230_receiveBuffer == "NONE") {
-                    // 无检测目标
                     k230_detection_count = 0;
                 }
                 k230_receiveBuffer = "";
@@ -722,52 +712,58 @@ void parseGPSNMEA() {
     }
 }
 
-// ==================== MQTT 重连 ====================
-void mqtt_reconnect() {
+// ==================== MQTT 重连（非阻塞）====================
+// 返回true表示连接成功，false表示正在重连中
+bool mqtt_reconnect_nonblocking() {
+    static unsigned long last_retry = 0;
+    static int retry_count = 0;
+    const unsigned long RETRY_INTERVAL = 3000; // 3秒重试间隔
+
+    if (mqtt.connected()) return true;
+
+    unsigned long now = millis();
+    if (now - last_retry < RETRY_INTERVAL) return false;
+    last_retry = now;
+
+    // 确保WiFi连接状态正常
+    if (WiFi.status() != WL_CONNECTED) return false;
+
     // 配置MQTT客户端参数
     mqtt.setSocketTimeout(10);
     mqtt.setKeepAlive(60);
     mqtt.setBufferSize(131072);
+    espClient.setInsecure();
+    espClient.setHandshakeTimeout(12);
 
-    int retryCount = 0;
-    while (!mqtt.connected()) {
-        // 每次重试前重新配置TLS
-        espClient.setInsecure();
-        espClient.setHandshakeTimeout(12);
+    if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
+        mqtt.subscribe(MQTT_TOPIC_TTS_AUDIO);
+        mqtt.subscribe("blindstick/tts/control");
+        mqtt.subscribe("blindstick/tts/stream/+");
+        mqtt.subscribe("blindstick/tts/url");
+        mqtt.subscribe(MQTT_TOPIC_NAV_STEPS);
+        mqtt.subscribe(MQTT_TOPIC_TTS_REQ);
+        mqtt.subscribe("blindstick/config/home_city");
+        mqtt.subscribe("blindstick/stats/detour");
+        retry_count = 0;
 
-        // 确保WiFi连接状态正常
-        if (WiFi.status() != WL_CONNECTED) {
-            delay(1000);
-            continue;
+        // 【开机语音】只在系统启动后的首次MQTT连接时播放一次
+        if (!startup_announced && !startup_announced_rtc) {
+            delay(100);  // 短暂延迟确保连接稳定
+            playStartupVoice();
+            startup_announced = true;
+            startup_announced_rtc = true;
         }
-
-        if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
-            Serial.println("[MQTT] 已连接！");
-            mqtt.subscribe(MQTT_TOPIC_TTS_AUDIO);
-            mqtt.subscribe("blindstick/tts/control");
-            mqtt.subscribe("blindstick/tts/stream/+");
-            mqtt.subscribe("blindstick/tts/url");
-            mqtt.subscribe(MQTT_TOPIC_NAV_STEPS);
-            mqtt.subscribe(MQTT_TOPIC_TTS_REQ);
-            mqtt.subscribe("blindstick/config/home_city");
-            retryCount = 0;
-
-            // 【开机语音】只在系统启动后的首次MQTT连接时播放一次本地音频
-            if (!startup_announced && !startup_announced_rtc) {
-                delay(200);
-                playStartupVoice();
-                startup_announced = true;
-                startup_announced_rtc = true;
-                Serial.println("[系统] 开机完成");
-            }
-        } else {
-            retryCount++;
-            if (retryCount >= 5) {
-                retryCount = 0;
-            }
-            delay(5000);
-        }
+        return true;
+    } else {
+        retry_count++;
+        if (retry_count >= 10) retry_count = 0;
+        return false;
     }
+}
+
+// 旧的重连函数（保留兼容性，但内部调用非阻塞版本）
+void mqtt_reconnect() {
+    mqtt_reconnect_nonblocking();
 }
 
 // ==================== MQTT 消息回调（支持流式TTS）====================
@@ -811,19 +807,16 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
         return;
     }
 
-    // 打印前 20 字节内容用于调试（仅非音频数据）
-    if (length < 1000) {
-        Serial.print("[MQTT] 内容: ");
-        for (int i = 0; i < min(50, (int)length); i++) {
-            Serial.printf("%c", payload[i]);
-        }
-        Serial.println();
+    // ===== 路线调整统计处理 =====
+    if (strcmp(topic, "blindstick/stats/detour") == 0) {
+        detour_count++;
+        saveStatsToRTC();
+        return;
     }
 
     // ===== 原有的TTS_AUDIO处理（兼容旧版）=====
     if (strcmp(topic, MQTT_TOPIC_TTS_AUDIO) == 0) {
         if (length < 1000 || length >= TTS_AUDIO_BUF_SIZE) {
-            Serial.printf("[TTS] 音频长度无效: %d\n", length);
             return;
         }
 
@@ -837,7 +830,6 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
             // 分配内存并复制音频数据
             uint8_t* audio_buf = (uint8_t*)allocateBuffer(length);
             if (audio_buf == NULL) {
-                Serial.println("[TTS] 内存分配失败，无法播放");
                 xSemaphoreGive(audioMutex);
                 return;
             }
@@ -876,9 +868,10 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length) {
                 nav_total_steps++; if (nav_total_steps >= 10) break;
             }
             current_step_idx = 0; current_progress = 0; nav_active = true;
-            Serial.printf("[导航] 开始: %s, %d步\n",
-                doc.containsKey("destination") ? doc["destination"].as<const char*>() : "未知",
-                nav_total_steps);
+
+            // 增加导航次数统计
+            nav_count++;
+            saveStatsToRTC();
         }
 
     } else if (strcmp(topic, MQTT_TOPIC_TTS_REQ) == 0) {
@@ -983,7 +976,6 @@ void checkObstacleAndAlert() {
         }
 
         // 避障语音使用云端TTS生成
-        Serial.println("[障碍物] 请求云端TTS播报");
         if (mqtt.connected()) {
             StaticJsonDocument<256> ttsDoc;
             char buf[256];
@@ -991,7 +983,10 @@ void checkObstacleAndAlert() {
             ttsDoc["priority"] = PRIO_HIGH;  // 避障使用高优先级
             size_t len = serializeJson(ttsDoc, buf, sizeof(buf));
             mqtt.publish(MQTT_TOPIC_TTS_REQ, buf, len);
-            Serial.printf("[避障TTS] %s\n", alert_text.c_str());
+
+            // 增加障碍物提醒次数统计
+            obstacle_count++;
+            saveStatsToRTC();
         }
 
         // 更新记录
@@ -1013,11 +1008,55 @@ void* allocateBuffer(size_t size) {
     }
 }
 
+// ==================== 保存统计数据到RTC内存 ====================
+void saveStatsToRTC() {
+    rtc_total_mileage = (uint32_t)total_mileage;
+    rtc_nav_count = nav_count;
+    rtc_obstacle_count = obstacle_count;
+    rtc_detour_count = detour_count;
+    if (has_last_gps_pos) {
+        rtc_last_gps_lat = *((uint32_t*)&last_gps_lat_for_mileage);
+        rtc_last_gps_lng = *((uint32_t*)&last_gps_lng_for_mileage);
+        rtc_has_last_pos = true;
+    }
+}
+
+// ==================== 计算两点间距离（米）====================
+float calcDistanceFloat(float lat1, float lng1, float lat2, float lng2) {
+    const float R = 6371000; // 地球半径（米）
+    float dLat = (lat2 - lat1) * PI / 180.0;
+    float dLng = (lng2 - lng1) * PI / 180.0;
+    float a = sin(dLat/2) * sin(dLat/2) +
+              cos(lat1 * PI / 180.0) * cos(lat2 * PI / 180.0) *
+              sin(dLng/2) * sin(dLng/2);
+    float c = 2 * atan2(sqrt(a), sqrt(1-a));
+    return R * c;
+}
+
+// ==================== 更新里程统计 ====================
+void updateMileage() {
+    if (gps_lat > 1.0 && gps_lng > 1.0) {
+        if (has_last_gps_pos) {
+            float dist = calcDistanceFloat(last_gps_lat_for_mileage, last_gps_lng_for_mileage, gps_lat, gps_lng);
+            if (dist > 1.0 && dist < 100.0) {  // 过滤跳变和静止
+                total_mileage += dist;
+                saveStatsToRTC();  // 保存到RTC内存
+            }
+        }
+        last_gps_lat_for_mileage = gps_lat;
+        last_gps_lng_for_mileage = gps_lng;
+        has_last_gps_pos = true;
+    }
+}
+
 static char json_buffer[2048];  // 扩大到2KB以容纳视觉检测数据
 
 // ==================== 通过 MQTT 发布传感器数据 ====================
 void publishSensorData() {
     if (!mqtt.connected()) return;
+
+    // 更新里程统计
+    updateMileage();
 
     // 使用更大的JSON缓冲区容纳视觉检测数据
     StaticJsonDocument<1024> doc;
@@ -1051,6 +1090,13 @@ void publishSensorData() {
         doc["k230_label"] = "";
         doc["k230_danger"] = false;
     }
+
+    // 添加今日出行统计数据
+    JsonObject stats = doc.createNestedObject("stats");
+    stats["total_mileage"] = (int)total_mileage;   // 总里程（米）
+    stats["nav_count"] = nav_count;                 // 导航次数
+    stats["obstacle_count"] = obstacle_count;       // 障碍物提醒次数
+    stats["detour_count"] = detour_count;           // 路线调整次数
 
     size_t n = serializeJson(doc, json_buffer, sizeof(json_buffer));
     if (n == 0 || n >= sizeof(json_buffer)) {
@@ -1281,12 +1327,10 @@ void playLocalStartupTone() {
 }
 
 /**
- * 流式语音识别任务（开机就开始，边录边传）
+ * 流式语音识别任务（非阻塞优化版）
  */
 void VoiceRecognitionTask(void* pvParameters) {
-    Serial.println("[语音识别] 启动");
-
-    // 等待WiFi连接
+    // 等待WiFi连接（最多60秒）
     int waitCount = 0;
     while (WiFi.status() != WL_CONNECTED && waitCount < 60) {
         vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -1294,22 +1338,15 @@ void VoiceRecognitionTask(void* pvParameters) {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[语音识别] WiFi未连接，退出");
         vTaskDelete(NULL);
         return;
     }
 
-    // 等待开机语音播放完成（最多等30秒）
+    // 等待开机语音播放完成（最多等10秒，避免阻塞太久）
     int waitStartup = 0;
-    while (!startup_announced && waitStartup < 30) {
+    while (!startup_announced && waitStartup < 10) {
         vTaskDelay(1000 / portTICK_PERIOD_MS);
         waitStartup++;
-    }
-
-    if (startup_announced) {
-        Serial.println("[语音识别] 开机语音已播放，开始监听...");
-    } else {
-        Serial.println("[语音识别] 开始监听...");
     }
 
     // 主循环：录音4秒 -> 识别 -> 处理结果
@@ -1323,12 +1360,10 @@ void VoiceRecognitionTask(void* pvParameters) {
         String result = doVoiceRecognition();
 
         if (result.length() > 0) {
-            Serial.printf("[语音识别] 识别: %s\n", result.c_str());
             handleVoiceCommand(result.c_str());
-            // 等待TTS播报完成
-            vTaskDelay(6000 / portTICK_PERIOD_MS);
+            // 短暂等待让系统处理，不阻塞TTS
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
         } else {
-            // 未识别到语音，短暂等待后继续
             vTaskDelay(500 / portTICK_PERIOD_MS);
         }
     }
@@ -1563,11 +1598,21 @@ void setup() {
         Serial.printf("[系统] TTS缓冲区分配成功:%dKB\n", TTS_AUDIO_BUF_SIZE/1024);
     }
 
+    // ===== 从RTC内存恢复今日出行统计数据 =====
+    total_mileage = rtc_total_mileage;
+    nav_count = rtc_nav_count;
+    obstacle_count = rtc_obstacle_count;
+    detour_count = rtc_detour_count;
+    if (rtc_has_last_pos) {
+        last_gps_lat_for_mileage = *((float*)&rtc_last_gps_lat);
+        last_gps_lng_for_mileage = *((float*)&rtc_last_gps_lng);
+        has_last_gps_pos = true;
+    }
+
     pinMode(MOTOR_IN1, OUTPUT); pinMode(MOTOR_IN2, OUTPUT); pinMode(MOTOR_PWM, OUTPUT);
     motorControl(0);
     pinMode(RADAR_M_CTR_PIN, OUTPUT);
     digitalWrite(RADAR_M_CTR_PIN, HIGH);
-    Serial.println("[雷达] 启动");
 
     nav_total_steps = 1;
     nav_steps[0] = "请说出目的地";
@@ -1577,9 +1622,6 @@ void setup() {
 
     // 初始化TTS请求标志互斥锁
     ttsRequestMutex = xSemaphoreCreateMutex();
-    if (ttsRequestMutex == NULL) {
-        Serial.println("[警告] TTS互斥锁创建失败");
-    }
 
     // 初始化流式TTS
     initStreamingTTS();
@@ -1590,62 +1632,28 @@ void setup() {
     // 播放测试音确认扬声器工作
     playLocalStartupTone();
 
-    // 麦克风硬件诊断测试
-    uint8_t test_buf[512];
-    size_t bytes_read = 0;
-    int test_non_zero = 0;
-    for (int test = 0; test < 3; test++) {
-        esp_err_t err = i2s_read(I2S_PORT, test_buf, sizeof(test_buf), &bytes_read, 100);
-        if (err == ESP_OK && bytes_read > 0) {
-            int16_t* samples = (int16_t*)test_buf;
-            for (int i = 0; i < bytes_read / 2; i++) {
-                if (samples[i] != 0 && samples[i] != -1) test_non_zero++;
-            }
-        }
-        delay(50);
-    }
-    if (test_non_zero == 0) {
-        Serial.println("[警告] 麦克风无数据");
-    }
-
     // 连接WiFi
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     unsigned long wifi_start = millis();
     while (WiFi.status() != WL_CONNECTED) {
-        if (millis() - wifi_start > 30000) {
-            Serial.println("[WiFi] 连接超时");
-            break;
-        }
+        if (millis() - wifi_start > 30000) break;
         delay(500);
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("[WiFi] 已连接: %s\n", WiFi.localIP().toString().c_str());
-
-        // 【关键】先配置TLS客户端，再初始化MQTT
+        // 配置MQTT
         espClient.setInsecure();
         espClient.setHandshakeTimeout(8);
-
-        // 初始化 MQTT
         mqtt.setServer(MQTT_BROKER, MQTT_PORT);
         mqtt.setCallback(mqtt_callback);
 
         // 连接MQTT（非阻塞重试）
         mqtt_reconnect();
-
-        // 注意：开机语音已移到 mqtt_reconnect 的 on_connect 回调中发送
-        // 确保 MQTT 连接成功后才发送，避免发送失败
-    } else {
-        Serial.println("[WiFi] 离线模式");
     }
-
-    Serial.println("[系统] 等待语音输入目的地...");
 
     xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 8192, NULL, 3, &RadarTaskHandle, 0);
     xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
     xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 8192, NULL, 2, &VoiceTaskHandle, 1);
-
-    delay(300);
 }
 
 void loop() {

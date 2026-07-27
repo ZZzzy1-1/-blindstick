@@ -49,9 +49,9 @@ const AppState = {
     videoDetections: [],
     gpsHistory: [],
     isRunning: true,
-    gpsCenter: null,  // 不再硬编码，从第一个GPS数据获取
-    gpsInitialized: false,  // GPS是否已初始化
-    gpsHasFix: false,       // GPS是否已定位
+    gpsCenter: null,
+    gpsInitialized: false,
+    gpsHasFix: false,
     reportData: {
         totalMileage: 0, navCount: 0, obstacleCount: 0, detourCount: 0,
     },
@@ -59,20 +59,22 @@ const AppState = {
     imgSize: [320, 320],
     navHistory: [],
     config: { homeCity: '黄石市' },
-    // 统计计数辅助
-    lastObstacleState: false,  // 上一次是否有障碍物（防止重复计数）
-    lastGpsPos: null,          // 上一次GPS位置（用于计算里程）
-    navStartTime: null,        // 导航开始时间
-    navJustStarted: false,     // 导航是否刚开始（用于区分路线调整）
-    // 语音分段接收
+    lastObstacleState: false,
+    lastGpsPos: null,
+    navStartTime: null,
+    navJustStarted: false,
     voiceSegments: [],
     voiceSegmentCount: 0,
-    voiceSegmentReceived: 0
+    voiceSegmentReceived: 0,
+    // 标记是否已收到过真实的雷达数据
+    radarDataReceived: false,
+    // 标记是否已收到设备启动事件
+    deviceStarted: false
 };
 
 // ================= 计算两点间距离（米）====================
 function calcDistance(lat1, lng1, lat2, lng2) {
-    const R = 6371000; // 地球半径（米）
+    const R = 6371000;
     const dLat = (lat2 - lat1) * Math.PI / 180;
     const dLng = (lng2 - lng1) * Math.PI / 180;
     const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
@@ -114,7 +116,7 @@ const DESTINATION_FILTER_WORDS = [
 const NAVIGATION_TRIGGERS = ['带我去', '我要去', '我想去', '导航到', '我去', '去', '到', '往', '走', '来'];
 
 // ================= 最大导航距离（米）====================
-const MAX_NAVIGATION_DISTANCE = 10000; // 10公里
+const MAX_NAVIGATION_DISTANCE = 10000;
 
 let baiduToken = null;
 let baiduTokenExpire = 0;
@@ -160,11 +162,8 @@ async function baiduASR(pcmBytes) {
 
 // 注意：所有语音播放由ESP32硬件功放完成，前端不播放任何声音
 
-
 // --- 百度 TTS（请求代理服务器合成，但只发送给ESP32播放，前端不播放）---
 async function baiduTTSWeb(text) {
-    console.log('[百度TTS] 请求合成:', text);
-
     try {
         const response = await fetch(`${API_BASE}/api/tts`, {
             method: 'POST',
@@ -174,67 +173,46 @@ async function baiduTTSWeb(text) {
 
         if (response.ok) {
             const audioData = await response.arrayBuffer();
-            console.log('[百度TTS] 合成成功:', audioData.byteLength, '字节');
-            // 返回音频数据，供MQTT发送给ESP32
             return new Uint8Array(audioData);
-        } else {
-            const error = await response.json();
-            console.error('[百度TTS] 错误:', error);
-            return null;
         }
     } catch (e) {
         console.error('[百度TTS] 请求异常:', e.message);
-        return null;
     }
+    return null;
 }
 
 // --- 百度 TTS（ESP32直接调用，网页端只负责转发音频数据给ESP32）---
-// 注意：ESP32优先直接调用百度API，当ESP32无法连接百度时，网页端代为合成并通过MQTT发送音频
 async function baiduTTS(text) {
-    console.log('[百度TTS] 合成文本:', text);
-    // 通过MQTT发送文本给ESP32，让ESP32自己合成并播放
     if (mqttClient && AppState.mqttConnected) {
         const msg = JSON.stringify({
             type: 'tts_request',
             text: text
         });
         mqttClient.publish(MQTT_CONFIG.topics.ttsReq, msg);
-        console.log('[百度TTS] 已发送文本给ESP32:', text);
     }
     return null;
 }
 
 // ==================== 流式TTS（新）====================
-// 优先级定义
 const TTS_PRIORITY = {
-    LOW: 0,      // 导航
-    NORMAL: 1,   // 对话
-    HIGH: 2      // 雷达告警
+    LOW: 0,
+    NORMAL: 1,
+    HIGH: 2
 };
 
-// 当前TTS会话状态
 let currentTTSSession = {
     sessionId: null,
     priority: 0,
     isPlaying: false
 };
 
-/**
- * 发送TTS请求到代理服务器进行流式合成（纯MQTT方式）
- * @param {string} text - 要合成的文本
- * @param {number} priority - 优先级 0=低(导航) 1=中(对话) 2=高(雷达告警)
- * @returns {Promise<boolean>}
- */
 async function streamTTS(text, priority = TTS_PRIORITY.NORMAL) {
-    console.log(`[流式TTS] 请求: "${text}" 优先级=${priority}`);
-
     if (!mqttClient || !AppState.mqttConnected) {
         console.error('[流式TTS] MQTT未连接');
         return false;
     }
 
     try {
-        // 直接通过MQTT发送请求到代理服务器
         const msg = JSON.stringify({
             type: 'tts_request',
             text: text,
@@ -243,7 +221,6 @@ async function streamTTS(text, priority = TTS_PRIORITY.NORMAL) {
         });
 
         mqttClient.publish('blindstick/tts/request', msg);
-        console.log('[流式TTS] 已通过MQTT发送请求:', text.substring(0, 30));
         return true;
     } catch (e) {
         console.error('[流式TTS] 发送失败:', e.message);
@@ -251,17 +228,8 @@ async function streamTTS(text, priority = TTS_PRIORITY.NORMAL) {
     }
 }
 
-/**
- * 立即打断当前TTS播放（用于雷达告警等紧急场景）
- * @param {number} newPriority - 新播放的优先级
- */
 async function interruptTTS(newPriority = TTS_PRIORITY.HIGH) {
-    console.log(`[流式TTS] 打断请求，新优先级=${newPriority}`);
-
-    if (!mqttClient || !AppState.mqttConnected) {
-        console.error('[流式TTS] MQTT未连接');
-        return;
-    }
+    if (!mqttClient || !AppState.mqttConnected) return;
 
     try {
         const msg = JSON.stringify({
@@ -270,33 +238,22 @@ async function interruptTTS(newPriority = TTS_PRIORITY.HIGH) {
             ts: Date.now()
         });
         mqttClient.publish('blindstick/tts/control', msg);
-        console.log('[流式TTS] 已发送打断请求');
     } catch (e) {
         console.error('[流式TTS] 打断请求失败:', e.message);
     }
 }
 
-/**
- * 发送导航语音（普通优先级）
- * @param {string} text - 导航文本
- */
 async function announceNavigation(text) {
-    console.log('[导航语音]', text);
     await streamTTS(text, TTS_PRIORITY.LOW);
 }
 
 // --- 处理语音导航（简化版 - 调用改进版）---
 async function handleVoiceNavigation(pcmBytes) {
-    console.log('[语音] 收到PCM数据', pcmBytes.length, '字节');
-
-    // 语音识别
     const text = await baiduASR(pcmBytes);
     if (!text) {
         await streamTTS('语音识别失败，请重新说出目的地', TTS_PRIORITY.NORMAL);
         return;
     }
-
-    // 调用改进版处理函数
     await handleVoiceNavigationAdvanced(text);
 }
 
@@ -326,14 +283,13 @@ let mqttClient = null;
 // ================= MQTT 连接 =================
 function connectMQTT() {
     const url = `wss://${MQTT_CONFIG.host}:${MQTT_CONFIG.port}${MQTT_CONFIG.path}`;
-    console.log('[MQTT] 正在连接:', url);
 
     try {
         mqttClient = mqtt.connect(url, {
             clientId: MQTT_CONFIG.clientId,
             username: MQTT_CONFIG.username,
             password: MQTT_CONFIG.password,
-            clean: true,  // 清理会话，不接收保留消息
+            clean: true,
             reconnectPeriod: 5000,
             connectTimeout: 10000
         });
@@ -345,30 +301,17 @@ function connectMQTT() {
 
     mqttClient.on('connect', () => {
         AppState.mqttConnected = true;
-        console.log('[MQTT] 已连接');
         showToast('已接入 MQTT 数据流');
 
         // 订阅主题
         Object.values(MQTT_CONFIG.topics).forEach(topic => {
             mqttClient.subscribe(topic, (err) => {
                 if (err) console.error('[MQTT] 订阅失败:', topic, err);
-                else console.log('[MQTT] 已订阅:', topic);
             });
         });
-
-        // 播放开机播报
-        setTimeout(() => {
-            playStartupSound();
-        }, 2000);
-
-        // 订阅确认后，发送测试消息
-        setTimeout(() => {
-            console.log('[MQTT] 订阅完成，测试发布到:', MQTT_CONFIG.topics.ttsReq);
-        }, 1000);
     });
 
     mqttClient.on('message', async (topic, payload) => {
-        console.log('[MQTT] 收到:', topic, payload.length + ' bytes');
         await handleMqttMessage(topic, payload);
     });
 
@@ -378,13 +321,11 @@ function connectMQTT() {
     });
 
     mqttClient.on('offline', () => {
-        console.warn('[MQTT] 离线，等待重连...');
         AppState.mqttConnected = false;
         updateModuleStatus({ main: false, vision: false, radar: false, gps: false, voice: false });
     });
 
     mqttClient.on('reconnect', () => {
-        console.log('[MQTT] 重连中...');
         showToast('MQTT 重连中...');
     });
 }
@@ -395,35 +336,42 @@ async function handleMqttMessage(topic, payload) {
         // --- 传感器数据 ---
         if (topic === MQTT_CONFIG.topics.sensors) {
             const msg = JSON.parse(payload.toString());
-            console.log('[MQTT] 传感器数据:', JSON.stringify(msg));
+
+            // 标记收到真实数据
+            if (!AppState.deviceStarted) {
+                AppState.deviceStarted = true;
+                addEventLog('系统', '设备已连接，开始接收数据');
+            }
 
             // 设备状态 - 根据真实传感器数据推断
-            // ESP32 没有直接发送 status 对象，需要根据各传感器数据推断
             const hasVisionData = !!(msg.k230_class && msg.k230_class !== 'none' && msg.k230_class !== 'null');
             const deviceStatus = {
-                main: true,  // ESP32 在线（能收到MQTT消息就是在线）
-                vision: hasVisionData,  // K230 有检测数据时显示在线
+                main: true,
+                vision: hasVisionData,
                 radar: !!(msg.radar && (msg.radar.f !== undefined || msg.radar.front !== undefined)),
                 gps: !!(msg.gps && msg.gps.sats > 0),
-                voice: true  // 语音模块在线（能处理TTS请求）
+                voice: true
             };
             updateModuleStatus(deviceStatus);
 
             // 雷达数据（三向）- 前方/左方/右方
             if (msg.radar) {
-                // 强制转换为数字，处理字符串或 undefined 情况
-                const front = Number(msg.radar.f ?? msg.radar.front ?? 400);
-                const left = Number(msg.radar.l ?? msg.radar.left ?? 400);
-                const right = Number(msg.radar.r ?? msg.radar.right ?? 400);
-
-                // 详细调试输出
-                console.log('[雷达原始]', JSON.stringify(msg.radar));
-                console.log('[雷达解析] F:%d L:%d R:%d', front, left, right);
+                AppState.radarDataReceived = true;
+                // 使用null作为未收到数据的标记，不再默认400
+                const front = msg.radar.f !== undefined ? Number(msg.radar.f) :
+                             (msg.radar.front !== undefined ? Number(msg.radar.front) : null);
+                const left = msg.radar.l !== undefined ? Number(msg.radar.l) :
+                            (msg.radar.left !== undefined ? Number(msg.radar.left) : null);
+                const right = msg.radar.r !== undefined ? Number(msg.radar.r) :
+                             (msg.radar.right !== undefined ? Number(msg.radar.right) : null);
 
                 updateRadarCircles(front, left, right);
 
-                // 使用新的障碍物检测和播报功能
-                handleObstacleDetection({ front, left, right });
+                // 只使用有效的雷达数据进行障碍物检测
+                const validDistances = { front, left, right };
+                if (front !== null || left !== null || right !== null) {
+                    handleObstacleDetection(validDistances);
+                }
             }
 
             // GPS - 兼容新旧字段名
@@ -438,12 +386,11 @@ async function handleMqttMessage(topic, payload) {
             }
 
             // ====== K230 视觉检测数据 ======
-            // ESP32通过MQTT发送的K230数据格式: { k230_class, k230_label, k230_danger }
             if (msg.k230_class && msg.k230_class !== 'none' && msg.k230_class !== 'null') {
                 const cls = msg.k230_class;
                 const label = msg.k230_label || cls;
                 const meta = DETECTION_CLASSES[cls] || { label: label, color: '#ff4757' };
-                // 生成一个模拟检测框（居中，固定大小，因为串口只传类别没有bbox）
+                // 检测框使用固定位置（因为串口只传类别没有bbox）
                 AppState.videoDetections = [{
                     class: cls,
                     label: meta.label,
@@ -451,9 +398,22 @@ async function handleMqttMessage(topic, payload) {
                     confidence: 0.85,
                     x: 80, y: 80, w: 160, h: 160
                 }];
-                console.log('[K230/MQTT] 收到检测:', cls, '→', meta.label, '危险:', msg.k230_danger);
             } else {
                 AppState.videoDetections = [];
+            }
+
+            // ====== 今日出行统计数据（来自ESP32）======
+            if (msg.stats) {
+                AppState.reportData.totalMileage = msg.stats.total_mileage || AppState.reportData.totalMileage;
+                AppState.reportData.navCount = msg.stats.nav_count || AppState.reportData.navCount;
+                AppState.reportData.obstacleCount = msg.stats.obstacle_count || AppState.reportData.obstacleCount;
+                AppState.reportData.detourCount = msg.stats.detour_count || AppState.reportData.detourCount;
+
+                // 更新UI显示
+                document.getElementById('totalMileage').textContent = Math.round(AppState.reportData.totalMileage);
+                document.getElementById('navCount').textContent = AppState.reportData.navCount;
+                document.getElementById('obstacleCount').textContent = AppState.reportData.obstacleCount;
+                document.getElementById('detourCount').textContent = AppState.reportData.detourCount;
             }
 
             // 导航状态
@@ -473,7 +433,6 @@ async function handleMqttMessage(topic, payload) {
             AppState.voiceSegmentCount = parseInt(payload.toString());
             AppState.voiceSegments = [];
             AppState.voiceSegmentReceived = 0;
-            console.log('[语音] 期待接收', AppState.voiceSegmentCount, '段音频');
             return;
         }
 
@@ -482,11 +441,9 @@ async function handleMqttMessage(topic, payload) {
             const segIdx = parseInt(topic.split('/').pop());
             AppState.voiceSegments[segIdx] = new Uint8Array(payload);
             AppState.voiceSegmentReceived++;
-            console.log('[语音] 收到第', segIdx, '段，共', AppState.voiceSegmentReceived, '段');
 
             // 如果收齐所有段
             if (AppState.voiceSegmentReceived >= AppState.voiceSegmentCount && AppState.voiceSegmentCount > 0) {
-                // 拼接所有段
                 let totalLen = 0;
                 for (const seg of AppState.voiceSegments) {
                     if (seg) totalLen += seg.length;
@@ -499,8 +456,6 @@ async function handleMqttMessage(topic, payload) {
                         offset += seg.length;
                     }
                 }
-                console.log('[语音] 音频拼接完成', totalLen, '字节');
-                // 识别并导航
                 handleVoiceNavigation(fullPcm);
                 AppState.voiceSegmentCount = 0;
             }
@@ -508,28 +463,19 @@ async function handleMqttMessage(topic, payload) {
         }
 
         // --- TTS 音频（来自 ESP32 通过 MQTT 代理的 TTS 结果）---
-        // 注意：所有语音由ESP32硬件功放播放，前端只记录日志不播放
         if (topic === MQTT_CONFIG.topics.ttsAudio) {
-            const audioLen = payload.length;
-            console.log('[TTS] ESP32播放完成通知，音频大小:', audioLen, '字节');
-            // 前端不播放声音，只做记录
             return;
         }
 
-        // --- TTS 请求（ESP32通过MQTT代理请求TTS） ---
-        // 注意：此主题的消息是给 proxy_server 的，前端只需记录日志
-        // 不要转发，否则会形成循环（前端→MQTT→前端→MQTT...）
+        // --- TTS 请求（ESP32通过MQTT代理请求TTS）---
+        // 检测开机语音请求，记录设备启动事件
         if (topic === MQTT_CONFIG.topics.ttsReq) {
             try {
                 const msg = JSON.parse(payload.toString());
-                console.log('[TTS-MQTT] 收到TTS请求（仅记录）:', msg.text);
-
-                // 只记录日志，不转发
-                // proxy_server 会处理这个请求并发送 tts/url 给 ESP32
-
-                // 显示在事件记录中（可选）
-                if (msg.text && msg.text.includes('启动')) {
-                    console.log('系统', `设备启动: ${msg.text.substring(0, 20)}`);
+                // 检测到开机语音请求，记录设备启动
+                if (msg.text && msg.text.includes('系统启动成功') && !AppState.deviceStarted) {
+                    AppState.deviceStarted = true;
+                    addEventLog('系统', '设备启动成功');
                 }
             } catch (e) {
                 console.error('[TTS-MQTT] 解析失败:', e);
@@ -541,12 +487,7 @@ async function handleMqttMessage(topic, payload) {
         if (topic === MQTT_CONFIG.topics.navSteps) {
             const msg = JSON.parse(payload.toString());
             if (msg.destination && msg.steps) {
-                // 如果已经在导航中，且收到新的路线，算作路线调整
-                if (AppState.reportData.navCount > 0 && !AppState.navJustStarted) {
-                    AppState.reportData.detourCount++;
-                    document.getElementById('detourCount').textContent = AppState.reportData.detourCount;
-                    console.log('导航', `路线已调整：${msg.destination}`);
-                }
+                // 路线调整统计由ESP32负责并上报，前端不再重复统计
                 AppState.navJustStarted = false;
                 updateNavigationSteps(msg);
                 addNavHistory(msg.destination, msg.steps);
@@ -587,20 +528,15 @@ function updateRadarCircles(front, left, right) {
     const barLeft = document.getElementById('barLeft');
     const barRight = document.getElementById('barRight');
 
-    if (valFront) valFront.textContent = Math.round(front) + 'cm';
-    if (valLeft) valLeft.textContent = Math.round(left) + 'cm';
-    if (valRight) valRight.textContent = Math.round(right) + 'cm';
+    // 显示 -- 如果数据为null，否则显示数值
+    if (valFront) valFront.textContent = front !== null ? Math.round(front) + 'cm' : '--';
+    if (valLeft) valLeft.textContent = left !== null ? Math.round(left) + 'cm' : '--';
+    if (valRight) valRight.textContent = right !== null ? Math.round(right) + 'cm' : '--';
 
-    if (barFront) updateRadarBar(barFront, front);
-    if (barLeft) updateRadarBar(barLeft, left);
-    if (barRight) updateRadarBar(barRight, right);
-
-    // 调试：确认更新后的值
-    console.log('[雷达UI更新] 前:%s 左:%s 右:%s',
-        valFront?.textContent || 'N/A',
-        valLeft?.textContent || 'N/A',
-        valRight?.textContent || 'N/A'
-    );
+    // 更新进度条（如果数据有效）
+    if (barFront && front !== null) updateRadarBar(barFront, front);
+    if (barLeft && left !== null) updateRadarBar(barLeft, left);
+    if (barRight && right !== null) updateRadarBar(barRight, right);
 }
 
 function updateRadarBar(bar, distance) {
@@ -710,25 +646,24 @@ function updateGPS(lng, lat, speed) {
 
     if (marker) marker.setLatLng(pos);
     if (pathPolyline) pathPolyline.addLatLng(pos);
-    if (map) map.panTo(pos);  // 平滑移动地图
+    if (map) map.panTo(pos);
 
     const lngEl = document.getElementById('lng');
     const latEl = document.getElementById('lat');
     const speedEl = document.getElementById('speed');
-    if (lngEl) lngEl.textContent = lng.toFixed(6);  // 提高精度到6位小数
+    if (lngEl) lngEl.textContent = lng.toFixed(6);
     if (latEl) latEl.textContent = lat.toFixed(6);
     if (speedEl) speedEl.textContent = (speed || 0).toFixed(1);
 
     // 更新状态为GPS已定位
     if (!AppState.gpsHasFix) {
         AppState.gpsHasFix = true;
-        console.log('[GPS] 已定位');
     }
 
     // 计算里程
     if (AppState.lastGpsPos) {
         const dist = calcDistance(AppState.lastGpsPos.lat, AppState.lastGpsPos.lng, lat, lng);
-        if (dist > 1 && dist < 100) { // 过滤掉跳变和静止
+        if (dist > 1 && dist < 100) {
             AppState.reportData.totalMileage += dist;
             document.getElementById('totalMileage').textContent = Math.round(AppState.reportData.totalMileage);
         }
@@ -802,7 +737,6 @@ function updateSatellites(count) {
         else if (count > 0)  { gpsEl.textContent = 'GPS信号弱';   gpsEl.className = 'tag warn'; }
         else                 { gpsEl.textContent = 'GPS搜星中';   gpsEl.className = 'tag warn'; }
     }
-    // 更新GPS状态栏
     updateModuleStatus({ gps: count > 0 });
 }
 
@@ -810,6 +744,10 @@ function updateSatellites(count) {
 function addNavHistory(destination, steps) {
     const el = document.getElementById('navHistoryList');
     if (!el) return;
+
+    // 检测是否是路线调整（如果已经在导航中，又发起新导航）
+    const isDetour = AppState.reportData.navCount > 0 && !AppState.navJustStarted;
+
     const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
     const item = document.createElement('div');
     item.className = 'nav-history-item';
@@ -817,13 +755,26 @@ function addNavHistory(destination, steps) {
     const empty = el.querySelector('.nav-empty');
     if (empty) empty.remove();
     el.insertBefore(item, el.firstChild);
+
     // 增加导航次数计数
     AppState.reportData.navCount++;
     document.getElementById('navCount').textContent = AppState.reportData.navCount;
+
+    // 如果是路线调整，通知ESP32
+    if (isDetour && mqttClient && AppState.mqttConnected) {
+        const detourMsg = JSON.stringify({
+            type: 'detour',
+            ts: Date.now()
+        });
+        mqttClient.publish('blindstick/stats/detour', detourMsg);
+        addEventLog('导航', '路线已调整');
+    }
+
     // 记录导航开始时间（用于路线调整检测）
     AppState.navStartTime = Date.now();
     // 标记导航刚开始（防止第一次路线被算作调整）
     AppState.navJustStarted = true;
+}
 }
 
 // ================= 初始化 =================
@@ -854,8 +805,8 @@ function init() {
     initClock();
     initMap();
     initDetectionStats();
-    connectMQTT();        // ← MQTT 替代 WebSocket
-    loadHomeCitySettings(); // 加载常住地设置
+    connectMQTT();
+    loadHomeCitySettings();
     initModal();
 
     function loop() {
@@ -870,15 +821,8 @@ document.addEventListener('DOMContentLoaded', init);
 
 // ================= 新增：改进的目的地提取功能 =================
 
-/**
- * 从文本中提取目的地（高级版，自动屏蔽非目的地词汇）
- * @param {string} text - 识别文本
- * @returns {string|null} - 提取的目的地或null
- */
 function extractDestinationAdvanced(text) {
     if (!text || text.length < 2) return null;
-
-    console.log('[目的地提取] 原始文本:', text);
 
     // 步骤1：查找触发词
     let triggerIndex = -1;
@@ -893,13 +837,11 @@ function extractDestinationAdvanced(text) {
     }
 
     if (triggerIndex === -1) {
-        console.log('[目的地提取] 未找到导航触发词');
         return null;
     }
 
     // 步骤2：提取触发词后的内容
     let destination = text.substring(triggerIndex + matchedTrigger.length).trim();
-    console.log('[目的地提取] 触发词后内容:', destination);
 
     // 步骤3：去除标点符号
     destination = destination.replace(/[，。？！.,?!；：""''（）()【】\[\]{}]/g, ' ');
@@ -907,7 +849,6 @@ function extractDestinationAdvanced(text) {
     // 步骤4：按空格分割，取第一个非空部分
     const parts = destination.split(/\s+/).filter(p => p.length > 0);
     if (parts.length === 0) {
-        console.log('[目的地提取] 触发词后无内容');
         return null;
     }
 
@@ -920,11 +861,9 @@ function extractDestinationAdvanced(text) {
             filtered = '';
             break;
         }
-        // 去除开头的过滤词
         if (filtered.startsWith(word)) {
             filtered = filtered.substring(word.length);
         }
-        // 去除结尾的过滤词
         if (filtered.endsWith(word)) {
             filtered = filtered.substring(0, filtered.length - word.length);
         }
@@ -934,43 +873,29 @@ function extractDestinationAdvanced(text) {
 
     // 步骤6：验证目的地有效性
     if (filtered.length < 2) {
-        console.log('[目的地提取] 过滤后内容太短:', filtered);
         return null;
     }
 
     // 不能全是数字或标点
     if (/^[\d\s\p{P}]+$/u.test(filtered)) {
-        console.log('[目的地提取] 无效内容（纯数字/标点）:', filtered);
         return null;
     }
 
-    console.log('[目的地提取] 最终目的地:', filtered);
     return filtered;
 }
 
 // ================= 新增：搜索最近目的地功能 =================
 
-/**
- * 搜索最近的目的地（返回距离用户最近的结果）
- * @param {string} keyword - 目的地关键词
- * @param {number} currentLat - 当前纬度
- * @param {number} currentLng - 当前经度
- * @returns {Promise<Object|null>} - 最近的地点信息或null
- */
 async function searchNearestDestination(keyword, currentLat, currentLng) {
     try {
-        // 使用百度地点检索API搜索多个结果
         const searchUrl = `https://api.map.baidu.com/place/v2/search?query=${encodeURIComponent(keyword)}&region=${encodeURIComponent(API_CONFIG.homeCity)}&output=json&ak=${API_CONFIG.baiduMapAk}&page_size=10`;
 
         const searchRes = await fetch(searchUrl);
         const searchData = await searchRes.json();
 
         if (searchData.status !== 0 || !searchData.results || searchData.results.length === 0) {
-            console.log('[最近目的地] 未找到结果');
             return null;
         }
-
-        console.log('[最近目的地] 找到', searchData.results.length, '个结果');
 
         // 如果没有当前位置，返回第一个结果
         if (!currentLat || !currentLng) {
@@ -991,18 +916,12 @@ async function searchNearestDestination(keyword, currentLat, currentLng) {
                 place.location.lat, place.location.lng
             );
 
-            place._distance = distance; // 保存距离
-
-            console.log(`[最近目的地] ${place.name}: ${Math.round(distance)}米`);
+            place._distance = distance;
 
             if (distance < minDistance) {
                 minDistance = distance;
                 nearest = place;
             }
-        }
-
-        if (nearest) {
-            console.log('[最近目的地] 最近的是:', nearest.name, '距离', Math.round(minDistance), '米');
         }
 
         return nearest;
@@ -1013,27 +932,16 @@ async function searchNearestDestination(keyword, currentLat, currentLng) {
     }
 }
 
-/**
- * 规划到最近目的地的步行路线
- * @param {string} destination - 目的地关键词
- * @param {number} currentLat - 当前纬度
- * @param {number} currentLng - 当前经度
- * @returns {Promise<Object|null>} - 路线信息或null
- */
 async function planRouteToNearest(destination, currentLat, currentLng) {
-    // 搜索最近的目的地
     const nearestPlace = await searchNearestDestination(destination, currentLat, currentLng);
 
     if (!nearestPlace) {
-        console.log('[路线规划] 未找到目的地');
         return null;
     }
 
     const distance = nearestPlace._distance || 0;
 
-    // 检查距离是否太远
     if (distance > MAX_NAVIGATION_DISTANCE) {
-        console.log('[路线规划] 距离太远:', Math.round(distance), '米');
         return {
             tooFar: true,
             distance: distance,
@@ -1042,7 +950,6 @@ async function planRouteToNearest(destination, currentLat, currentLng) {
         };
     }
 
-    // 获取步行路线
     try {
         const origin = currentLat && currentLng ? `${currentLat},${currentLng}` : '30.229320,115.063977';
         const destLat = nearestPlace.location.lat;
@@ -1054,7 +961,6 @@ async function planRouteToNearest(destination, currentLat, currentLng) {
         const routeData = await routeRes.json();
 
         if (routeData.status !== 0 || !routeData.result || !routeData.result.routes || routeData.result.routes.length === 0) {
-            console.error('[路线规划] 路线规划失败:', routeData);
             return null;
         }
 
@@ -1080,19 +986,12 @@ async function planRouteToNearest(destination, currentLat, currentLng) {
 
 // ================= 新增：事件记录功能 =================
 
-/**
- * 添加事件记录到网页大屏 - 使用原有CSS样式
- * @param {string} category - 事件类别：'系统', '导航', '障碍物', '语音', '雷达'
- * @param {string} message - 事件消息
- */
 function addEventLog(category, message) {
     const eventList = document.getElementById('eventList');
     if (!eventList) {
-        console.warn('[事件记录] 找不到eventList元素');
         return;
     }
 
-    // 根据类别设置样式类
     const classMap = {
         '系统': 'info',
         '导航': 'success',
@@ -1103,7 +1002,6 @@ function addEventLog(category, message) {
     const itemClass = classMap[category] || 'info';
     const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
-    // 创建事件项 - 使用原有CSS样式
     const item = document.createElement('div');
     item.className = `event-item ${itemClass}`;
     item.innerHTML = `
@@ -1114,20 +1012,13 @@ function addEventLog(category, message) {
         </div>
     `;
 
-    // 插入到列表顶部
     eventList.insertBefore(item, eventList.firstChild);
 
-    // 限制最多显示50条记录
     while (eventList.children.length > 50) {
         eventList.removeChild(eventList.lastChild);
     }
-
-    console.log(`[事件记录] [${category}] ${message}`);
 }
 
-/**
- * 清空事件记录
- */
 function clearEventLog() {
     const eventList = document.getElementById('eventList');
     if (eventList) {
@@ -1135,19 +1026,13 @@ function clearEventLog() {
     }
 }
 
-/**
- * 清空聊天历史
- */
 function clearChatHistory() {
     const chatContainer = document.getElementById('chatContainer');
     if (chatContainer) {
-        chatContainer.innerHTML = '<div class="chat-welcome">语音对话功能暂不可用</div>';
+        chatContainer.innerHTML = '<div class="chat-welcome">语音对话由ESP32硬件处理</div>';
     }
 }
 
-/**
- * 清空导航历史
- */
 function clearNavHistory() {
     const navHistoryList = document.getElementById('navHistoryList');
     if (navHistoryList) {
@@ -1156,39 +1041,29 @@ function clearNavHistory() {
 }
 
 // ================= 新增：开机播报（已由ESP32硬件端处理）====================
-
-/**
- * 开机播报 - 已由ESP32硬件端处理，前端只记录日志，避免重复播报
- */
-async function playStartupSound() {
-    console.log('[开机播报] ESP32硬件已处理开机语音，前端仅记录日志');
-    addEventLog('系统', '设备启动成功');
-    // 注意：不再通过MQTT发送TTS请求，因为ESP32在连接MQTT后会自动发送开机语音
-}
+// 注意：开机语音由ESP32硬件端处理，前端只检测TTS请求中的开机消息来记录事件
 
 // ================= 障碍物检测（仅用于统计和显示，不播报）====================
 
-/**
- * 处理三向雷达障碍物检测 - 仅用于统计和显示
- * 播报由ESP32硬件端处理，避免重复
- * @param {Object} radarData - 雷达数据 {front, left, right}
- */
-async function handleObstacleDetection(radarData) {
+function handleObstacleDetection(radarData) {
     const { front, left, right } = radarData;
-    const OBSTACLE_THRESHOLD = 100; // 与ESP32一致
+    const OBSTACLE_THRESHOLD = 100;
 
-    // 找出最近的障碍物（三向雷达：前方、左方、右方）
-    const distances = [
-        { dist: front, dir: '前方' },
-        { dist: left, dir: '左方' },
-        { dist: right, dir: '右方' }
-    ];
+    // 找出最近的障碍物（只使用有效的数据）
+    const distances = [];
+    if (front !== null) distances.push({ dist: front, dir: '前方' });
+    if (left !== null) distances.push({ dist: left, dir: '左方' });
+    if (right !== null) distances.push({ dist: right, dir: '右方' });
+
+    if (distances.length === 0) return;
 
     let minDist = Infinity;
+    let minDir = '';
 
     for (const item of distances) {
         if (item.dist < minDist) {
             minDist = item.dist;
+            minDir = item.dir;
         }
     }
 
@@ -1197,62 +1072,43 @@ async function handleObstacleDetection(radarData) {
         AppState.reportData.obstacleCount++;
         document.getElementById('obstacleCount').textContent = AppState.reportData.obstacleCount;
         AppState.lastObstacleState = true;
-        console.log('[障碍物] 检测到障碍物，距离:', Math.round(minDist), 'cm');
-        // 添加事件记录
-        addEventLog('障碍物', `检测到障碍物，距离 ${Math.round(minDist)}cm`);
+        addEventLog('障碍物', `${minDir}检测到障碍物，距离 ${Math.round(minDist)}cm`);
     } else if (minDist >= OBSTACLE_THRESHOLD + 20) {
-        // 增加20cm迟滞，避免频繁切换
         AppState.lastObstacleState = false;
     }
 }
 
 // ================= 语音导航处理（改进版 - ESP32播放）====================
 
-/**
- * 处理语音导航指令（改进版）- 由ESP32功放播放语音
- * @param {string} text - 识别的语音文本
- */
 async function handleVoiceNavigationAdvanced(text) {
-    console.log('[语音导航] 收到文本:', text);
     addEventLog('语音', `识别: ${text}`);
 
-    // 提取目的地
     const destination = extractDestinationAdvanced(text);
 
     if (!destination) {
-        console.log('[语音导航] 未提取到有效目的地');
         addEventLog('语音', '未提取到有效目的地');
-        // 发送文本给ESP32，由ESP32播放提示音
         await baiduTTS('请说出具体地点，例如带我去天安门');
         return;
     }
 
-    console.log('[语音导航] 目的地:', destination);
     addEventLog('导航', `目的地: ${destination}`);
 
     const currentPos = AppState.lastGpsPos;
 
-    // 使用新的路线规划函数
     const route = await planRouteToNearest(destination, currentPos?.lat, currentPos?.lng);
 
     if (!route) {
-        console.log('[语音导航] 路线规划失败');
         addEventLog('导航', '路线规划失败');
-        // 发送文本给ESP32，由ESP32播放提示音
         await baiduTTS('抱歉，没有找到该地点的路线');
         return;
     }
 
-    // 检查距离是否太远
     if (route.tooFar) {
-        console.log('[语音导航]', route.message);
         addEventLog('导航', route.message);
-        // 发送文本给ESP32，由ESP32播放提示音
         await baiduTTS(route.message + '，请重新选择较近的地点');
         return;
     }
 
-    // 发送导航路线
     const navMsg = {
         status: 'ok',
         destination: route.destination,
@@ -1264,11 +1120,9 @@ async function handleVoiceNavigationAdvanced(text) {
 
     if (mqttClient && AppState.mqttConnected) {
         mqttClient.publish(MQTT_CONFIG.topics.navSteps, JSON.stringify(navMsg));
-        console.log('[语音导航] 导航路线已发送:', route.steps.length, '步');
         addEventLog('导航', `开始导航到 ${route.destination}，共${route.steps.length}步，${Math.round(route.distance)}米`);
     }
 
-    // 发送导航播报文本给ESP32，由ESP32功放播放
     const firstStep = route.steps[0] || '开始导航';
     const ttsText = `开始导航到${route.destination}，全程${Math.round(route.distance)}米，预计${Math.round(route.duration / 60)}分钟，${firstStep}`;
     await baiduTTS(ttsText);
@@ -1279,17 +1133,12 @@ async function handleVoiceNavigationAdvanced(text) {
 
 // ================= 停止导航功能 =================
 
-/**
- * 停止当前导航
- * 发送停止指令到 ESP32，并更新前端状态
- */
 function stopNavigation() {
     if (!mqttClient || !AppState.mqttConnected) {
         showToast('MQTT未连接，无法发送停止指令');
         return;
     }
 
-    // 发送停止导航指令
     const stopMsg = {
         nav_active: false,
         status: 'stop',
@@ -1301,12 +1150,8 @@ function stopNavigation() {
 
     mqttClient.publish(MQTT_CONFIG.topics.navSteps, JSON.stringify(stopMsg), (err) => {
         if (err) {
-            console.error('[导航] 停止指令发送失败:', err);
             showToast('停止导航失败，请重试');
         } else {
-            console.log('[导航] 停止指令已发送');
-
-            // 更新前端状态
             updateNavigationSteps({
                 nav_active: false,
                 steps: [],
@@ -1315,37 +1160,32 @@ function stopNavigation() {
             });
 
             showToast('导航已停止');
-            addEventLog('用户手动停止导航', 'info');
+            addEventLog('导航', '用户手动停止导航');
         }
     });
 }
 
 // ================= 新增：初始化时播放开机播报 =================
 
-// 导出函数供外部使用（如果需要）
+// 导出函数供外部使用
 if (typeof window !== 'undefined') {
     window.extractDestinationAdvanced = extractDestinationAdvanced;
     window.planRouteToNearest = planRouteToNearest;
-    window.playStartupSound = playStartupSound;
     window.handleVoiceNavigationAdvanced = handleVoiceNavigationAdvanced;
     window.addEventLog = addEventLog;
     window.clearEventLog = clearEventLog;
     window.clearChatHistory = clearChatHistory;
     window.clearNavHistory = clearNavHistory;
-    window.stopNavigation = stopNavigation;  // 导出停止导航函数
+    window.stopNavigation = stopNavigation;
 }
 
 // ================= 新增：常住地设置功能 =================
 
-/**
- * 打开设置弹窗
- */
 function openSettings() {
     const modal = document.getElementById('settingsModal');
     const currentCityDiv = document.getElementById('currentHomeCity');
     const homeCityInput = document.getElementById('homeCityInput');
 
-    // 加载当前常住地
     const savedCity = localStorage.getItem('homeCity') || API_CONFIG.homeCity;
     if (currentCityDiv) {
         currentCityDiv.textContent = savedCity;
@@ -1356,20 +1196,13 @@ function openSettings() {
     }
 
     modal.style.display = 'flex';
-    console.log('[设置] 打开设置弹窗，当前常住地:', savedCity);
 }
 
-/**
- * 关闭设置弹窗
- */
 function closeSettings() {
     const modal = document.getElementById('settingsModal');
     modal.style.display = 'none';
 }
 
-/**
- * 保存常住地设置
- */
 function saveSettings() {
     const homeCityInput = document.getElementById('homeCityInput');
     const newCity = homeCityInput.value.trim();
@@ -1379,14 +1212,10 @@ function saveSettings() {
         return;
     }
 
-    // 保存到 localStorage
     localStorage.setItem('homeCity', newCity);
-
-    // 更新 API_CONFIG
     API_CONFIG.homeCity = newCity;
     AppState.config.homeCity = newCity;
 
-    // 通过 MQTT 发送给 ESP32
     if (mqttClient && AppState.mqttConnected) {
         const msg = JSON.stringify({
             type: 'home_city_update',
@@ -1394,10 +1223,8 @@ function saveSettings() {
             ts: Date.now()
         });
         mqttClient.publish('blindstick/config/home_city', msg);
-        console.log('[设置] 常住地已发送给ESP32:', newCity);
     }
 
-    // 更新显示
     const currentCityDiv = document.getElementById('currentHomeCity');
     if (currentCityDiv) {
         currentCityDiv.textContent = newCity;
@@ -1405,20 +1232,12 @@ function saveSettings() {
 
     showToast(`常住地已设置为：${newCity}`);
     closeSettings();
-
-    console.log('[设置] 常住地已保存:', newCity);
 }
 
-/**
- * 加载常住地设置（从 localStorage）
- */
 function loadHomeCitySettings() {
     const savedCity = localStorage.getItem('homeCity');
     if (savedCity) {
         API_CONFIG.homeCity = savedCity;
         AppState.config.homeCity = savedCity;
-        console.log('[设置] 已加载常住地:', savedCity);
-    } else {
-        console.log('[设置] 使用默认常住地:', API_CONFIG.homeCity);
     }
 }
