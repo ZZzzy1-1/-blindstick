@@ -1002,8 +1002,9 @@ void checkObstacleAndAlert() {
 
 // ==================== 辅助函数：使用PSRAM或普通内存分配 ====================
 void* allocateBuffer(size_t size) {
-    if (ESP.getPsramSize() > 0) {
-        return ps_malloc(size);
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    if (psram_free > size + 10000) {
+        return heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
     } else {
         return malloc(size);
     }
@@ -1379,9 +1380,10 @@ String doVoiceRecognition() {
 
     uint8_t* buffer = NULL;
 
-    // 优先使用PSRAM
-    if (ESP.getPsramSize() > 0) {
-        buffer = (uint8_t*)ps_malloc(RECORD_SIZE);
+    // 优先使用PSRAM（使用ESP-IDF风格API）
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    if (psram_free > RECORD_SIZE + 5000) {
+        buffer = (uint8_t*)heap_caps_malloc(RECORD_SIZE, MALLOC_CAP_SPIRAM);
     }
 
     // 如果PSRAM分配失败，尝试使用普通内存
@@ -1562,20 +1564,29 @@ void setup() {
     // ===== PSRAM 初始化（必须在内存分配前完成）=====
     bool psram_ok = psramInit();
 
+    // 检查PSRAM状态（使用ESP-IDF风格API）
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    Serial.printf("PSRAM Free: %d bytes (%d KB)\n", psram_free, psram_free / 1024);
+
     // 初始化TTS音频缓冲区（优先使用PSRAM）
-    if (psram_ok && ESP.getPsramSize() > 0) {
-        tts_rx_buf = (uint8_t*)ps_malloc(TTS_AUDIO_BUF_SIZE);
+    if (psram_ok && psram_free > TTS_AUDIO_BUF_SIZE + 10000) {
+        tts_rx_buf = (uint8_t*)heap_caps_malloc(TTS_AUDIO_BUF_SIZE, MALLOC_CAP_SPIRAM);
+        Serial.printf("TTS buffer allocated in PSRAM: %d KB\n", TTS_AUDIO_BUF_SIZE / 1024);
     } else {
         tts_rx_buf = (uint8_t*)malloc(TTS_AUDIO_BUF_SIZE);
+        Serial.printf("TTS buffer allocated in HEAP: %d KB\n", TTS_AUDIO_BUF_SIZE / 1024);
     }
 
     // 如果分配失败，尝试更小的缓冲区
     if (tts_rx_buf == NULL) {
         int smaller_size = 40 * 1024;  // 40KB
-        if (psram_ok && ESP.getPsramSize() > 0) {
-            tts_rx_buf = (uint8_t*)ps_malloc(smaller_size);
+        psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        if (psram_ok && psram_free > smaller_size + 5000) {
+            tts_rx_buf = (uint8_t*)heap_caps_malloc(smaller_size, MALLOC_CAP_SPIRAM);
+            Serial.printf("Using smaller TTS buffer in PSRAM: %d KB\n", smaller_size / 1024);
         } else {
             tts_rx_buf = (uint8_t*)malloc(smaller_size);
+            Serial.printf("Using smaller TTS buffer in HEAP: %d KB\n", smaller_size / 1024);
         }
     }
 
@@ -2016,21 +2027,17 @@ void handleTTSUrl(const char* payload, int length) {
         return;
     }
 
-    // 检查可用内存
-    size_t freeHeap = ESP.getFreeHeap();
-    size_t freePsram = ESP.getFreePsram();
-    Serial.printf("[TTS-URL] 可用内存: Heap=%d, PSRAM=%d, 需要=%d\n", freeHeap, freePsram, len);
+    // 检查可用内存（使用ESP-IDF风格API）
+    size_t freeHeap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    size_t freePsram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
 
     // 分配内存（优先使用PSRAM）
     uint8_t* audioBuffer = NULL;
-    if (ESP.getPsramSize() > 0 && freePsram > len + 10000) {  // 确保PSRAM有足够空间
-        audioBuffer = (uint8_t*)ps_malloc(len);
-        Serial.println("[TTS-URL] 使用PSRAM分配");
-    } else if (freeHeap > len + 50000) {  // 确保堆内存有足够空间（保留50KB给系统）
+    if (freePsram > len + 10000) {
+        audioBuffer = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+    } else if (freeHeap > len + 50000) {
         audioBuffer = (uint8_t*)malloc(len);
-        Serial.println("[TTS-URL] 使用堆内存分配");
     } else {
-        Serial.printf("[TTS-URL] 内存不足，跳过播放\n");
         http.end();
         if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
         return;
@@ -2168,15 +2175,11 @@ void handleTTSUrl(const char* payload, int length) {
 // ==================== 流式TTS实现（新版简化逻辑）====================
 
 void initStreamingTTS() {
-    if (ESP.getPsramSize() > 0) {
-        stream_buffer = (uint8_t*)ps_malloc(STREAM_BUF_SIZE);
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    if (psram_free > STREAM_BUF_SIZE + 10000) {
+        stream_buffer = (uint8_t*)heap_caps_malloc(STREAM_BUF_SIZE, MALLOC_CAP_SPIRAM);
     } else {
         stream_buffer = (uint8_t*)malloc(STREAM_BUF_SIZE);
-    }
-    if (stream_buffer) {
-        Serial.printf("[流式TTS] 缓冲区分配成功: %d字节\n", STREAM_BUF_SIZE);
-    } else {
-        Serial.println("[流式TTS] 缓冲区分配失败！");
     }
     stream_playing = false;
     stream_priority = 0;
