@@ -614,15 +614,15 @@ void processRadarPacket() {
     float diffAngle = angleLSA - angleFSA;
     if (diffAngle < 0) diffAngle += 360.0f;
 
-    // 重置三个方向的距离
+    // 重置三个方向的距离（注意：雷达安装方向导致左右相反）
     if (angleFSA >= ANG_FRONT_MIN || angleFSA <= ANG_FRONT_MAX) {
         frontDist = 200.0;
     }
     else if (angleFSA >= ANG_LEFT_MIN && angleFSA <= ANG_LEFT_MAX) {
-        leftDist = 200.0;  // 修正：左方区域对应leftDist
+        rightDist = 200.0;  // 左侧扇区对应rightDist（雷达安装方向）
     }
     else if (angleFSA >= ANG_RIGHT_MIN && angleFSA <= ANG_RIGHT_MAX) {
-        rightDist = 200.0;  // 修正：右方区域对应rightDist
+        leftDist = 200.0;   // 右侧扇区对应leftDist（雷达安装方向）
     }
 
     for (int i = 0; i < packet_lsn; i++) {
@@ -639,10 +639,10 @@ void processRadarPacket() {
                 if (cm < frontDist) frontDist = cm;
             }
             else if (currentAngle >= ANG_LEFT_MIN && currentAngle <= ANG_LEFT_MAX) {
-                if (cm < leftDist) leftDist = cm;  // 修正：左方区域存入leftDist
+                if (cm < rightDist) rightDist = cm;  // 左侧扇区存入rightDist
             }
             else if (currentAngle >= ANG_RIGHT_MIN && currentAngle <= ANG_RIGHT_MAX) {
-                if (cm < rightDist) rightDist = cm;  // 修正：右方区域存入rightDist
+                if (cm < leftDist) leftDist = cm;   // 右侧扇区存入leftDist
             }
         }
     }
@@ -1671,7 +1671,12 @@ void setup() {
     pinMode(MOTOR_IN1, OUTPUT); pinMode(MOTOR_IN2, OUTPUT); pinMode(MOTOR_PWM, OUTPUT);
     motorControl(0);
     pinMode(RADAR_M_CTR_PIN, OUTPUT);
-    digitalWrite(RADAR_M_CTR_PIN, HIGH);
+
+    // 雷达电机软启动（YDLIDAR X2需要PWM控制）
+    for(int speed = 0; speed < 200; speed += 10) {
+        analogWrite(RADAR_M_CTR_PIN, speed);
+        delay(20);
+    }
 
     nav_total_steps = 1;
     nav_steps[0] = "请说出目的地";
