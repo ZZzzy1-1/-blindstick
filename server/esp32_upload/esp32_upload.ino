@@ -1566,15 +1566,10 @@ String base64Encode(const uint8_t* data, size_t len) {
 // ==================== setup / loop ====================
 void setup() {
     Serial.begin(115200);
-    randomSeed(millis());  // 初始化随机数种子
-    Serial.printf("PSRAM:%d\n",ESP.getPsramSize());
-    Serial.printf("Free Heap:%d\n",ESP.getFreeHeap());
+    randomSeed(millis());
+
     // ===== PSRAM 初始化（必须在内存分配前完成）=====
-    if (psramInit()) {
-        size_t psram_total = ESP.getPsramSize();
-        size_t psram_free = ESP.getFreePsram();
-        Serial.printf("[系统] PSRAM: %dKB/%dKB\n", psram_free/1024, psram_total/1024);
-    }
+    psramInit();
 
     // 初始化TTS音频缓冲区（优先使用PSRAM）
     if (ESP.getPsramSize() > 0) {
@@ -1583,7 +1578,6 @@ void setup() {
         tts_rx_buf = (uint8_t*)malloc(TTS_AUDIO_BUF_SIZE);
     }
     if (tts_rx_buf == NULL) {
-        Serial.printf("[警告] TTS缓冲区分配失败(%dKB)，尝试分配更小缓冲区\n", TTS_AUDIO_BUF_SIZE/1024);
         // 尝试分配更小的缓冲区
         int smaller_size = 40 * 1024;  // 40KB
         if (ESP.getPsramSize() > 0) {
@@ -1591,11 +1585,6 @@ void setup() {
         } else {
             tts_rx_buf = (uint8_t*)malloc(smaller_size);
         }
-        if (tts_rx_buf) {
-            Serial.printf("[系统] 使用较小TTS缓冲区:%dKB\n", smaller_size/1024);
-        }
-    } else {
-        Serial.printf("[系统] TTS缓冲区分配成功:%dKB\n", TTS_AUDIO_BUF_SIZE/1024);
     }
 
     // ===== 从RTC内存恢复今日出行统计数据 =====
