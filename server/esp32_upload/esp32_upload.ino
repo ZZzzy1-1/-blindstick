@@ -1133,60 +1133,79 @@ void publishSensorData() {
     mqtt.publish(MQTT_TOPIC_SENSORS, json_buffer, n);
 }
 void RadarMotorUploadTask(void* pvParameters) {
+    Serial.println("[任务] RadarMotorUploadTask 启动");
+
     // 雷达使用Serial1（硬件串口）
     Serial1.begin(115200, SERIAL_8N1, RADAR_RX_PIN, -1);
+    Serial.printf("[雷达] Serial1初始化 RX=GPIO%d 波特率=115200\n", RADAR_RX_PIN);
 
-    // GPS改为软串口（原K230引脚GPIO37/38）
+    // GPS改为软串口
     gpsSerial.begin(9600);
-    Serial.println("[GPS] 软串口初始化完成 RX=GPIO37 TX=GPIO38");
+    Serial.println("[GPS] 软串口初始化完成");
 
-    // K230改为硬件串口UART1（GPIO9/10），用于接收音频数据
+    // K230硬件串口UART2
     k230Serial.begin(K230_UART_BAUD, SERIAL_8N1, K230_RX_PIN, K230_TX_PIN);
-    Serial.printf("[K230] 硬件串口UART%d初始化完成 RX=GPIO%d TX=GPIO%d 波特率=%d\n",
-                  K230_UART_ID, K230_RX_PIN, K230_TX_PIN, K230_UART_BAUD);
+    Serial.printf("[K230] UART%d初始化 RX=GPIO%d TX=GPIO%d\n",
+                  K230_UART_ID, K230_RX_PIN, K230_TX_PIN);
 
     unsigned long lastUpload = 0;
+    unsigned long lastStatusPrint = 0;
+    int radarByteCount = 0;
+
     while (true) {
-        while (Serial1.available()) {
-            uint8_t b = Serial1.read();
-            switch (lidar_state) {
-                case WAIT_HEADER_AA: if (b == 0xAA) lidar_state = WAIT_HEADER_55; break;
-                case WAIT_HEADER_55: if (b == 0x55) lidar_state = READ_CT; else if (b != 0xAA) lidar_state = WAIT_HEADER_AA; break;
-                case READ_CT: packet_ct = b; lidar_state = READ_LSN; break;
-                case READ_LSN: packet_lsn = b; payload_expected = 6 + packet_lsn * 2; payload_idx = 0; lidar_state = READ_PAYLOAD; break;
-                case READ_PAYLOAD: payload_buf[payload_idx++] = b; if (payload_idx >= payload_expected) { processRadarPacket(); lidar_state = WAIT_HEADER_AA; } break;
+        // 接收雷达数据
+        int availableBytes = Serial1.available();
+        if (availableBytes > 0) {
+            radarByteCount += availableBytes;
+            while (Serial1.available()) {
+                uint8_t b = Serial1.read();
+                switch (lidar_state) {
+                    case WAIT_HEADER_AA: if (b == 0xAA) lidar_state = WAIT_HEADER_55; break;
+                    case WAIT_HEADER_55: if (b == 0x55) lidar_state = READ_CT; else if (b != 0xAA) lidar_state = WAIT_HEADER_AA; break;
+                    case READ_CT: packet_ct = b; lidar_state = READ_LSN; break;
+                    case READ_LSN: packet_lsn = b; payload_expected = 6 + packet_lsn * 2; payload_idx = 0; lidar_state = READ_PAYLOAD; break;
+                    case READ_PAYLOAD: payload_buf[payload_idx++] = b; if (payload_idx >= payload_expected) { processRadarPacket(); lidar_state = WAIT_HEADER_AA; } break;
+                }
             }
         }
+
         parseGPSNMEA();
         processK230Data();
         unsigned long now = millis();
         smartAvoid();
 
+        // 每3秒打印一次状态
+        if (now - lastStatusPrint > 3000) {
+            lastStatusPrint = now;
+            Serial.printf("[状态] WiFi:%s MQTT:%s 雷达字节:%d 雷达F:%.0f\n",
+                WiFi.status() == WL_CONNECTED ? "连接" : "断开",
+                mqtt.connected() ? "连接" : "断开",
+                radarByteCount,
+                dir_smt[0]);
+            radarByteCount = 0;  // 重置计数
+        }
+
         if (WiFi.status() == WL_CONNECTED) {
-            // 确保 MQTT 连接成功
             if (!mqtt.connected()) {
                 mqtt_reconnect();
             }
 
             if (mqtt.connected()) {
-                mqtt.loop();  // 保活
+                mqtt.loop();
 
-                // 检查TTS请求超时（防止卡死）
                 if (getTTSRequesting() && (millis() - tts_request_start_time > TTS_REQUEST_TIMEOUT_MS)) {
                     setTTSRequesting(false);
                 }
 
-                // 障碍物检测和语音告警（独立控制频率）
                 checkObstacleAndAlert();
 
-                // 数据上传 - 每200ms一次，与语音播报频率无关
                 if (now - lastUpload >= UPLOAD_INTERVAL_MS) {
                     lastUpload = now;
                     publishSensorData();
                 }
             }
         }
-        vTaskDelay(15 / portTICK_PERIOD_MS);
+        vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 }
 
