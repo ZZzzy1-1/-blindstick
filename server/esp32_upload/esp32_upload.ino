@@ -96,12 +96,11 @@ static const uint8_t YDLIDAR_CMD_RESET[] = { 0xA5, 0x40, 0x00, 0x40, 0x01, 0x00,
 SoftwareSerial gpsSerial(GPS_SOFT_RX_PIN, GPS_SOFT_TX_PIN);  // GPS软串口
 
 // ==================== K230硬件串口配置 ====================
-// K230使用硬件串口UART1，GPIO9/10
 #define K230_UART_ID        1      // UART1
 #define K230_UART_BAUD      115200
-#define K230_RX_PIN         38      // K230 TX → ESP32 GPIO38 (UART1 RX)
-#define K230_TX_PIN         37    // K230 RX → ESP32 GPIO37 (UART1 TX)
-HardwareSerial k230Serial(2);      // K230硬件串口
+#define K230_RX_PIN         15      // K230 TX → ESP32 GPIO15 (UART1 RX)
+#define K230_TX_PIN         7       // K230 RX → ESP32 GPIO7 (UART1 TX)
+HardwareSerial k230Serial(1);      // K230硬件串口使用UART1
 
 #define RECORD_BUTTON_PIN  0
 
@@ -557,10 +556,11 @@ void sendK230_TTSRequest(const char* targetName) {
 }
 
 /**
- * 处理从K230接收的数据（仅检测数据）
+ * 处理从K230接收的数据（仅检测数据）- 限制每次处理的最大字符数避免阻塞
  */
 void processK230Data() {
-    while (k230Serial.available() > 0) {
+    int maxChars = 100;  // 每次最多处理100个字符，避免阻塞
+    while (k230Serial.available() > 0 && maxChars-- > 0) {
         char c = k230Serial.read();
 
         if (c == '\n') {
@@ -1141,12 +1141,11 @@ void RadarMotorUploadTask(void* pvParameters) {
                 mqtt_reconnect();
             }
 
-        if (mqtt.connected()) {
+            if (mqtt.connected()) {
                 mqtt.loop();  // 保活
 
                 // 检查TTS请求超时（防止卡死）
                 if (getTTSRequesting() && (millis() - tts_request_start_time > TTS_REQUEST_TIMEOUT_MS)) {
-                    Serial.println("[TTS] 请求超时，重置标志");
                     setTTSRequesting(false);
                 }
 
