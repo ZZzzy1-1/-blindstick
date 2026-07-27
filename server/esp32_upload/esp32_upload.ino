@@ -1377,28 +1377,19 @@ String doVoiceRecognition() {
     // 录音3秒 = 96KB (16000Hz * 2字节 * 3秒)
     const int RECORD_SIZE = 16000 * 2 * 3;
 
-    // 检查内存是否足够
-    size_t freeHeap = ESP.getFreeHeap();
-    size_t freePsram = ESP.getFreePsram();
-    if (ESP.getPsramSize() > 0 && freePsram < RECORD_SIZE + 5000) {
-        Serial.println("[ASR] PSRAM不足，跳过识别");
-        return "";
-    } else if (ESP.getPsramSize() == 0 && freeHeap < RECORD_SIZE + 30000) {
-        Serial.println("[ASR] 内存不足，跳过识别");
-        return "";
-    }
-
     uint8_t* buffer = NULL;
 
     // 优先使用PSRAM
     if (ESP.getPsramSize() > 0) {
         buffer = (uint8_t*)ps_malloc(RECORD_SIZE);
-    } else {
+    }
+
+    // 如果PSRAM分配失败，尝试使用普通内存
+    if (!buffer) {
         buffer = (uint8_t*)malloc(RECORD_SIZE);
     }
 
     if (!buffer) {
-        Serial.println("[ASR] 内存分配失败");
         return "";
     }
 
