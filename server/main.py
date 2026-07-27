@@ -28,8 +28,8 @@ try:
     # 使用UART2，GPIO5/6
     K230_UART_ID = 2          # UART2（不是UART1）
     K230_UART_BAUD = 115200
-    K230_UART_TX_PIN = 5      # GPIO5
-    K230_UART_RX_PIN = 6      # GPIO6
+    K230_UART_TX_PIN = 5      # GPIO5 -> ESP32 RX
+    K230_UART_RX_PIN = 6      # GPIO6 -> ESP32 TX（可选）
     uart = UART(K230_UART_ID, K230_UART_BAUD, tx=K230_UART_TX_PIN, rx=K230_UART_RX_PIN)
     K230_UART_AVAILABLE = True
     print(f"[串口] UART{K230_UART_ID} 初始化 TX=GPIO{K230_UART_TX_PIN} RX=GPIO{K230_UART_RX_PIN} 波特={K230_UART_BAUD}")
@@ -73,9 +73,11 @@ def send_detections_uart(detections):
     """
     通过 UART 将检测结果发送给 ESP32
     单目标简单格式：DET:类名\n
-    多目标扩展格式：DETS:类1,置信度1,x1,y1,w1,h1;类2,置信度2,x2,y2,w2,h2\n
-    无检测：NONE\n    """
-    if not K230_UART_AVAILABLE: return
+    多目标扩展格式：DETS:类1,置信度1,x1,y1,w1,h1;类2,置信度2,x2,y2,w2,h2
+    无检测：NONE
+    """
+    if not K230_UART_AVAILABLE:
+        return
     try:
         if not detections or len(detections) == 0:
             line = "NONE\n"
@@ -96,7 +98,8 @@ def send_detections_uart(detections):
                 parts.append("{},{},{},{},{},{}".format(cls, conf, cx, cy, w, h))
             line = "DETS:" + ";".join(parts) + "\n"
 
-        uart.write(line.encode('utf-8'))
+        # MicroPython UART 直接接受字符串
+        uart.write(line)
         print("[串口→ESP32]", line.strip())
     except Exception as e:
         print("[串口] 发送失败:", e)
