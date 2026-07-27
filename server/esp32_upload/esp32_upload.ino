@@ -744,6 +744,7 @@ bool mqtt_reconnect_nonblocking() {
     espClient.setHandshakeTimeout(12);
 
     if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
+        Serial.println("[MQTT] 连接成功!");
         mqtt.subscribe(MQTT_TOPIC_TTS_AUDIO);
         mqtt.subscribe("blindstick/tts/control");
         mqtt.subscribe("blindstick/tts/stream/+");
@@ -765,6 +766,7 @@ bool mqtt_reconnect_nonblocking() {
     } else {
         retry_count++;
         if (retry_count >= 10) retry_count = 0;
+        Serial.printf("[MQTT] 连接失败，重试次数:%d\n", retry_count);
         return false;
     }
 }
@@ -1127,10 +1129,14 @@ void publishSensorData() {
 
     size_t n = serializeJson(doc, json_buffer, sizeof(json_buffer));
     if (n == 0 || n >= sizeof(json_buffer)) {
+        Serial.println("[MQTT] JSON序列化失败");
         return;
     }
 
-    mqtt.publish(MQTT_TOPIC_SENSORS, json_buffer, n);
+    bool published = mqtt.publish(MQTT_TOPIC_SENSORS, json_buffer, n);
+    if (!published) {
+        Serial.println("[MQTT] 发布失败!");
+    }
 }
 void RadarMotorUploadTask(void* pvParameters) {
     Serial.println("[任务] RadarMotorUploadTask 启动");
