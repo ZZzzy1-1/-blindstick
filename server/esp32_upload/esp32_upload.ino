@@ -1569,18 +1569,19 @@ void setup() {
     randomSeed(millis());
 
     // ===== PSRAM 初始化（必须在内存分配前完成）=====
-    psramInit();
+    bool psram_ok = psramInit();
 
     // 初始化TTS音频缓冲区（优先使用PSRAM）
-    if (ESP.getPsramSize() > 0) {
+    if (psram_ok && ESP.getPsramSize() > 0) {
         tts_rx_buf = (uint8_t*)ps_malloc(TTS_AUDIO_BUF_SIZE);
     } else {
         tts_rx_buf = (uint8_t*)malloc(TTS_AUDIO_BUF_SIZE);
     }
+
+    // 如果分配失败，尝试更小的缓冲区
     if (tts_rx_buf == NULL) {
-        // 尝试分配更小的缓冲区
         int smaller_size = 40 * 1024;  // 40KB
-        if (ESP.getPsramSize() > 0) {
+        if (psram_ok && ESP.getPsramSize() > 0) {
             tts_rx_buf = (uint8_t*)ps_malloc(smaller_size);
         } else {
             tts_rx_buf = (uint8_t*)malloc(smaller_size);
