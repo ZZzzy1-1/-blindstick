@@ -243,6 +243,11 @@ volatile int current_step_idx = 0;
 volatile int current_progress = 0;
 volatile bool nav_active = false;
 
+// 导航步骤坐标（用于GPS实时导航）
+float nav_step_lats[10] = {0};
+float nav_step_lngs[10] = {0};
+volatile bool nav_using_gps = false;  // 是否使用GPS导航
+
 volatile bool  is_blocked  = false;
 volatile bool  is_ai_talking = false;
 volatile bool  is_tts_requesting = false;  // TTS请求状态标志，防止重复发送
@@ -995,18 +1000,20 @@ void checkObstacleAndAlert() {
             return;
         }
 
-        // 避障语音使用云端TTS生成
+        // 避障语音 - 通过MQTT发送给后端生成
         if (mqtt.connected()) {
             StaticJsonDocument<256> ttsDoc;
             char buf[256];
             ttsDoc["text"] = alert_text;
-            ttsDoc["priority"] = PRIO_HIGH;  // 避障使用高优先级
+            ttsDoc["priority"] = PRIO_HIGH;  // 高优先级避障
             size_t len = serializeJson(ttsDoc, buf, sizeof(buf));
             mqtt.publish(MQTT_TOPIC_TTS_REQ, buf, len);
 
             // 增加障碍物提醒次数统计
             obstacle_count++;
             saveStatsToRTC();
+
+            Serial.printf("[避障] 发送TTS请求: %s\n", alert_text.c_str());
         }
 
         // 更新记录
@@ -1215,10 +1222,12 @@ void RadarMotorUploadTask(void* pvParameters) {
     }
 }
 
-// ==================== Core 1 导航任务（带路口播报）====================
+// ==================== Core 1 导航任务（基于GPS实时位置）====================
 void NavigationTask(void* pvParameters) {
-    Serial.println("[导航] 启动");
+    Serial.println("[导航] 启动（GPS实时导航）");
     static int last_step_idx = -1;
+    static unsigned long lastDistanceCheck = 0;
+    const float STEP_REACHED_DISTANCE = 30.0;  // 到达步骤的距离阈值（米）
 
     while (true) {
         int total = nav_total_steps;
@@ -1252,20 +1261,35 @@ void NavigationTask(void* pvParameters) {
                 }
             }
 
-            if (current_progress < 100) {
-                if (is_blocked || is_ai_talking) {
-                    vTaskDelay(200 / portTICK_PERIOD_MS);
-                    continue;
+            // GPS实时导航：计算与下一步目标的距离
+            if (nav_using_gps && current_step_idx < total) {
+                unsigned long now = millis();
+                if (now - lastDistanceCheck > 2000) {  // 每2秒检查一次距离
+                    lastDistanceCheck = now;
+
+                    float targetLat = nav_step_lats[current_step_idx];
+                    float targetLng = nav_step_lngs[current_step_idx];
+
+                    if (gps_lat > 1.0 && gps_lng > 1.0 && targetLat > 1.0 && targetLng > 1.0) {
+                        float dist = calcDistance(gps_lat, gps_lng, targetLat, targetLng);
+                        Serial.printf("[导航] 距离目标%d: %.0f米\n", current_step_idx, dist);
+
+                        if (dist < STEP_REACHED_DISTANCE) {
+                            // 到达当前步骤，进入下一步
+                            current_progress = 100;  // 标记为完成
+                        }
+                    }
                 }
-                // 每3秒增加5%进度，一步约60秒
-                vTaskDelay(3000 / portTICK_PERIOD_MS);
-                current_progress += 5;
-            } else {
+            }
+
+            // 检查步骤进度
+            if (current_progress >= 100) {
                 current_progress = 0;
                 current_step_idx++;
 
                 if (current_step_idx >= total) {
                     nav_active = false;
+                    nav_using_gps = false;
                     nav_total_steps = 1;
                     nav_steps[0] = "导航完成，请说出新目的地";
                     last_step_idx = -1;
@@ -1282,6 +1306,8 @@ void NavigationTask(void* pvParameters) {
                     }
                 }
                 vTaskDelay(1000 / portTICK_PERIOD_MS);
+            } else {
+                vTaskDelay(500 / portTICK_PERIOD_MS);  // 正常检查间隔
             }
         } else {
             current_step_idx = 0;
@@ -1289,7 +1315,6 @@ void NavigationTask(void* pvParameters) {
             last_step_idx = -1;
             vTaskDelay(1000 / portTICK_PERIOD_MS);
         }
-        vTaskDelay(50 / portTICK_PERIOD_MS);
     }
 }
 
@@ -1923,9 +1948,21 @@ bool planWalkingRoute(float destLat, float destLng, String& destName) {
         instruction.replace("<font color='red'>", "");
         instruction.replace("</font>", "");
         nav_steps[i] = instruction;
+
+        // 保存步骤起点坐标（用于GPS导航）
+        const char* step_path = steps[i]["path"];
+        if (step_path && strlen(step_path) > 0) {
+            // path格式: "lat,lng;lat,lng;..."
+            sscanf(step_path, "%f,%f", &nav_step_lats[i], &nav_step_lngs[i]);
+        } else {
+            // 如果没有path，使用起点或终点
+            nav_step_lats[i] = (i == 0) ? originLat : destLat;
+            nav_step_lngs[i] = (i == 0) ? originLng : destLng;
+        }
     }
 
     nav_active = true;
+    nav_using_gps = true;  // 启用GPS导航
     current_step_idx = 0;
     current_progress = 0;
 
