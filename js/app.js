@@ -775,7 +775,6 @@ function addNavHistory(destination, steps) {
     // 标记导航刚开始（防止第一次路线被算作调整）
     AppState.navJustStarted = true;
 }
-}
 
 // ================= 初始化 =================
 function initClock() {
