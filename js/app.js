@@ -528,10 +528,10 @@ function updateRadarCircles(front, left, right) {
     const barLeft = document.getElementById('barLeft');
     const barRight = document.getElementById('barRight');
 
-    // 显示 -- 如果数据为null，否则显示数值
-    if (valFront) valFront.textContent = front !== null ? Math.round(front) + 'cm' : '--';
-    if (valLeft) valLeft.textContent = left !== null ? Math.round(left) + 'cm' : '--';
-    if (valRight) valRight.textContent = right !== null ? Math.round(right) + 'cm' : '--';
+    // 显示 400cm 如果数据为null，否则显示实际数值
+    if (valFront) valFront.textContent = front !== null ? Math.round(front) + 'cm' : '400cm';
+    if (valLeft) valLeft.textContent = left !== null ? Math.round(left) + 'cm' : '400cm';
+    if (valRight) valRight.textContent = right !== null ? Math.round(right) + 'cm' : '400cm';
 
     // 更新进度条（如果数据有效）
     if (barFront && front !== null) updateRadarBar(barFront, front);
