@@ -656,6 +656,13 @@ void processRadarPacket() {
     frontDist = dir_smt[0];
     leftDist = dir_smt[1];
     rightDist = dir_smt[2];
+
+    // 调试输出雷达数据（每1秒输出一次）
+    static unsigned long lastRadarDebug = 0;
+    if (millis() - lastRadarDebug > 1000) {
+        lastRadarDebug = millis();
+        Serial.printf("[雷达数据] 前:%.0fcm 左:%.0fcm 右:%.0fcm\n", dir_smt[0], dir_smt[1], dir_smt[2]);
+    }
 }
 
 void parseGPSNMEA() {
@@ -906,6 +913,16 @@ void checkObstacleAndAlert() {
     float L = dir_smt[1];
     float R = dir_smt[2];
 
+    // 调试输出（每2秒一次）
+    static unsigned long lastObstacleDebug = 0;
+    if (millis() - lastObstacleDebug > 2000) {
+        lastObstacleDebug = millis();
+        Serial.printf("[避障检测] F:%.0f(%s) L:%.0f(%s) R:%.0f(%s)\n",
+            f, f < 80.0f ? "警告" : "正常",
+            L, L < 50.0f ? "警告" : "正常",
+            R, R < 50.0f ? "警告" : "正常");
+    }
+
     // 阈值定义
     const float FRONT_ALERT_CM = 80.0f;
     const float SIDE_ALERT_CM = 50.0f;
@@ -1075,6 +1092,14 @@ void publishSensorData() {
     gps["lng"] = gps_lng;
     gps["satellites"] = gps_satellites;  // 统一字段名与前端一致
     gps["speed"] = gps_speed;            // 添加速度字段
+
+    // 调试输出（每5秒一次）
+    static unsigned long lastPublishDebug = 0;
+    if (millis() - lastPublishDebug > 5000) {
+        lastPublishDebug = millis();
+        Serial.printf("[MQTT上传] 雷达 F:%.0f L:%.0f R:%.0f GPS:%.6f,%.6f\n",
+            dir_smt[0], dir_smt[1], dir_smt[2], gps_lat, gps_lng);
+    }
 
     // K230视觉检测数据 - 发送最新检测到的目标（取第一个）
     if (k230_detection_count > 0 && millis() - k230_detections[0].timestamp < 5000) {
