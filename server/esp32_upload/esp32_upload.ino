@@ -1904,21 +1904,11 @@ void handleVoiceCommand(const char* text) {
     // 提取目的地
     String destination = extractDestination(text);
 
-    // 如果没有触发词，尝试直接使用识别文本作为目的地
+    // 如果没有触发词，提示用户
     if (destination.length() < 2) {
-        Serial.println("[语音识别] 无触发词，尝试直接搜索...");
-        destination = String(text);
-        // 去除标点和常见语气词
-        destination.replace("。", "");
-        destination.replace("，", "");
-        destination.replace("！", "");
-        destination.replace("？", "");
-        destination.replace("啊", "");
-        destination.replace("吧", "");
-        destination.replace("呢", "");
-        destination.replace("吗", "");
-        destination.replace("哦", "");
-        destination.trim();
+        Serial.println("[语音识别] 无触发词，忽略");
+        // 可选：播放提示音告诉用户需要说触发词
+        return;
     }
 
     if (destination.length() < 2) {
