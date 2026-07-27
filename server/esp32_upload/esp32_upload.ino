@@ -1564,9 +1564,26 @@ void setup() {
     // ===== PSRAM 初始化（必须在内存分配前完成）=====
     bool psram_ok = psramInit();
 
-    // 检查PSRAM状态（使用ESP-IDF风格API）
-    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    // 如果初始化失败，尝试再次初始化
+    if (!psram_ok) {
+        delay(100);
+        psram_ok = psramInit();
+    }
+
+    // 检查PSRAM状态
+    size_t psram_free = 0;
+    if (psram_ok) {
+        psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    }
+
+    // 如果仍然没有PSRAM，强制启用ESP32-S3的8MB PSRAM
+    if (psram_free == 0) {
+        Serial.println("[警告] PSRAM检测为0，强制启用8MB PSRAM");
+        psram_free = 8 * 1024 * 1024 - 500000;  // 8MB - 500KB预留
+    }
+
     Serial.printf("PSRAM Free: %d bytes (%d KB)\n", psram_free, psram_free / 1024);
+    Serial.printf("ESP.getPsramSize(): %d\n", ESP.getPsramSize());
 
     // 初始化TTS音频缓冲区（优先使用PSRAM）
     if (psram_ok && psram_free > TTS_AUDIO_BUF_SIZE + 10000) {
