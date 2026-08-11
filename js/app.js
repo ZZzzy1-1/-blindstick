@@ -282,6 +282,14 @@ let mqttClient = null;
 
 // ================= MQTT 连接 =================
 function connectMQTT() {
+    // 检查 MQTT 库是否加载
+    if (typeof mqtt === 'undefined') {
+        console.error('[MQTT] mqtt.min.js 未加载');
+        showToast('MQTT库加载失败，请刷新页面');
+        return;
+    }
+    console.log('[MQTT] 库版本:', mqtt.VERSION || 'unknown');
+
     const url = `wss://${MQTT_CONFIG.host}:${MQTT_CONFIG.port}${MQTT_CONFIG.path}`;
 
     try {
@@ -291,8 +299,12 @@ function connectMQTT() {
             password: MQTT_CONFIG.password,
             clean: true,
             reconnectPeriod: 5000,
-            connectTimeout: 10000
+            connectTimeout: 10000,
+            rejectUnauthorized: false,  // 允许自签名证书
+            protocolVersion: 4,  // MQTT 3.1.1
+            keepalive: 60
         });
+        console.log('[MQTT] 正在连接:', url);
     } catch (e) {
         console.error('[MQTT] 连接失败:', e);
         showToast('MQTT连接失败，请刷新重试');
@@ -302,11 +314,16 @@ function connectMQTT() {
     mqttClient.on('connect', () => {
         AppState.mqttConnected = true;
         showToast('已接入 MQTT 数据流');
+        console.log('[MQTT] 连接成功，ClientId:', MQTT_CONFIG.clientId);
 
         // 订阅主题
         Object.values(MQTT_CONFIG.topics).forEach(topic => {
             mqttClient.subscribe(topic, (err) => {
-                if (err) console.error('[MQTT] 订阅失败:', topic, err);
+                if (err) {
+                    console.error('[MQTT] 订阅失败:', topic, err);
+                } else {
+                    console.log('[MQTT] 订阅成功:', topic);
+                }
             });
         });
     });
@@ -328,6 +345,16 @@ function connectMQTT() {
     mqttClient.on('reconnect', () => {
         showToast('MQTT 重连中...');
     });
+
+    mqttClient.on('close', () => {
+        console.log('[MQTT] 连接关闭');
+        AppState.mqttConnected = false;
+    });
+
+    mqttClient.on('disconnect', () => {
+        console.log('[MQTT] 断开连接');
+        AppState.mqttConnected = false;
+    });
 }
 
 // ================= MQTT 消息处理 =================
@@ -335,7 +362,20 @@ async function handleMqttMessage(topic, payload) {
     try {
         // --- 传感器数据 ---
         if (topic === MQTT_CONFIG.topics.sensors) {
-            const msg = JSON.parse(payload.toString());
+            let msg;
+            try {
+                msg = JSON.parse(payload.toString());
+            } catch (parseErr) {
+                console.error('[MQTT] JSON解析失败:', parseErr.message, payload.toString().substring(0, 100));
+                return;
+            }
+
+            // 调试输出（每5秒显示一次原始数据）
+            const now = Date.now();
+            if (!window.lastDebugTime || now - window.lastDebugTime > 5000) {
+                window.lastDebugTime = now;
+                console.log('[MQTT] 收到传感器数据:', JSON.stringify(msg, null, 2));
+            }
 
             // 标记收到真实数据
             if (!AppState.deviceStarted) {
@@ -345,11 +385,15 @@ async function handleMqttMessage(topic, payload) {
 
             // 设备状态 - 根据真实传感器数据推断
             const hasVisionData = !!(msg.k230_class && msg.k230_class !== 'none' && msg.k230_class !== 'null');
+            const hasRadarData = !!(msg.radar && (msg.radar.f !== undefined || msg.radar.front !== undefined));
+            const hasGpsData = !!(msg.gps && (msg.gps.lat > 1.0 || msg.gps.lng > 1.0));
+            const hasGpsSats = !!(msg.gps && (msg.gps.satellites > 0 || msg.gps.sats > 0));
+
             const deviceStatus = {
                 main: true,
                 vision: hasVisionData,
-                radar: !!(msg.radar && (msg.radar.f !== undefined || msg.radar.front !== undefined)),
-                gps: !!(msg.gps && (msg.gps.satellites > 0 || msg.gps.sats > 0)),
+                radar: hasRadarData,
+                gps: hasGpsData || hasGpsSats,
                 voice: true
             };
             updateModuleStatus(deviceStatus);
@@ -1239,4 +1283,22 @@ function loadHomeCitySettings() {
         API_CONFIG.homeCity = savedCity;
         AppState.config.homeCity = savedCity;
     }
+}
+
+// ================= 手动重连 MQTT =================
+function reconnectMQTT() {
+    if (mqttClient) {
+        console.log('[MQTT] 手动断开并重连...');
+        mqttClient.end(true, () => {
+            console.log('[MQTT] 已断开，重新连接...');
+            connectMQTT();
+        });
+    } else {
+        connectMQTT();
+    }
+}
+
+// 导出到全局供HTML调用
+if (typeof window !== 'undefined') {
+    window.reconnectMQTT = reconnectMQTT;
 }

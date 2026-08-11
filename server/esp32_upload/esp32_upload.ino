@@ -90,9 +90,12 @@ static const uint8_t YDLIDAR_CMD_STOP[]  = { 0xA5, 0x65, 0x00, 0x65, 0x01, 0x00,
 static const uint8_t YDLIDAR_CMD_RESET[] = { 0xA5, 0x40, 0x00, 0x40, 0x01, 0x00, 0x40, 0x97 };
 
 // ==================== GPS软串口配置 ====================
-// GPS改为软串口（原K230引脚）
-#define GPS_SOFT_RX_PIN     16   // GPS TX → ESP32 GPIO37 (软串口RX)
-#define GPS_SOFT_TX_PIN     17   // GPS RX → ESP32 GPIO38 (软串口TX)
+// GPS使用软串口
+// GPS TX → ESP32 GPIO16 (软串口RX)
+// GPS RX → ESP32 GPIO17 (软串口TX)
+#define GPS_SOFT_RX_PIN     16
+#define GPS_SOFT_TX_PIN     17
+#define GPS_BAUD_RATE       9600
 SoftwareSerial gpsSerial(GPS_SOFT_RX_PIN, GPS_SOFT_TX_PIN);  // GPS软串口
 
 // ==================== K230硬件串口配置 ====================
@@ -224,7 +227,7 @@ const char* getPrioName(int p) {
 #define ANG_RIGHT_MIN  250
 #define ANG_RIGHT_MAX  290
 
-#define UPLOAD_INTERVAL_MS  200
+#define UPLOAD_INTERVAL_MS  500  // 500ms上传一次，避免网络拥塞
 #define STEER_MAX_PWM  255
 
 // ==================== TTS 配置 ====================
@@ -292,14 +295,8 @@ float gps_speed = 0.0;
 int   gps_heading = 0;
 int   gps_satellites = 0;
 volatile unsigned long gps_byte_count = 0;   // GPS软串口累计收到字节数（诊断用）
-
-// GPS 波特率自动检测（软串口可能收不到默认波特率的数据）
-const int gps_baud_table[] = {115200, 9600, 38400, 4800};
-const int gps_baud_count = 4;
-int   gps_baud_index = 0;        // 当前尝试的波特率索引
-bool  gps_baud_locked = false;   // 是否已锁定正确的波特率
 bool  gps_got_nmea = false;      // 是否收到过有效NMEA（$开头）
-unsigned long gps_baud_try_start = 0;  // 当前波特率尝试开始时间
+unsigned long gps_last_nmea_time = 0;  // 上次收到NMEA的时间
 
 // 常住地设置（默认黄石市，可通过MQTT更新）
 String home_city = "黄石市";
@@ -757,11 +754,18 @@ bool mqtt_reconnect_nonblocking() {
     // 配置MQTT客户端参数
     mqtt.setSocketTimeout(10);
     mqtt.setKeepAlive(60);
-    mqtt.setBufferSize(131072);
+    // 注意：PubSubClient默认buffer是256字节，如果JSON超过这个大小会发布失败
+    // 这里增加到512字节，JSON数据通常在300-400字节左右
+    if (!mqtt.setBufferSize(512)) {
+        Serial.println("[MQTT] Buffer分配失败，使用默认256字节");
+    }
     espClient.setInsecure();
     espClient.setHandshakeTimeout(12);
 
+    Serial.printf("[MQTT] 正在连接 %s:%d...\n", MQTT_BROKER, MQTT_PORT);
+
     if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
+        Serial.println("[MQTT] 连接成功");
         mqtt.subscribe(MQTT_TOPIC_TTS_AUDIO);
         mqtt.subscribe("blindstick/tts/control");
         mqtt.subscribe("blindstick/tts/stream/+");
@@ -782,7 +786,9 @@ bool mqtt_reconnect_nonblocking() {
         return true;
     } else {
         retry_count++;
-        if (retry_count >= 10) retry_count = 0;
+        if (retry_count % 5 == 0) {  // 每5次重试打印一次错误
+            Serial.printf("[MQTT] 连接失败，重试次数:%d\n", retry_count);
+        }
         return false;
     }
 }
@@ -1146,10 +1152,31 @@ void publishSensorData() {
 
     size_t n = serializeJson(doc, json_buffer, sizeof(json_buffer));
     if (n == 0 || n >= sizeof(json_buffer)) {
+        Serial.printf("[MQTT] JSON序列化失败或过大: %d字节\n", n);
         return;
     }
 
-    mqtt.publish(MQTT_TOPIC_SENSORS, json_buffer, n);
+    // 检查是否超过MQTT buffer大小
+    if (n > 512) {
+        Serial.printf("[MQTT] JSON超过512字节限制: %d字节，将被截断或失败\n", n);
+    }
+
+    // 调试输出JSON内容（每10秒一次）
+    static unsigned long lastJsonDebug = 0;
+    if (millis() - lastJsonDebug > 10000) {
+        lastJsonDebug = millis();
+        Serial.printf("[MQTT] 发布JSON %d字节: %.100s...\n", n, json_buffer);
+    }
+
+    // PubSubClient只支持QoS 0发布
+    bool published = mqtt.publish(MQTT_TOPIC_SENSORS, json_buffer, n, false);
+    if (!published) {
+        static unsigned long lastFailDebug = 0;
+        if (millis() - lastFailDebug > 5000) {
+            lastFailDebug = millis();
+            Serial.println("[MQTT] 发布失败，可能buffer不足或连接中断");
+        }
+    }
 }
 void RadarMotorUploadTask(void* pvParameters) {
     Serial.println("[任务] RadarMotorUploadTask 启动");
@@ -1158,12 +1185,13 @@ void RadarMotorUploadTask(void* pvParameters) {
     Serial1.begin(115200, SERIAL_8N1, RADAR_RX_PIN, -1);
     Serial.printf("[雷达] Serial1初始化 RX=GPIO%d 波特率=115200\n", RADAR_RX_PIN);
 
-    // GPS改为软串口（波特率自动检测）
-    gps_baud_index = 0;
-    gpsSerial.begin(gps_baud_table[gps_baud_index]);
+    // GPS软串口初始化（固定波特率9600，更稳定）
+    gpsSerial.begin(GPS_BAUD_RATE);
     gpsSerial.listen();  // 必须listen才会开始接收RX数据
-    gps_baud_try_start = millis();
-    Serial.printf("[GPS] 软串口初始化，尝试波特率=%d\n", gps_baud_table[gps_baud_index]);
+#if defined(ESP32)
+    gpsSerial.setRxBufferSize(256);  // 设置大缓冲区防止数据丢失
+#endif
+    Serial.printf("[GPS] 软串口初始化 RX=GPIO%d TX=GPIO%d 波特率=%d\n", GPS_SOFT_RX_PIN, GPS_SOFT_TX_PIN, GPS_BAUD_RATE);
 
     // K230硬件串口UART2
     k230Serial.begin(K230_UART_BAUD, SERIAL_8N1, K230_RX_PIN, K230_TX_PIN);
@@ -1191,39 +1219,24 @@ void RadarMotorUploadTask(void* pvParameters) {
             }
         }
 
+        // GPS数据解析（固定波特率9600）
         parseGPSNMEA();
         processK230Data();
-        unsigned long now = millis();
         smartAvoid();
 
-        // GPS 波特率自动检测：每4秒检查一次，如果没收到有效NMEA则切换波特率
-        if (!gps_baud_locked && (now - gps_baud_try_start > 4000)) {
-            if (!gps_got_nmea) {
-                // 当前波特率收不到有效NMEA，切换下一个（最多完整试2轮后停止，避免无限空转）
-                gps_baud_index = (gps_baud_index + 1) % gps_baud_count;
-                gpsSerial.begin(gps_baud_table[gps_baud_index]);
-                gpsSerial.listen();  // 切换波特率后也要重新listen
-                gps_baud_try_start = now;
-                Serial.printf("[GPS] 当前波特率无有效NMEA，切换到:%d\n", gps_baud_table[gps_baud_index]);
-            } else {
-                // 收到有效NMEA，锁定波特率
-                gps_baud_locked = true;
-                Serial.printf("[GPS] 波特率已锁定: %d (累计收到%d字节)\n", gps_baud_table[gps_baud_index], gps_byte_count);
-            }
-        }
+        unsigned long now = millis();
 
         // 每3秒打印一次状态
         if (now - lastStatusPrint > 3000) {
             lastStatusPrint = now;
-            Serial.printf("[状态] WiFi:%s MQTT:%s 雷达字节:%d 雷达F:%.0f GPS可用:%d GPS字节:%lu 卫星:%d 波特率:%d\n",
+            Serial.printf("[状态] WiFi:%s MQTT:%s 雷达字节:%d 雷达F:%.0f GPS可用:%d GPS字节:%lu 卫星:%d\n",
                 WiFi.status() == WL_CONNECTED ? "连接" : "断开",
                 mqtt.connected() ? "连接" : "断开",
                 radarByteCount,
                 dir_smt[0],
                 gpsSerial.available(),
                 gps_byte_count,
-                gps_satellites,
-                gps_baud_table[gps_baud_index]);
+                gps_satellites);
             radarByteCount = 0;  // 重置计数
         }
 
