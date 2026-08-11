@@ -191,7 +191,7 @@ default: return "未知";
 #define ANG_LEFT_MAX   110
 #define ANG_RIGHT_MIN  250
 #define ANG_RIGHT_MAX  290
-// 【加快】MQTT上传间隔从200ms改为100ms
+// 【加快】MQTT上传间隔从200ms改为100ms（10Hz刷新率，平衡实时性和稳定性）
 #define UPLOAD_INTERVAL_MS  100
 #define STEER_MAX_PWM  255
 // ==================== TTS 配置 ====================
@@ -252,7 +252,8 @@ int   gps_heading = 0;
 int   gps_satellites = 0;
 volatile unsigned long gps_byte_count = 0;   // GPS软串口累计收到字节数（诊断用）
 // GPS 波特率自动检测（软串口可能收不到默认波特率的数据）
-const int gps_baud_table[] = {115200, 9600, 38400, 4800};
+// 【修复】GPS波特率表从9600开始（大多数GPS模块默认9600，避免4秒检测延迟）
+const int gps_baud_table[] = {9600, 115200, 38400, 4800};
 const int gps_baud_count = 4;
 int   gps_baud_index = 0;        // 当前尝试的波特率索引
 bool  gps_baud_locked = false;   // 是否已锁定正确的波特率
@@ -656,7 +657,8 @@ if (WiFi.status() != WL_CONNECTED) return false;
 // 配置MQTT客户端参数
 mqtt.setSocketTimeout(10);
 mqtt.setKeepAlive(60);
-mqtt.setBufferSize(131072);
+// 【修复】MQTT Buffer从128KB改为2KB（避免内存不足，JSON通常<1KB）
+mqtt.setBufferSize(2048);
 espClient.setInsecure();
 espClient.setHandshakeTimeout(12);
 if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
@@ -993,9 +995,19 @@ stats["obstacle_count"] = obstacle_count;       // 障碍物提醒次数
 stats["detour_count"] = detour_count;           // 路线调整次数
 size_t n = serializeJson(doc, json_buffer, sizeof(json_buffer));
 if (n == 0 || n >= sizeof(json_buffer)) {
+Serial.printf("[MQTT] JSON序列化失败或过大: %d字节\n", n);
 return;
 }
-mqtt.publish(MQTT_TOPIC_SENSORS, json_buffer, n);
+// 【调试】每10秒打印一次JSON大小
+static unsigned long lastJsonDebug = 0;
+if (millis() - lastJsonDebug > 10000) {
+lastJsonDebug = millis();
+Serial.printf("[MQTT] 发布JSON %d字节\n", n);
+}
+bool published = mqtt.publish(MQTT_TOPIC_SENSORS, (const uint8_t*)json_buffer, n, false);
+if (!published) {
+Serial.println("[MQTT] 发布失败");
+}
 }
 void RadarMotorUploadTask(void* pvParameters) {
 Serial.println("[任务] RadarMotorUploadTask 启动");
