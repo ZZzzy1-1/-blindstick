@@ -986,35 +986,30 @@ void checkObstacleAndAlert() {
     float minDist = min(f, min(L, R));
     static int consecutiveAlerts = 0;
 
-    // 判断哪个方向有障碍物
+    // 判断哪个方向有障碍物（优先级：前方 > 左方 > 右方）
     bool has_obstacle = false;
     String alert_text = "";
 
     if (f < FRONT_ALERT_CM) {
+        // 前方有障碍物
         has_obstacle = true;
         if (L > R && L > SIDE_ALERT_CM) {
-            alert_text = "前方有障碍物，请向左绕行";  // -> voice_left
+            alert_text = "前方有障碍物，请向左绕行";
         } else if (R >= L && R > SIDE_ALERT_CM) {
-            alert_text = "前方有障碍物，请向右绕行";  // -> voice_right
+            alert_text = "前方有障碍物，请向右绕行";
         } else {
-            alert_text = "前方有障碍物，请注意避让";  // -> voice_front
+            alert_text = "前方有障碍物，请注意避让";
         }
     }
-    else if (L < SIDE_ALERT_CM && L < R) {
+    else if (L < SIDE_ALERT_CM) {
+        // 左方有障碍物（前方安全）
         has_obstacle = true;
-        if (R > SIDE_ALERT_CM && f > FRONT_ALERT_CM) {
-            alert_text = "左方有障碍物，请向右绕行";  // -> voice_right
-        } else {
-            alert_text = "前方有障碍物，请注意避让";  // -> voice_front (默认)
-        }
+        alert_text = "左方有障碍物，请向右绕行";
     }
     else if (R < SIDE_ALERT_CM) {
+        // 右方有障碍物（前方安全）
         has_obstacle = true;
-        if (L > SIDE_ALERT_CM && f > FRONT_ALERT_CM) {
-            alert_text = "右方有障碍物，请向左绕行";  // -> voice_left
-        } else {
-            alert_text = "前方有障碍物，请注意避让";  // -> voice_front (默认)
-        }
+        alert_text = "右方有障碍物，请向左绕行";
     }
 
     // 连续检测计数
