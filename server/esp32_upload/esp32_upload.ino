@@ -1168,8 +1168,8 @@ void publishSensorData() {
         Serial.printf("[MQTT] 发布JSON %d字节: %.100s...\n", n, json_buffer);
     }
 
-    // PubSubClient只支持QoS 0发布
-    bool published = mqtt.publish(MQTT_TOPIC_SENSORS, json_buffer, n, false);
+    // PubSubClient只支持QoS 0发布，需要类型转换
+    bool published = mqtt.publish(MQTT_TOPIC_SENSORS, (const uint8_t*)json_buffer, n, false);
     if (!published) {
         static unsigned long lastFailDebug = 0;
         if (millis() - lastFailDebug > 5000) {
@@ -1188,9 +1188,7 @@ void RadarMotorUploadTask(void* pvParameters) {
     // GPS软串口初始化（固定波特率9600，更稳定）
     gpsSerial.begin(GPS_BAUD_RATE);
     gpsSerial.listen();  // 必须listen才会开始接收RX数据
-#if defined(ESP32)
-    gpsSerial.setRxBufferSize(256);  // 设置大缓冲区防止数据丢失
-#endif
+    // 注意：SoftwareSerial 不支持 setRxBufferSize，依赖默认buffer
     Serial.printf("[GPS] 软串口初始化 RX=GPIO%d TX=GPIO%d 波特率=%d\n", GPS_SOFT_RX_PIN, GPS_SOFT_TX_PIN, GPS_BAUD_RATE);
 
     // K230硬件串口UART2
