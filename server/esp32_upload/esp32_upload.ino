@@ -292,6 +292,14 @@ float gps_speed = 0.0;
 int   gps_heading = 0;
 int   gps_satellites = 0;
 
+// GPS 波特率自动检测（软串口可能收不到默认波特率的数据）
+const int gps_baud_table[] = {115200, 9600, 38400, 4800};
+const int gps_baud_count = 4;
+int   gps_baud_index = 0;        // 当前尝试的波特率索引
+bool  gps_baud_locked = false;   // 是否已锁定正确的波特率
+bool  gps_got_nmea = false;      // 是否收到过有效NMEA（$开头）
+unsigned long gps_baud_try_start = 0;  // 当前波特率尝试开始时间
+
 // 常住地设置（默认黄石市，可通过MQTT更新）
 String home_city = "黄石市";
 
@@ -676,6 +684,10 @@ void parseGPSNMEA() {
             nmea[idx++] = c;
             if (c == '\n' || c == '\r') {
                 nmea[idx] = '\0';
+                // 收到一条完整的以$开头的NMEA，标记波特率正确
+                if (nmea[0] == '$' && idx > 6) {
+                    gps_got_nmea = true;
+                }
                 // 调试：每5秒打印收到的NMEA原文（判断是否有GPS数据进来）
                 if (millis() - lastNmeaDump > 5000) {
                     lastNmeaDump = millis();
@@ -1145,9 +1157,11 @@ void RadarMotorUploadTask(void* pvParameters) {
     Serial1.begin(115200, SERIAL_8N1, RADAR_RX_PIN, -1);
     Serial.printf("[雷达] Serial1初始化 RX=GPIO%d 波特率=115200\n", RADAR_RX_PIN);
 
-    // GPS改为软串口
-    gpsSerial.begin(115200);
-    Serial.println("[GPS] 软串口初始化完成");
+    // GPS改为软串口（波特率自动检测）
+    gps_baud_index = 0;
+    gpsSerial.begin(gps_baud_table[gps_baud_index]);
+    gps_baud_try_start = millis();
+    Serial.printf("[GPS] 软串口初始化，尝试波特率=%d\n", gps_baud_table[gps_baud_index]);
 
     // K230硬件串口UART2
     k230Serial.begin(K230_UART_BAUD, SERIAL_8N1, K230_RX_PIN, K230_TX_PIN);
@@ -1180,16 +1194,32 @@ void RadarMotorUploadTask(void* pvParameters) {
         unsigned long now = millis();
         smartAvoid();
 
+        // GPS 波特率自动检测：每4秒检查一次，如果没收到有效NMEA则切换波特率
+        if (!gps_baud_locked && (now - gps_baud_try_start > 4000)) {
+            if (!gps_got_nmea) {
+                // 当前波特率收不到数据，切换下一个
+                gps_baud_index = (gps_baud_index + 1) % gps_baud_count;
+                gpsSerial.begin(gps_baud_table[gps_baud_index]);
+                gps_baud_try_start = now;
+                Serial.printf("[GPS] 当前波特率无数据，切换到:%d\n", gps_baud_table[gps_baud_index]);
+            } else {
+                // 收到有效NMEA，锁定波特率
+                gps_baud_locked = true;
+                Serial.printf("[GPS] 波特率已锁定: %d\n", gps_baud_table[gps_baud_index]);
+            }
+        }
+
         // 每3秒打印一次状态
         if (now - lastStatusPrint > 3000) {
             lastStatusPrint = now;
-            Serial.printf("[状态] WiFi:%s MQTT:%s 雷达字节:%d 雷达F:%.0f GPS可用:%d 卫星:%d\n",
+            Serial.printf("[状态] WiFi:%s MQTT:%s 雷达字节:%d 雷达F:%.0f GPS可用:%d 卫星:%d 波特率:%d\n",
                 WiFi.status() == WL_CONNECTED ? "连接" : "断开",
                 mqtt.connected() ? "连接" : "断开",
                 radarByteCount,
                 dir_smt[0],
                 gpsSerial.available(),
-                gps_satellites);
+                gps_satellites,
+                gps_baud_table[gps_baud_index]);
             radarByteCount = 0;  // 重置计数
         }
 
