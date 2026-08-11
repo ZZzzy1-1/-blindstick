@@ -216,7 +216,16 @@ const char* getPrioName(int p) {
 #define SIDE_WARNING_CM     180.0
 #define AVOID_TURN_HOLD_MS 2000
 
+// ==================== 雷达角度扇区 ====================
+#define ANG_FRONT_MIN  350
+#define ANG_FRONT_MAX  10
+#define ANG_LEFT_MIN   70
+#define ANG_LEFT_MAX   110
+#define ANG_RIGHT_MIN  250
+#define ANG_RIGHT_MAX  290
+
 #define UPLOAD_INTERVAL_MS  200
+#define STEER_MAX_PWM  255
 
 // ==================== TTS 配置 ====================
 enum TTS_Priority {
@@ -233,11 +242,6 @@ volatile int nav_total_steps = 0;
 volatile int current_step_idx = 0;
 volatile int current_progress = 0;
 volatile bool nav_active = false;
-
-// 导航步骤坐标（用于GPS实时导航）
-float nav_step_lats[10] = {0};
-float nav_step_lngs[10] = {0};
-volatile bool nav_using_gps = false;  // 是否使用GPS导航
 
 volatile bool  is_blocked  = false;
 volatile bool  is_ai_talking = false;
@@ -610,15 +614,15 @@ void processRadarPacket() {
     float diffAngle = angleLSA - angleFSA;
     if (diffAngle < 0) diffAngle += 360.0f;
 
-    // 重置三个方向的距离（注意：雷达安装方向导致左右相反）
+    // 重置三个方向的距离
     if (angleFSA >= ANG_FRONT_MIN || angleFSA <= ANG_FRONT_MAX) {
         frontDist = 200.0;
     }
     else if (angleFSA >= ANG_LEFT_MIN && angleFSA <= ANG_LEFT_MAX) {
-        rightDist = 200.0;  // 左侧扇区对应rightDist（雷达安装方向）
+        leftDist = 200.0;  // 修正：左方区域对应leftDist
     }
     else if (angleFSA >= ANG_RIGHT_MIN && angleFSA <= ANG_RIGHT_MAX) {
-        leftDist = 200.0;   // 右侧扇区对应leftDist（雷达安装方向）
+        rightDist = 200.0;  // 修正：右方区域对应rightDist
     }
 
     for (int i = 0; i < packet_lsn; i++) {
@@ -635,10 +639,10 @@ void processRadarPacket() {
                 if (cm < frontDist) frontDist = cm;
             }
             else if (currentAngle >= ANG_LEFT_MIN && currentAngle <= ANG_LEFT_MAX) {
-                if (cm < rightDist) rightDist = cm;  // 左侧扇区存入rightDist
+                if (cm < leftDist) leftDist = cm;  // 修正：左方区域存入leftDist
             }
             else if (currentAngle >= ANG_RIGHT_MIN && currentAngle <= ANG_RIGHT_MAX) {
-                if (cm < leftDist) leftDist = cm;   // 右侧扇区存入leftDist
+                if (cm < rightDist) rightDist = cm;  // 修正：右方区域存入rightDist
             }
         }
     }
@@ -740,7 +744,6 @@ bool mqtt_reconnect_nonblocking() {
     espClient.setHandshakeTimeout(12);
 
     if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
-        Serial.println("[MQTT] 连接成功!");
         mqtt.subscribe(MQTT_TOPIC_TTS_AUDIO);
         mqtt.subscribe("blindstick/tts/control");
         mqtt.subscribe("blindstick/tts/stream/+");
@@ -762,7 +765,6 @@ bool mqtt_reconnect_nonblocking() {
     } else {
         retry_count++;
         if (retry_count >= 10) retry_count = 0;
-        Serial.printf("[MQTT] 连接失败，重试次数:%d\n", retry_count);
         return false;
     }
 }
@@ -991,20 +993,18 @@ void checkObstacleAndAlert() {
             return;
         }
 
-        // 避障语音 - 通过MQTT发送给后端生成
+        // 避障语音使用云端TTS生成
         if (mqtt.connected()) {
             StaticJsonDocument<256> ttsDoc;
             char buf[256];
             ttsDoc["text"] = alert_text;
-            ttsDoc["priority"] = PRIO_HIGH;  // 高优先级避障
+            ttsDoc["priority"] = PRIO_HIGH;  // 避障使用高优先级
             size_t len = serializeJson(ttsDoc, buf, sizeof(buf));
             mqtt.publish(MQTT_TOPIC_TTS_REQ, buf, len);
 
             // 增加障碍物提醒次数统计
             obstacle_count++;
             saveStatsToRTC();
-
-            Serial.printf("[避障] 发送TTS请求: %s\n", alert_text.c_str());
         }
 
         // 更新记录
@@ -1127,14 +1127,10 @@ void publishSensorData() {
 
     size_t n = serializeJson(doc, json_buffer, sizeof(json_buffer));
     if (n == 0 || n >= sizeof(json_buffer)) {
-        Serial.println("[MQTT] JSON序列化失败");
         return;
     }
 
-    bool published = mqtt.publish(MQTT_TOPIC_SENSORS, json_buffer, n);
-    if (!published) {
-        Serial.println("[MQTT] 发布失败!");
-    }
+    mqtt.publish(MQTT_TOPIC_SENSORS, json_buffer, n);
 }
 void RadarMotorUploadTask(void* pvParameters) {
     Serial.println("[任务] RadarMotorUploadTask 启动");
@@ -1144,7 +1140,7 @@ void RadarMotorUploadTask(void* pvParameters) {
     Serial.printf("[雷达] Serial1初始化 RX=GPIO%d 波特率=115200\n", RADAR_RX_PIN);
 
     // GPS改为软串口
-    gpsSerial.begin(9600);
+    gpsSerial.begin(115200);
     Serial.println("[GPS] 软串口初始化完成");
 
     // K230硬件串口UART2
@@ -1213,12 +1209,10 @@ void RadarMotorUploadTask(void* pvParameters) {
     }
 }
 
-// ==================== Core 1 导航任务（基于GPS实时位置）====================
+// ==================== Core 1 导航任务（带路口播报）====================
 void NavigationTask(void* pvParameters) {
-    Serial.println("[导航] 启动（GPS实时导航）");
+    Serial.println("[导航] 启动");
     static int last_step_idx = -1;
-    static unsigned long lastDistanceCheck = 0;
-    const float STEP_REACHED_DISTANCE = 30.0;  // 到达步骤的距离阈值（米）
 
     while (true) {
         int total = nav_total_steps;
@@ -1252,35 +1246,20 @@ void NavigationTask(void* pvParameters) {
                 }
             }
 
-            // GPS实时导航：计算与下一步目标的距离
-            if (nav_using_gps && current_step_idx < total) {
-                unsigned long now = millis();
-                if (now - lastDistanceCheck > 2000) {  // 每2秒检查一次距离
-                    lastDistanceCheck = now;
-
-                    float targetLat = nav_step_lats[current_step_idx];
-                    float targetLng = nav_step_lngs[current_step_idx];
-
-                    if (gps_lat > 1.0 && gps_lng > 1.0 && targetLat > 1.0 && targetLng > 1.0) {
-                        float dist = calcDistance(gps_lat, gps_lng, targetLat, targetLng);
-                        Serial.printf("[导航] 距离目标%d: %.0f米\n", current_step_idx, dist);
-
-                        if (dist < STEP_REACHED_DISTANCE) {
-                            // 到达当前步骤，进入下一步
-                            current_progress = 100;  // 标记为完成
-                        }
-                    }
+            if (current_progress < 100) {
+                if (is_blocked || is_ai_talking) {
+                    vTaskDelay(200 / portTICK_PERIOD_MS);
+                    continue;
                 }
-            }
-
-            // 检查步骤进度
-            if (current_progress >= 100) {
+                // 每3秒增加5%进度，一步约60秒
+                vTaskDelay(3000 / portTICK_PERIOD_MS);
+                current_progress += 5;
+            } else {
                 current_progress = 0;
                 current_step_idx++;
 
                 if (current_step_idx >= total) {
                     nav_active = false;
-                    nav_using_gps = false;
                     nav_total_steps = 1;
                     nav_steps[0] = "导航完成，请说出新目的地";
                     last_step_idx = -1;
@@ -1297,8 +1276,6 @@ void NavigationTask(void* pvParameters) {
                     }
                 }
                 vTaskDelay(1000 / portTICK_PERIOD_MS);
-            } else {
-                vTaskDelay(500 / portTICK_PERIOD_MS);  // 正常检查间隔
             }
         } else {
             current_step_idx = 0;
@@ -1306,6 +1283,7 @@ void NavigationTask(void* pvParameters) {
             last_step_idx = -1;
             vTaskDelay(1000 / portTICK_PERIOD_MS);
         }
+        vTaskDelay(50 / portTICK_PERIOD_MS);
     }
 }
 
@@ -1687,12 +1665,7 @@ void setup() {
     pinMode(MOTOR_IN1, OUTPUT); pinMode(MOTOR_IN2, OUTPUT); pinMode(MOTOR_PWM, OUTPUT);
     motorControl(0);
     pinMode(RADAR_M_CTR_PIN, OUTPUT);
-
-    // 雷达电机软启动（YDLIDAR X2需要PWM控制）
-    for(int speed = 0; speed < 200; speed += 10) {
-        analogWrite(RADAR_M_CTR_PIN, speed);
-        delay(20);
-    }
+    digitalWrite(RADAR_M_CTR_PIN, HIGH);
 
     nav_total_steps = 1;
     nav_steps[0] = "请说出目的地";
@@ -1939,21 +1912,9 @@ bool planWalkingRoute(float destLat, float destLng, String& destName) {
         instruction.replace("<font color='red'>", "");
         instruction.replace("</font>", "");
         nav_steps[i] = instruction;
-
-        // 保存步骤起点坐标（用于GPS导航）
-        const char* step_path = steps[i]["path"];
-        if (step_path && strlen(step_path) > 0) {
-            // path格式: "lat,lng;lat,lng;..."
-            sscanf(step_path, "%f,%f", &nav_step_lats[i], &nav_step_lngs[i]);
-        } else {
-            // 如果没有path，使用起点或终点
-            nav_step_lats[i] = (i == 0) ? originLat : destLat;
-            nav_step_lngs[i] = (i == 0) ? originLng : destLng;
-        }
     }
 
     nav_active = true;
-    nav_using_gps = true;  // 启用GPS导航
     current_step_idx = 0;
     current_progress = 0;
 

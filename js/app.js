@@ -349,7 +349,7 @@ async function handleMqttMessage(topic, payload) {
                 main: true,
                 vision: hasVisionData,
                 radar: !!(msg.radar && (msg.radar.f !== undefined || msg.radar.front !== undefined)),
-                gps: !!(msg.gps && msg.gps.sats > 0),
+                gps: !!(msg.gps && (msg.gps.satellites > 0 || msg.gps.sats > 0)),
                 voice: true
             };
             updateModuleStatus(deviceStatus);
