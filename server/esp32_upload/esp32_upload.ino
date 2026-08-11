@@ -207,6 +207,7 @@ volatile int nav_total_steps = 0;
 volatile int current_step_idx = 0;
 volatile int current_progress = 0;
 volatile bool nav_active = false;
+String current_destination = "";  // 【新增】当前导航目的地，用于MQTT上报
 volatile bool  is_blocked  = false;
 volatile bool  is_ai_talking = false;
 volatile bool  is_tts_requesting = false;  // TTS请求状态标志，防止重复发送
@@ -243,8 +244,8 @@ value = is_tts_requesting;
 }
 return value;
 }
-int last_motor_pwm = 0;
-String last_motor_dir = "stop";
+int last_motor_pwm = 0;  // 【预留】可扩展用于电机状态记录
+String last_motor_dir = "stop";  // 【预留】可扩展用于方向记录
 float gps_lat = 0.0;
 float gps_lng = 0.0;
 float gps_speed = 0.0;
@@ -289,7 +290,8 @@ volatile uint8_t payload_idx = 0, payload_expected = 0;
 TaskHandle_t RadarTaskHandle = NULL;
 TaskHandle_t NavTaskHandle = NULL;
 TaskHandle_t VoiceTaskHandle = NULL;
-TaskHandle_t TTSPlayerTaskHandle = NULL;
+// 【删除】TTSPlayerTaskHandle未使用
+// TaskHandle_t TTSPlayerTaskHandle = NULL;
 // ==================== K230视觉检测配置 ====================
 // 需要播报的目标列表
 const char* K230_ALERT_TARGETS[] = {
@@ -321,7 +323,8 @@ int k230_detection_count = 0;
 // ==================== 五向雷达 + EMA平滑 ====================
 #define NUM_DIR     3
 #define SMOOTH_A    0.50f
-volatile float dir_raw[NUM_DIR] = {400.0f, 400.0f, 400.0f};
+// 【删除】dir_raw未使用，直接使用frontDist/leftDist/rightDist
+// volatile float dir_raw[NUM_DIR] = {400.0f, 400.0f, 400.0f};
 volatile float dir_smt[NUM_DIR] = {400.0f, 400.0f, 400.0f};
 // ==================== 智能避障参数（用户算法）====================
 #define STEER_MAX_PWM 230
@@ -790,9 +793,9 @@ saveStatsToRTC();
 }
 }
 // 全局变量
-bool last_blocked = false;
+// 【删除】last_blocked未使用
 unsigned long last_alert_time = 0;
-float last_alert_dist = 0;
+// 【删除】last_alert_dist未使用
 // 【加快】障碍物告警间隔从8秒改为5秒
 #define ALERT_INTERVAL_MS 5000
 #define ALERT_DIST_CHANGE 30          // 距离变化超过30cm才重新播报
@@ -956,8 +959,14 @@ JsonObject radar = doc.createNestedObject("radar");
 radar["f"] = dir_smt[0];  // 前方
 radar["l"] = dir_smt[1];  // 左方
 radar["r"] = dir_smt[2];  // 右方
+// 【修复】blocked状态：前方<180cm或侧边<180cm时为true
+is_blocked = (dir_smt[0] < 180.0 || dir_smt[1] < 180.0 || dir_smt[2] < 180.0);
 doc["blocked"] = is_blocked;
 doc["nav"] = nav_active;
+doc["nav_destination"] = current_destination;  // 【新增】当前导航目的地
+doc["nav_step"] = nav_active ? nav_steps[current_step_idx] : "";  // 【新增】当前步骤
+doc["current_step"] = current_step_idx;  // 【新增】当前步骤索引
+doc["nav_steps"] = nav_total_steps;  // 【新增】总步骤数
 JsonObject gps = doc.createNestedObject("gps");
 gps["lat"] = gps_lat;
 gps["lng"] = gps_lng;
@@ -1140,6 +1149,7 @@ current_progress = 0;
 current_step_idx++;
 if (current_step_idx >= total) {
 nav_active = false;
+current_destination = "";  // 【新增】导航结束清除目的地
 nav_total_steps = 1;
 nav_steps[0] = "导航完成，请说出新目的地";
 last_step_idx = -1;
@@ -1689,6 +1699,7 @@ instruction.replace("</font>", "");
 nav_steps[i] = instruction;
 }
 nav_active = true;
+current_destination = destName;  // 【新增】保存当前目的地用于MQTT上报
 current_step_idx = 0;
 current_progress = 0;
 // 播报导航开始 - 使用流式TTS
@@ -2010,6 +2021,7 @@ stream_playing = true;
 stream_priority = new_priority;
 stream_session_id = session_id;
 stream_buf_used = 0;
+is_ai_talking = true;  // 【修复】标记正在播放语音
 if (VoiceTaskHandle != NULL) {
 vTaskSuspend(VoiceTaskHandle);
 }
@@ -2028,6 +2040,7 @@ Serial.println("[流式TTS] 语音识别已恢复");
 }
 stream_playing = false;
 stream_buf_used = 0;
+is_ai_talking = false;  // 【修复】标记语音播放结束
 } else if (strcmp(type, "interrupt") == 0) {
 Serial.printf("[流式TTS] 收到打断信号\n");
 stopCurrentPlayback();
