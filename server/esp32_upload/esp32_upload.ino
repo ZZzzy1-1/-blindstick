@@ -378,35 +378,34 @@ volatile float dir_smt[NUM_DIR] = {400.0f, 400.0f, 400.0f};
 #define STEER_MAX_PWM 230
 #define STEER_SLOW_PWM 180
 
-#define FRONT_CRITICAL 60.0
-#define SIDE_WARNING   50.0
+#define FRONT_CRITICAL 95.0   // 前方95cm触发全速紧急避障
+#define SIDE_WARNING   50.0   // 侧边障碍物排斥线 (50cm)
 
-#define ANG_FRONT_MIN  330
+#define ANG_FRONT_MIN  330    // 前方扇区：330° 到 30°
 #define ANG_FRONT_MAX  30
-#define ANG_LEFT_MIN   60
+#define ANG_LEFT_MIN   60     // 左侧扇区：60° 到 120°
 #define ANG_LEFT_MAX   120
-#define ANG_RIGHT_MIN  240
+#define ANG_RIGHT_MIN  240    // 右侧扇区：240° 到 300°
 #define ANG_RIGHT_MAX  300
 
 float frontDist = 200.0;
 float leftDist  = 200.0;
 float rightDist = 200.0;
 
-// ==================== 电机控制 ====================
 // ==================== 电机控制（正数右转，负数左转）====================
 void motorControl(int steerPower) {
     int safePower = constrain(steerPower, -STEER_MAX_PWM, STEER_MAX_PWM);
 
     if (safePower > 15) {
         // 👉 产生向右的动力
-        digitalWrite(MOTOR_IN1, LOW);
-        digitalWrite(MOTOR_IN2, HIGH);
+        digitalWrite(MOTOR_IN1, HIGH);
+        digitalWrite(MOTOR_IN2, LOW);
         analogWrite(MOTOR_PWM, safePower);
     }
     else if (safePower < -15) {
         // 👈 产生向左的动力
-        digitalWrite(MOTOR_IN1, HIGH);
-        digitalWrite(MOTOR_IN2, LOW);
+        digitalWrite(MOTOR_IN1, LOW);
+        digitalWrite(MOTOR_IN2, HIGH);
         analogWrite(MOTOR_PWM, abs(safePower));
     }
     else {
@@ -434,21 +433,51 @@ void smartAvoid() {
 
     // --- 步骤 C：综合大局进行合力判断 ---
 
-    // 情况 1：正前方小于60cm，紧急全速避障
+    // 情况 1：正前方小于95cm，紧急全速避障
     if (frontDist < FRONT_CRITICAL) {
-        if (leftDist > rightDist) {
-            motorControl(-STEER_MAX_PWM);  // 左边更空，满功率左转
-        } else {
-            motorControl(STEER_MAX_PWM);   // 右边更空，满功率右转
+        // 调试输出
+        static unsigned long lastEmergencyLog = 0;
+        if (millis() - lastEmergencyLog > 500) {
+            lastEmergencyLog = millis();
+            Serial.printf("🚨 前方紧急(%.1fcm)！全速闪避！", frontDist);
         }
-        return;
+
+        if (leftDist > rightDist) {
+            // 左边更空，满功率左转
+            static unsigned long lastLeftLog = 0;
+            if (millis() - lastLeftLog > 500) {
+                lastLeftLog = millis();
+                Serial.println("👈 左边更空，全速向左闪避！");
+            }
+            motorControl(-STEER_MAX_PWM);
+        } else {
+            // 右边更空，满功率右转
+            static unsigned long lastRightLog = 0;
+            if (millis() - lastRightLog > 500) {
+                lastRightLog = millis();
+                Serial.println("👉 右边更空，全速向右闪避！");
+            }
+            motorControl(STEER_MAX_PWM);
+        }
+        return; // 紧急模式直接返回，不走低速逻辑
     }
 
     // 情况 2：前方安全，仅侧边有障碍物 -> 低速微调
     if (leftForce > 0 || rightForce > 0) {
         float netSteerSignal = leftForce - rightForce;
+        // 关键：把合力映射到低速区间 STEER_SLOW_PWM，避免猛打方向
+        // 先算出原始最大可能推力：SIDE_WARNING * 4 = 200
+        // 按比例缩放到低速180以内
         float scaleRatio = STEER_SLOW_PWM / (SIDE_WARNING * 4.0f);
         int slowSteer = netSteerSignal * scaleRatio;
+
+        static unsigned long lastSlowLog = 0;
+        if (millis() - lastSlowLog > 600) {
+            lastSlowLog = millis();
+            Serial.printf("⚠️ 侧边预警(低速) -> 左距:%.1fcm, 右距:%.1fcm | 输出低速:%d\n",
+                          leftDist, rightDist, slowSteer);
+        }
+
         motorControl(slowSteer);
     }
     // 情况 3：无障碍物，停机
@@ -625,10 +654,10 @@ void processRadarPacket() {
         frontDist = 200.0;
     }
     else if (angleFSA >= ANG_LEFT_MIN && angleFSA <= ANG_LEFT_MAX) {
-        leftDist = 200.0;  // 修正：左方区域对应leftDist
+        rightDist = 200.0;  // 左侧扇区数据存入rightDist（按用户提供的代码）
     }
     else if (angleFSA >= ANG_RIGHT_MIN && angleFSA <= ANG_RIGHT_MAX) {
-        rightDist = 200.0;  // 修正：右方区域对应rightDist
+        leftDist = 200.0;   // 右侧扇区数据存入leftDist（按用户提供的代码）
     }
 
     for (int i = 0; i < packet_lsn; i++) {
@@ -645,10 +674,10 @@ void processRadarPacket() {
                 if (cm < frontDist) frontDist = cm;
             }
             else if (currentAngle >= ANG_LEFT_MIN && currentAngle <= ANG_LEFT_MAX) {
-                if (cm < leftDist) leftDist = cm;  // 修正：左方区域存入leftDist
+                if (cm < rightDist) rightDist = cm;  // 左侧扇区存入rightDist（按用户代码）
             }
             else if (currentAngle >= ANG_RIGHT_MIN && currentAngle <= ANG_RIGHT_MAX) {
-                if (cm < rightDist) rightDist = cm;  // 修正：右方区域存入rightDist
+                if (cm < leftDist) leftDist = cm;   // 右侧扇区存入leftDist（按用户代码）
             }
         }
     }
