@@ -1161,6 +1161,7 @@ void RadarMotorUploadTask(void* pvParameters) {
     // GPS改为软串口（波特率自动检测）
     gps_baud_index = 0;
     gpsSerial.begin(gps_baud_table[gps_baud_index]);
+    gpsSerial.listen();  // 必须listen才会开始接收RX数据
     gps_baud_try_start = millis();
     Serial.printf("[GPS] 软串口初始化，尝试波特率=%d\n", gps_baud_table[gps_baud_index]);
 
@@ -1201,6 +1202,7 @@ void RadarMotorUploadTask(void* pvParameters) {
                 // 当前波特率收不到有效NMEA，切换下一个（最多完整试2轮后停止，避免无限空转）
                 gps_baud_index = (gps_baud_index + 1) % gps_baud_count;
                 gpsSerial.begin(gps_baud_table[gps_baud_index]);
+                gpsSerial.listen();  // 切换波特率后也要重新listen
                 gps_baud_try_start = now;
                 Serial.printf("[GPS] 当前波特率无有效NMEA，切换到:%d\n", gps_baud_table[gps_baud_index]);
             } else {
