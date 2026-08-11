@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8">
+<title>MQTT 连接测试</title>
+</head>
+<body style="font-family:monospace;padding:20px">
+<h3>MQTT 连接测试 - 请在真实浏览器打开</h3>
+<p>此页面用你的 EMQX 配置尝试连接 MQTT，结果会显示在下方。</p>
+<pre id="status" style="background:#111;color:#0f0;padding:15px;min-height:300px;white-space:pre-wrap">starting...</pre>
+<script src="js/mqtt.min.js"></script>
+<script>
+var log = function(m){ var d=document.getElementById('status'); d.textContent += new Date().toLocaleTimeString() + ' ' + m + '\n'; };
+log('mqtt库=' + (typeof window.mqtt) + ' connect=' + (window.mqtt?typeof window.mqtt.connect:'N/A'));
+
+var url = 'wss://u72a7838.ala.asia-southeast1.emqxsl.com:8084/mqtt';
+log('尝试连接: ' + url);
+log('Origin: ' + location.origin);
+
+var client = mqtt.connect(url, {
+  clientId: 'web_diag_' + Math.random().toString(16).substr(2,6),
+  username: 'blindstick', password: '2026',
+  clean: true, connectTimeout: 10000
+});
+var t0 = Date.now();
+client.on('connect', function(){
+  log('✅ 连接成功 in ' + ((Date.now()-t0)/1000).toFixed(1) + 's');
+  client.subscribe('blindstick/sensors', function(err){
+    log('订阅 sensors: ' + (err ? '失败 ' + JSON.stringify(err) : '成功'));
+    client.on('message', function(topic, payload){
+      log('📩 [' + topic + ']: ' + payload.toString().slice(0,150));
+    });
+  });
+});
+client.on('error', function(e){ log('❌ 错误: ' + e.message); });
+client.on('offline', function(){ log('⚠️ offline'); });
+client.on('reconnect', function(){ log('🔄 reconnect'); });
+client.on('close', function(){ log('🔒 close'); });
+</script>
+</body>
+</html>
