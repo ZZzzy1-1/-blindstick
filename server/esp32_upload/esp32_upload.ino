@@ -291,6 +291,7 @@ float gps_lng = 0.0;
 float gps_speed = 0.0;
 int   gps_heading = 0;
 int   gps_satellites = 0;
+volatile unsigned long gps_byte_count = 0;   // GPS软串口累计收到字节数（诊断用）
 
 // GPS 波特率自动检测（软串口可能收不到默认波特率的数据）
 const int gps_baud_table[] = {115200, 9600, 38400, 4800};
@@ -679,6 +680,7 @@ void parseGPSNMEA() {
     static unsigned long lastNmeaDump = 0;
     while (gpsSerial.available()) {
         char c = gpsSerial.read();
+        gps_byte_count++;
         if (c == '$') { idx = 0; nmea[idx++] = c; }
         else if (idx > 0 && idx < 255) {
             nmea[idx++] = c;
@@ -1110,6 +1112,7 @@ void publishSensorData() {
     gps["lng"] = gps_lng;
     gps["satellites"] = gps_satellites;  // 统一字段名与前端一致
     gps["speed"] = gps_speed;            // 添加速度字段
+    gps["bytes"] = gps_byte_count;       // GPS累计接收字节数（诊断：>0说明有信号进来）
 
     // 调试输出（每5秒一次）
     static unsigned long lastPublishDebug = 0;
@@ -1212,12 +1215,13 @@ void RadarMotorUploadTask(void* pvParameters) {
         // 每3秒打印一次状态
         if (now - lastStatusPrint > 3000) {
             lastStatusPrint = now;
-            Serial.printf("[状态] WiFi:%s MQTT:%s 雷达字节:%d 雷达F:%.0f GPS可用:%d 卫星:%d 波特率:%d\n",
+            Serial.printf("[状态] WiFi:%s MQTT:%s 雷达字节:%d 雷达F:%.0f GPS可用:%d GPS字节:%lu 卫星:%d 波特率:%d\n",
                 WiFi.status() == WL_CONNECTED ? "连接" : "断开",
                 mqtt.connected() ? "连接" : "断开",
                 radarByteCount,
                 dir_smt[0],
                 gpsSerial.available(),
+                gps_byte_count,
                 gps_satellites,
                 gps_baud_table[gps_baud_index]);
             radarByteCount = 0;  // 重置计数
