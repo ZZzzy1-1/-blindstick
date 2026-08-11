@@ -828,16 +828,6 @@ static int consecutiveAlerts = 0;
 	// 【修复】判断哪个方向有障碍物（简化逻辑，直接检测）
 bool has_obstacle = false;
 String alert_text = "";
-if (f < FRONT_ALERT_CM) {
-has_obstacle = true;
-if (L > R && L > SIDE_ALERT_CM) {
-alert_text = "前方有障碍物，请向左绕行";  // -> voice_left
-} else if (R >= L && R > SIDE_ALERT_CM) {
-alert_text = "前方有障碍物，请向右绕行";  // -> voice_right
-} else {
-alert_text = "前方有障碍物，请注意避让";  // -> voice_front
-}
-}
 	// 优先级1：前方障碍物
 	if (f < FRONT_ALERT_CM) {
 		has_obstacle = true;
