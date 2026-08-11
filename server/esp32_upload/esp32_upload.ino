@@ -668,6 +668,7 @@ void processRadarPacket() {
 void parseGPSNMEA() {
     static char nmea[256];
     static uint8_t idx = 0;
+    static unsigned long lastNmeaDump = 0;
     while (gpsSerial.available()) {
         char c = gpsSerial.read();
         if (c == '$') { idx = 0; nmea[idx++] = c; }
@@ -675,6 +676,11 @@ void parseGPSNMEA() {
             nmea[idx++] = c;
             if (c == '\n' || c == '\r') {
                 nmea[idx] = '\0';
+                // 调试：每5秒打印收到的NMEA原文（判断是否有GPS数据进来）
+                if (millis() - lastNmeaDump > 5000) {
+                    lastNmeaDump = millis();
+                    Serial.printf("[GPS-NMEA] %s\n", nmea);
+                }
                 // 解析 GGA 语句：位置 + 卫星数
                 if (strstr(nmea, "GGA") != NULL) {
                     float lat_raw = 0, lng_raw = 0;
@@ -1177,11 +1183,13 @@ void RadarMotorUploadTask(void* pvParameters) {
         // 每3秒打印一次状态
         if (now - lastStatusPrint > 3000) {
             lastStatusPrint = now;
-            Serial.printf("[状态] WiFi:%s MQTT:%s 雷达字节:%d 雷达F:%.0f\n",
+            Serial.printf("[状态] WiFi:%s MQTT:%s 雷达字节:%d 雷达F:%.0f GPS可用:%d 卫星:%d\n",
                 WiFi.status() == WL_CONNECTED ? "连接" : "断开",
                 mqtt.connected() ? "连接" : "断开",
                 radarByteCount,
-                dir_smt[0]);
+                dir_smt[0],
+                gpsSerial.available(),
+                gps_satellites);
             radarByteCount = 0;  // 重置计数
         }
 
