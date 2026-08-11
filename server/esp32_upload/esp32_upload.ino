@@ -686,10 +686,6 @@ void parseGPSNMEA() {
             nmea[idx++] = c;
             if (c == '\n' || c == '\r') {
                 nmea[idx] = '\0';
-                // 收到一条完整的以$开头的NMEA，标记波特率正确
-                if (nmea[0] == '$' && idx > 6) {
-                    gps_got_nmea = true;
-                }
                 // 调试：每5秒打印收到的NMEA原文（判断是否有GPS数据进来）
                 if (millis() - lastNmeaDump > 5000) {
                     lastNmeaDump = millis();
@@ -701,6 +697,8 @@ void parseGPSNMEA() {
                     char ns = 'N', ew = 'E';
                     int fix = 0, sats = 0;
                     if (sscanf(nmea, "$%*[^,],%*[^,],%f,%c,%f,%c,%d,%d,", &lat_raw, &ns, &lng_raw, &ew, &fix, &sats) >= 6) {
+                        // 只有成功解析出GGA字段才算波特率正确
+                        gps_got_nmea = true;
                         gps_satellites = sats;
                         if (fix > 0 && lat_raw > 0.0f && lng_raw > 0.0f) {
                             float lat = lat_raw / 100.0f;
@@ -1200,15 +1198,15 @@ void RadarMotorUploadTask(void* pvParameters) {
         // GPS 波特率自动检测：每4秒检查一次，如果没收到有效NMEA则切换波特率
         if (!gps_baud_locked && (now - gps_baud_try_start > 4000)) {
             if (!gps_got_nmea) {
-                // 当前波特率收不到数据，切换下一个
+                // 当前波特率收不到有效NMEA，切换下一个（最多完整试2轮后停止，避免无限空转）
                 gps_baud_index = (gps_baud_index + 1) % gps_baud_count;
                 gpsSerial.begin(gps_baud_table[gps_baud_index]);
                 gps_baud_try_start = now;
-                Serial.printf("[GPS] 当前波特率无数据，切换到:%d\n", gps_baud_table[gps_baud_index]);
+                Serial.printf("[GPS] 当前波特率无有效NMEA，切换到:%d\n", gps_baud_table[gps_baud_index]);
             } else {
                 // 收到有效NMEA，锁定波特率
                 gps_baud_locked = true;
-                Serial.printf("[GPS] 波特率已锁定: %d\n", gps_baud_table[gps_baud_index]);
+                Serial.printf("[GPS] 波特率已锁定: %d (累计收到%d字节)\n", gps_baud_table[gps_baud_index], gps_byte_count);
             }
         }
 
