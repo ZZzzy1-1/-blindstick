@@ -1339,11 +1339,11 @@ void i2s_init() {
 i2s_config_t i2s_config = {
 .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
 .sample_rate = 16000,
-.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,  // 【修复】INMP441输出32bit I2S，必须用32bit读取
 .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
 .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-.intr_alloc_flags = ESP_INTR_FLAG_IRAM,
-.dma_buf_count = 4,
+.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+.dma_buf_count = 8,
 .dma_buf_len = 256,
 .use_apll = false,
 .tx_desc_auto_clear = false,
@@ -1461,59 +1461,84 @@ vTaskDelay(500 / portTICK_PERIOD_MS);
 * 返回值：识别到的文本，空字符串表示未识别
 */
 String doVoiceRecognition() {
-// 录音3秒 = 96KB (16000Hz * 2字节 * 3秒)
-const int RECORD_SIZE = 16000 * 2 * 3;
-uint8_t* buffer = NULL;
-// 优先使用PSRAM（使用ESP-IDF风格API）
-size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-if (psram_free > RECORD_SIZE + 5000) {
-buffer = (uint8_t*)heap_caps_malloc(RECORD_SIZE, MALLOC_CAP_SPIRAM);
-}
-// 如果PSRAM分配失败，尝试使用普通内存
-if (!buffer) {
-buffer = (uint8_t*)malloc(RECORD_SIZE);
-}
-if (!buffer) {
-return "";
-}
-// 录音3秒
-size_t totalRead = 0;
-unsigned long startTime = millis();
-while (millis() - startTime < 3000 && totalRead < RECORD_SIZE) {
-size_t bytesRead = 0;
-i2s_read(I2S_PORT, buffer + totalRead, RECORD_SIZE - totalRead, &bytesRead, 50);
-totalRead += bytesRead;
-}
-// 检查录音数据是否有效（避免静音）
-int16_t* samples = (int16_t*)buffer;
-int nonZeroCount = 0;
-for (int i = 0; i < totalRead / 2; i++) {
-if (samples[i] > 100 || samples[i] < -100) nonZeroCount++;
-}
-// 【诊断】每5秒打印一次录音统计，帮助排查语音识别问题
-static unsigned long lastDiagTime = 0;
-if (millis() - lastDiagTime > 5000) {
-lastDiagTime = millis();
-Serial.printf("[语音诊断] 录音:%d字节 非静音样本:%d\n", totalRead, nonZeroCount);
-}
-if (nonZeroCount < 100) {
-// 录音数据几乎是静音，跳过识别
-Serial.printf("[语音诊断] 录音静音(nonZero=%d)，跳过识别\n", nonZeroCount);
-free(buffer);
-return "";
-}
-// 获取百度Token
-String token = getBaiduToken();
-if (token.length() == 0) {
-free(buffer);
-return "";
-}
-// Base64编码
-String base64Audio = base64Encode(buffer, totalRead);
-free(buffer);
-if (base64Audio.length() == 0) {
-return "";
-}
+    // 【修复】INMP441输出32bit I2S，录音3秒原始数据 = 16000*4*3 = 192KB
+    const int RECORD_SECONDS = 3;
+    const int RAW_RECORD_BYTES = 16000 * 4 * RECORD_SECONDS;  // 32bit原始数据
+    const int PCM_RECORD_BYTES = 16000 * 2 * RECORD_SECONDS;   // 转换后的16bit PCM
+
+    uint8_t* rawBuffer = NULL;
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    if (psram_free > RAW_RECORD_BYTES + 5000) {
+        rawBuffer = (uint8_t*)heap_caps_malloc(RAW_RECORD_BYTES, MALLOC_CAP_SPIRAM);
+    }
+    if (!rawBuffer) {
+        rawBuffer = (uint8_t*)malloc(RAW_RECORD_BYTES);
+    }
+    if (!rawBuffer) {
+        Serial.println("[语音诊断] 录音缓冲区分配失败");
+        return "";
+    }
+
+    // 录音3秒（32bit原始数据）
+    size_t rawRead = 0;
+    unsigned long startTime = millis();
+    while (millis() - startTime < (unsigned long)RECORD_SECONDS * 1000 && rawRead < RAW_RECORD_BYTES) {
+        size_t bytesRead = 0;
+        i2s_read(I2S_PORT, rawBuffer + rawRead, RAW_RECORD_BYTES - rawRead, &bytesRead, 50);
+        rawRead += bytesRead;
+    }
+
+    // 分配16bit PCM缓冲区
+    uint8_t* pcmBuffer = (uint8_t*)malloc(PCM_RECORD_BYTES);
+    if (!pcmBuffer) {
+        free(rawBuffer);
+        Serial.println("[语音诊断] PCM缓冲区分配失败");
+        return "";
+    }
+
+    // 32bit I2S → 16bit PCM 转换（右移14位，与测试代码一致）
+    int32_t* rawSamples = (int32_t*)rawBuffer;
+    int16_t* pcmSamples = (int16_t*)pcmBuffer;
+    int rawSampleCount = rawRead / 4;
+    int pcmSampleCount = (rawSampleCount < RECORD_SECONDS * 16000) ? rawSampleCount : RECORD_SECONDS * 16000;
+    for (int i = 0; i < pcmSampleCount; i++) {
+        int32_t sample = rawSamples[i] >> 14;
+        if (sample > 32767) sample = 32767;
+        if (sample < -32768) sample = -32768;
+        pcmSamples[i] = (int16_t)sample;
+    }
+    size_t totalRead = pcmSampleCount * 2;  // 16bit字节数
+    free(rawBuffer);
+
+    // 检查录音数据是否有效（避免静音）
+    int nonZeroCount = 0;
+    for (int i = 0; i < pcmSampleCount; i++) {
+        if (pcmSamples[i] > 100 || pcmSamples[i] < -100) nonZeroCount++;
+    }
+    // 【诊断】每5秒打印一次录音统计
+    static unsigned long lastDiagTime = 0;
+    if (millis() - lastDiagTime > 5000) {
+        lastDiagTime = millis();
+        Serial.printf("[语音诊断] 录音:%d字节 非静音样本:%d\n", totalRead, nonZeroCount);
+    }
+    if (nonZeroCount < 100) {
+        Serial.printf("[语音诊断] 录音静音(nonZero=%d)，跳过识别\n", nonZeroCount);
+        free(pcmBuffer);
+        return "";
+    }
+
+    // 获取百度Token
+    String token = getBaiduToken();
+    if (token.length() == 0) {
+        free(pcmBuffer);
+        return "";
+    }
+    // Base64编码
+    String base64Audio = base64Encode(pcmBuffer, totalRead);
+    free(pcmBuffer);
+    if (base64Audio.length() == 0) {
+        return "";
+    }
 // 发送ASR请求
 WiFiClientSecure client;
 client.setInsecure();
