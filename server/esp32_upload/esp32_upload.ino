@@ -69,6 +69,7 @@ const int FILTER_WORD_COUNT = 34;
 #define MOTOR_IN1       12    // TB6612 AIN1 → GPIO12
 #define MOTOR_IN2       11    // TB6612 AIN2 → GPIO11
 #define MOTOR_PWM       10    // TB6612 PWMA → GPIO10
+#define MOTOR_STBY      9     // 【新增】TB6612 STBY → GPIO9（必须置高电机才能工作）
 // ==================== YDLIDAR X2 启动命令 ====================
 static const uint8_t YDLIDAR_CMD_START[] = { 0xA5, 0x60, 0x00, 0x60, 0x01, 0x00, 0x60, 0xE8 };
 static const uint8_t YDLIDAR_CMD_STOP[]  = { 0xA5, 0x65, 0x00, 0x65, 0x01, 0x00, 0x65, 0x1B };
@@ -211,6 +212,8 @@ volatile bool nav_active = false;
 String current_destination = "";  // 【新增】当前导航目的地，用于MQTT上报
 volatile bool  is_blocked  = false;
 volatile bool  is_ai_talking = false;
+volatile unsigned long ai_talking_start_time = 0;  // 【新增】记录开始时间
+const unsigned long AI_TALKING_TIMEOUT_MS = 15000;  // 【新增】15秒超时
 volatile bool  is_tts_requesting = false;  // TTS请求状态标志，防止重复发送
 unsigned long  tts_request_start_time = 0;
 // TTS请求标志互斥锁（防止竞态条件）
@@ -870,6 +873,12 @@ static unsigned long last_alert_text_time = 0;
 #define TTS_TRIGGER_COUNT 1
 // ==================== 障碍物检测和播报（三向雷达版 - 修复版）====================
 void checkObstacleAndAlert() {
+    // 【新增】检查 is_ai_talking 是否超时卡住
+    if (is_ai_talking && (millis() - ai_talking_start_time > AI_TALKING_TIMEOUT_MS)) {
+        Serial.println("[TTS超时] is_ai_talking 超时，自动重置");
+        is_ai_talking = false;
+    }
+
     // 三向雷达: [0]=前方, [1]=左方, [2]=右方
     float f = dir_smt[0];
     float L = dir_smt[1];
@@ -919,6 +928,9 @@ void checkObstacleAndAlert() {
 
     // 【修复】检查是否正在播报其他内容
     if (is_ai_talking || getTTSRequesting()) {
+        // 【调试】打印状态
+        Serial.printf("[避障跳过] is_ai_talking=%d, is_tts_requesting=%d\n",
+                      is_ai_talking, is_tts_requesting);
         // 如果是紧急情况，可以打断当前播报
         if (!urgentAlert) {
             return;  // 非紧急情况，等待当前播报完成
@@ -1636,6 +1648,8 @@ last_gps_lng_for_mileage = *((float*)&rtc_last_gps_lng);
 has_last_gps_pos = true;
 }
 pinMode(MOTOR_IN1, OUTPUT); pinMode(MOTOR_IN2, OUTPUT); pinMode(MOTOR_PWM, OUTPUT);
+pinMode(MOTOR_STBY, OUTPUT);  // 【新增】STBY引脚
+digitalWrite(MOTOR_STBY, HIGH);  // 【新增】置高使能电机驱动
 motorControl(0);
 pinMode(RADAR_M_CTR_PIN, OUTPUT);
 digitalWrite(RADAR_M_CTR_PIN, HIGH);
@@ -2161,6 +2175,7 @@ stream_priority = new_priority;
 stream_session_id = session_id;
 stream_buf_used = 0;
 is_ai_talking = true;  // 【修复】标记正在播放语音
+	ai_talking_start_time = millis();  // 【新增】记录开始时间
 if (VoiceTaskHandle != NULL) {
 vTaskSuspend(VoiceTaskHandle);
 }
