@@ -8,6 +8,7 @@ __pycache__/
 .env
 .env.local
 tts_segments/
+audio_cache/
 duckdns_update.log
 .vscode/
 .idea/
