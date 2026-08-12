@@ -193,7 +193,9 @@ if __name__ == "__main__":
         ob_det.draw_result(pl, res)
 
         frame_counter += 1
-        if frame_counter % 3 == 0 and res:
+        if frame_counter % 3 == 0:
+            # 【修复】无检测时也发送NONE，避免ESP32保留旧检测目标
+            # res为空时 upload_detections([]) 内部会发送 "NONE\n"
             upload_detections([{"x": int(d[0]), "y": int(d[1]), "w": int(d[2]-d[0]), "h": int(d[3]-d[1]), "label": LABEL_MAP.get(labels[int(d[5])], (labels[int(d[5])], "#00d4ff"))[0], "class": labels[int(d[5])], "confidence": round(float(d[4]), 2)} for d in res])
 
         pl.show_image()
