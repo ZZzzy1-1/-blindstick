@@ -301,6 +301,27 @@ function startHeartbeatCheck() {
     }, 2000);  // 每2秒检查一次
 }
 
+// ================= 后端保活（防止Render实例休眠）====================
+// 【新增】Render免费实例15分钟无流量会休眠，导致TTS服务中断。
+// 前端定期ping后端/health保持活跃。
+function startBackendKeepAlive() {
+    setInterval(() => {
+        fetch(`${API_BASE}/health`, { method: 'GET', cache: 'no-store' })
+            .then(r => r.json())
+            .then(d => {
+                if (d && d.mqtt_connected !== undefined) {
+                    // 后端MQTT状态记录（可在控制台观察）
+                    if (!d.mqtt_connected) {
+                        console.warn('[后端] MQTT未连接，TTS服务不可用');
+                    } else {
+                        console.log('[后端] 保活成功，MQTT已连接');
+                    }
+                }
+            })
+            .catch(e => console.warn('[后端] 保活请求失败（可能实例正在唤醒）:', e.message));
+    }, 5 * 60 * 1000);  // 每5分钟ping一次
+}
+
 // ================= MQTT 连接 =================
 function connectMQTT() {
     // 检查 MQTT 库是否加载
@@ -875,6 +896,7 @@ function init() {
     initDetectionStats();
     connectMQTT();
     startHeartbeatCheck();  // 【新增】启动心跳检测
+    startBackendKeepAlive();  // 【新增】启动后端保活
     loadHomeCitySettings();
     initModal();
 

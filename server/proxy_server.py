@@ -186,7 +186,10 @@ class MQTTAudioSender:
         self.username = "blindstick"
         self.password = "2026"
         self.connect_retry_count = 0
-        self.max_retries = 5
+        # 【修复】移除最大重试次数限制，改为无限重试
+        self.max_retries = 99999
+        # 【修复】客户端ID加随机后缀，避免与其他实例冲突被踢下线
+        self.client_id = "proxy_server_tts_" + str(int(time.time() * 1000))[-8:]
 
     def on_message(self, client, userdata, msg):
         """处理接收到的MQTT消息 - 使用线程池异步处理避免阻塞"""
@@ -203,10 +206,8 @@ class MQTTAudioSender:
 
                 if text:
                     print(f"[MQTT] TTS请求来自: {msg.retain and '保留消息' or '实时消息'}, 内容: '{text[:30]}...'")
-                    # 跳过开机语音，因为ESP32已本地播放
-                    if "系统启动" in text or "启动成功" in text:
-                        print(f"[MQTT] 跳过开机语音TTS请求: '{text[:30]}...'")
-                        return
+                    # 【修复】移除开机语音跳过逻辑，让所有TTS请求都能正常合成
+                    # 开机语音"系统启动成功..."也需要通过代理合成播放
                     # 使用线程异步处理，不阻塞MQTT回调
                     import threading
                     t = threading.Thread(
@@ -266,8 +267,22 @@ class MQTTAudioSender:
                     "priority": priority
                 })
 
-                self.client.publish("blindstick/tts/url", url_payload)
-                print(f"[MQTT] TTS URL pushed: {full_url}")
+                # 【修复】检测发布是否成功，失败则重试
+                if self.client and self.connected:
+                    result = self.client.publish("blindstick/tts/url", url_payload)
+                    # 检查返回的 (rc, mid) 元组，rc=0 表示成功
+                    rc = result.rc if hasattr(result, 'rc') else result[0]
+                    if rc == 0:
+                        print(f"[MQTT] TTS URL pushed: {full_url}")
+                    else:
+                        print(f"[MQTT] TTS URL发布失败 rc={rc}, 将重试...")
+                        time.sleep(1)
+                        try:
+                            self.client.publish("blindstick/tts/url", url_payload)
+                        except Exception as retry_e:
+                            print(f"[MQTT] TTS URL重试失败: {retry_e}")
+                else:
+                    print(f"[MQTT] MQTT未连接，无法推送TTS URL: {full_url}")
             else:
                 print(f"[TTS] Synthesis failed: {resp.text[:200]}")
 
@@ -285,14 +300,25 @@ class MQTTAudioSender:
             return True
 
         try:
+            # 【修复】如果已有client且正在运行，先停止旧连接
+            if self.client is not None:
+                try:
+                    self.client.disconnect()
+                except Exception:
+                    pass
+                try:
+                    self.client.loop_stop()
+                except Exception:
+                    pass
+
             # 使用新版 API (paho-mqtt >= 2.0) 或旧版 API
             if MQTT_V2:
                 self.client = mqtt.Client(
                     callback_api_version=CallbackAPIVersion.VERSION2,
-                    client_id="proxy_server_tts"
+                    client_id=self.client_id
                 )
             else:
-                self.client = mqtt.Client(client_id="proxy_server_tts")
+                self.client = mqtt.Client(client_id=self.client_id)
 
             self.client.username_pw_set(self.username, self.password)
 
@@ -315,8 +341,11 @@ class MQTTAudioSender:
                     self.connect_retry_count = 0
                     print(f"[MQTT] Connected to {self.broker}")
                     # 订阅TTS请求主题
-                    client.subscribe("blindstick/tts/request")
-                    print("[MQTT] Subscribed to blindstick/tts/request")
+                    try:
+                        client.subscribe("blindstick/tts/request")
+                        print("[MQTT] Subscribed to blindstick/tts/request")
+                    except Exception as e:
+                        print(f"[MQTT] 订阅失败: {e}")
                 else:
                     print(f"[MQTT] Connection failed, code: {reason_code}")
 
@@ -325,7 +354,8 @@ class MQTTAudioSender:
                 self.connected = False
                 # 处理不同版本的参数
                 if rc is not None:
-                    print(f"[MQTT] Disconnected, code: {rc}")
+                    rc_val = rc.value if hasattr(rc, 'value') else rc
+                    print(f"[MQTT] Disconnected, code: {rc_val}")
                 else:
                     print("[MQTT] Disconnected")
 
@@ -352,12 +382,12 @@ class MQTTAudioSender:
             traceback.print_exc()
             self.connect_retry_count += 1
             if self.connect_retry_count < self.max_retries:
-                print(f"[MQTT] Will retry ({self.connect_retry_count}/{self.max_retries})")
+                print(f"[MQTT] Will retry ({self.connect_retry_count})")
             return False
 
     def reconnect_if_needed(self):
-        """检查连接状态，如需要则重连"""
-        if not self.connected and self.connect_retry_count < self.max_retries:
+        """检查连接状态，如需要则重连（无限重试）"""
+        if not self.connected:
             print("[MQTT] Reconnecting...")
             return self.connect()
         return self.connected
@@ -413,23 +443,50 @@ if __name__ == '__main__':
     print(f"Running at: http://0.0.0.0:{port}")
     print("=" * 50)
 
-    # 启动 MQTT 连接（在后台重试）
+    # 启动 MQTT 连接（持续运行，断开自动重连）
     print("[Startup] Starting MQTT connection...")
-    def mqtt_connect_loop():
-        while not mqtt_sender.connected and mqtt_sender.connect_retry_count < mqtt_sender.max_retries:
-            mqtt_sender.connect()
-            if not mqtt_sender.connected:
-                time.sleep(5)
-        if mqtt_sender.connected:
-            print("[MQTT] Connection established successfully")
-        else:
-            print("[MQTT] Failed to connect after maximum retries")
-            print("[MQTT] TTS service will not work without MQTT connection")
+    def mqtt_keepalive_loop():
+        """持续运行：连接成功后保持监控，断开后自动重连（无限重试）"""
+        while True:
+            if mqtt_sender.connected:
+                # 已连接，每10秒检查一次
+                time.sleep(10)
+            else:
+                # 尝试连接（connect内部会处理旧client）
+                success = mqtt_sender.connect()
+                # 即使connect()返回True，也要确认connected标志（可能有立即断开的情况）
+                if not success or not mqtt_sender.connected:
+                    print("[MQTT] 连接未建立，3秒后重试...")
+                    time.sleep(3)
+                else:
+                    print("[MQTT] MQTT连接已建立，开始监控")
+                    time.sleep(10)
 
-    # 在后台线程启动 MQTT 连接
+    # 在后台线程启动 MQTT 连接守护循环
     import threading
-    mqtt_thread = threading.Thread(target=mqtt_connect_loop, daemon=True)
+    mqtt_thread = threading.Thread(target=mqtt_keepalive_loop, daemon=True)
     mqtt_thread.start()
+
+    # 【新增】防止Render免费实例休眠：定时自我唤醒
+    def keepalive_self_ping():
+        """每14分钟访问一次自身/health，防止Render实例休眠"""
+        import urllib.request
+        while True:
+            time.sleep(14 * 60)  # 14分钟一次（免费层15分钟休眠）
+            try:
+                port = int(os.environ.get('PORT', 8090))
+                req = urllib.request.Request(
+                    f"http://localhost:{port}/health",
+                    headers={'User-Agent': 'Mozilla/5.0'}
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    print(f"[KeepAlive] 自我唤醒: {resp.status}")
+            except Exception as e:
+                print(f"[KeepAlive] 自我唤醒失败(可忽略): {e}")
+
+    # 启动自我唤醒线程（仅在非Render本地运行时也保持）
+    keepalive_thread = threading.Thread(target=keepalive_self_ping, daemon=True)
+    keepalive_thread.start()
 
     # 启动 Flask 服务
     app.run(host='0.0.0.0', port=port, debug=False)
