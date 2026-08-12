@@ -400,41 +400,65 @@ void smartAvoid() {
     float L = dir_smt[1];
     float R = dir_smt[2];
 
+    // 【修复】转向迟滞：避免雷达数据波动导致方向频繁切换
+    static int lastSteerDir = 0;  // -1=左转, 1=右转, 0=直行/停止
+    const float TURN_CHANGE_MARGIN = 30.0f;  // 切换方向需要的差距
+
     bool leftBlocked = (L < SIDE_WARNING);   // 80cm
     bool rightBlocked = (R < SIDE_WARNING);
     bool leftTight = (L < 40.0f);
     bool rightTight = (R < 40.0f);
 
+    // ===== 前方有障碍物 =====
     if (f < FRONT_CRITICAL) {
+        // 两侧都非常堵(<40cm)才停止
         if (leftTight && rightTight) {
             motorControl(0);
+            lastSteerDir = 0;
             Serial.printf("[避障] 被包围(F:%.0f L:%.0f R:%.0f)，停止\n", f, L, R);
             return;
         }
-        if (L > R) {
-            int power = (f < 50.0f) ? -STEER_MAX_PWM : -STEER_SLOW_PWM;
-            motorControl(power);
+        // 决定转向方向（带迟滞）
+        int desiredDir;
+        if (L > R + TURN_CHANGE_MARGIN) {
+            desiredDir = -1;  // 左边明显更空，左转
+        } else if (R > L + TURN_CHANGE_MARGIN) {
+            desiredDir = 1;   // 右边明显更空，右转
+        } else {
+            // 差距不大，保持上次方向（避免频繁切换），默认右转
+            desiredDir = (lastSteerDir != 0) ? lastSteerDir : 1;
+        }
+        lastSteerDir = desiredDir;
+
+        int power = (f < 50.0f) ? STEER_MAX_PWM : STEER_SLOW_PWM;
+        if (desiredDir == -1) {
+            motorControl(-power);
             Serial.printf("[避障] 前方%.0fcm，左转(左%.0f vs 右%.0f)\n", f, L, R);
         } else {
-            int power = (f < 50.0f) ? STEER_MAX_PWM : STEER_SLOW_PWM;
             motorControl(power);
             Serial.printf("[避障] 前方%.0fcm，右转(左%.0f vs 右%.0f)\n", f, L, R);
         }
         return;
     }
 
+    // ===== 前方安全，侧边处理（带迟滞）=====
     if (leftBlocked && rightBlocked) {
         motorControl(0);
+        lastSteerDir = 0;
         return;
     }
-    if (leftBlocked) {
+    if (leftBlocked && !rightBlocked) {
         motorControl(STEER_SLOW_PWM);  // 左堵→右转
+        lastSteerDir = 1;
         return;
     }
-    if (rightBlocked) {
+    if (rightBlocked && !leftBlocked) {
         motorControl(-STEER_SLOW_PWM);  // 右堵→左转
+        lastSteerDir = -1;
         return;
     }
+    // 无障碍物 → 停机
+    lastSteerDir = 0;
     motorControl(0);
 }
 // ==================== 雷达处理 ====================
