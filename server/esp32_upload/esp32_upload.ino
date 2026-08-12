@@ -127,7 +127,20 @@ float calcDistance(float lat1, float lng1, float lat2, float lng2);
 void initStreamingTTS();
 void handleStreamControl(const char* payload, int length);
 void handleStreamAudio(const char* topic, byte* payload, unsigned int length);
-void handleTTSUrl(const char* payload, int length);  // URL方式下载并播放TTS
+// ==================== TTS URL 异步播放（独立任务，不阻塞MQTT主循环）====================
+// 【修复】之前handleTTSUrl在mqtt回调中同步下载+播放(约10秒)，阻塞了传感器数据上传，
+//        导致网页数据长时间不更新。改为独立任务异步播放。
+#define TTS_URL_MSG_URL_LEN  220
+#define TTS_URL_MSG_TEXT_LEN 60
+struct TTSUrlMsg {
+    char url[TTS_URL_MSG_URL_LEN];
+    char text[TTS_URL_MSG_TEXT_LEN];
+    int priority;
+};
+QueueHandle_t ttsUrlQueue = NULL;
+void TTSUrlPlayerTask(void* pvParameters);
+void handleTTSUrlDownload(const TTSUrlMsg* msg);
+
 void playPcmData(uint8_t* data, int len);
 void stopCurrentPlayback();
 const char* getPrioName(int p);
@@ -381,30 +394,26 @@ void motorControl(int steerPower) {
 }
 // ==================== 避障决策（修复版 - 智能左右权重避障算法）====================
 void smartAvoid() {
-    // 【修复】使用平滑后的数据 dir_smt 进行决策
-    float f = dir_smt[0];  // 前方
-    float L = dir_smt[1];  // 左方
-    float R = dir_smt[2];  // 右方
+    float f = dir_smt[0];
+    float L = dir_smt[1];
+    float R = dir_smt[2];
 
-    bool leftBlocked = (L < SIDE_WARNING);
+    bool leftBlocked = (L < SIDE_WARNING);   // 80cm
     bool rightBlocked = (R < SIDE_WARNING);
+    bool leftTight = (L < 40.0f);
+    bool rightTight = (R < 40.0f);
 
-    // ===== 前方有障碍物（最紧急）=====
     if (f < FRONT_CRITICAL) {
-        // 【修复】情况1：前方+左右都被堵 → 被包围，停止转动（避免无意义空转）
-        if (leftBlocked && rightBlocked) {
+        if (leftTight && rightTight) {
             motorControl(0);
-            Serial.printf("[避障] 被包围(F:%.0f L:%.0f R:%.0f)，停止转动\n", f, L, R);
+            Serial.printf("[避障] 被包围(F:%.0f L:%.0f R:%.0f)，停止\n", f, L, R);
             return;
         }
-        // 情况2：转向更空的一侧
         if (L > R) {
-            // 左边更空 → 左转（负值）
             int power = (f < 50.0f) ? -STEER_MAX_PWM : -STEER_SLOW_PWM;
             motorControl(power);
             Serial.printf("[避障] 前方%.0fcm，左转(左%.0f vs 右%.0f)\n", f, L, R);
         } else {
-            // 右边更空 → 右转（正值）
             int power = (f < 50.0f) ? STEER_MAX_PWM : STEER_SLOW_PWM;
             motorControl(power);
             Serial.printf("[避障] 前方%.0fcm，右转(左%.0f vs 右%.0f)\n", f, L, R);
@@ -412,23 +421,18 @@ void smartAvoid() {
         return;
     }
 
-    // ===== 前方安全，处理侧边障碍物 =====
-    // 【修复】左右都被堵 → 停止（两边都出不去，不要乱转）
     if (leftBlocked && rightBlocked) {
         motorControl(0);
         return;
     }
-    // 左边有障碍物 → 右转
     if (leftBlocked) {
-        motorControl(STEER_SLOW_PWM);
+        motorControl(STEER_SLOW_PWM);  // 左堵→右转
         return;
     }
-    // 右边有障碍物 → 左转
     if (rightBlocked) {
-        motorControl(-STEER_SLOW_PWM);
+        motorControl(-STEER_SLOW_PWM);  // 右堵→左转
         return;
     }
-    // 无障碍物 → 停机
     motorControl(0);
 }
 // ==================== 雷达处理 ====================
@@ -743,10 +747,24 @@ if (strncmp(topic, "blindstick/tts/stream/", 22) == 0) {
 handleStreamAudio(topic, payload, length);
 return;
 }
-// ===== TTS URL处理（新方案：接收URL并下载）=====
+// ===== TTS URL处理（新方案：接收URL并入队，由独立任务下载播放）=====
 if (strcmp(topic, "blindstick/tts/url") == 0) {
-handleTTSUrl((const char*)payload, length);
-return;
+    StaticJsonDocument<512> doc;
+    DeserializationError err = deserializeJson(doc, payload, length);
+    if (err) { Serial.println("[TTS-URL] JSON解析失败"); return; }
+    const char* url = doc["url"];
+    if (!url || strlen(url) == 0) { Serial.println("[TTS-URL] URL为空"); return; }
+    TTSUrlMsg msg;
+    strncpy(msg.url, url, sizeof(msg.url) - 1);
+    msg.url[sizeof(msg.url) - 1] = '\0';
+    const char* text = doc["text"];
+    strncpy(msg.text, text ? text : "", sizeof(msg.text) - 1);
+    msg.text[sizeof(msg.text) - 1] = '\0';
+    msg.priority = doc["priority"] | PRIO_NORMAL;
+    if (ttsUrlQueue != NULL && xQueueSend(ttsUrlQueue, &msg, 0) != pdTRUE) {
+        Serial.println("[TTS-URL] 播放队列已满，丢弃本次播报");
+    }
+    return;
 }
 // ===== 常住地设置处理 =====
 if (strcmp(topic, "blindstick/config/home_city") == 0) {
@@ -1670,6 +1688,15 @@ mqtt_reconnect();
 xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 8192, NULL, 3, &RadarTaskHandle, 0);
 xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
 xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 16384, NULL, 2, &VoiceTaskHandle, 1);  // 【修复】增大栈空间防止ASR请求时栈溢出
+    // 【修复】创建TTS URL异步播放队列和任务（独立播放，不阻塞MQTT主循环和传感器上传）
+    ttsUrlQueue = xQueueCreate(4, sizeof(TTSUrlMsg));
+    if (ttsUrlQueue != NULL) {
+        xTaskCreatePinnedToCore(TTSUrlPlayerTask, "TTSPlayer", 16384, NULL, 3, NULL, 0);
+        Serial.println("[TTS-Player] 异步播放任务已启动");
+    } else {
+        Serial.println("[TTS-Player] 队列创建失败");
+    }
+
 }
 void loop() {
 vTaskDelete(NULL);
@@ -1920,25 +1947,25 @@ mqtt.publish("blindstick/tts/request", buf, len);
 }
 }
 // ==================== TTS URL处理（下载并播放）====================
-void handleTTSUrl(const char* payload, int length) {
-// 解析JSON获取URL和文本
-StaticJsonDocument<512> doc;
-DeserializationError error = deserializeJson(doc, payload, length);
-if (error) {
-Serial.printf("[TTS-URL] JSON解析失败: %s\n", error.c_str());
-return;
+// ==================== TTS URL 异步播放任务 ====================
+void TTSUrlPlayerTask(void* pvParameters) {
+    TTSUrlMsg msg;
+    while (true) {
+        if (xQueueReceive(ttsUrlQueue, &msg, portMAX_DELAY) == pdTRUE) {
+            handleTTSUrlDownload(&msg);
+        }
+    }
 }
-const char* url = doc["url"];
-const char* text = doc["text"];
-int ttsPriority = doc["priority"] | PRIO_NORMAL;  // 【新增】解析优先级
-if (!url || strlen(url) == 0) {
-Serial.println("[TTS-URL] URL为空");
-return;
-}
-// 去重：基于文本内容 + 3秒时间窗口
-static String lastText = "";
-static unsigned long lastPlayTime = 0;
-String currentText = text ? String(text) : "";
+
+// ==================== TTS URL下载并播放（由独立任务调用）====================
+void handleTTSUrlDownload(const TTSUrlMsg* msg) {
+    const char* url = msg->url;
+    const char* text = msg->text;
+    int ttsPriority = msg->priority;
+    // 去重：基于文本内容 + 3秒时间窗口
+    static String lastText = "";
+    static unsigned long lastPlayTime = 0;
+    String currentText = text ? String(text) : "";
 unsigned long now = millis();
 if (currentText == lastText && (now - lastPlayTime) < 3000) {
 Serial.println("[TTS-URL] 3秒内重复文本，跳过播放");
