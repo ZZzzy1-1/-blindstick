@@ -540,7 +540,8 @@ k230_detections[0].timestamp = millis();
 k230_detection_count = 1;
 }
 void sendK230_TTSRequest(const char* targetName) {
-if (!mqtt.connected()) return;
+    Serial.printf("[K230播报] 目标:%s -> 发送TTS请求\n", targetName);  // 诊断
+    if (!mqtt.connected()) { Serial.println("[K230播报] MQTT未连接，跳过"); return; }
 StaticJsonDocument<256> ttsDoc;
 char buf[256];
 char alertText[64];
@@ -555,13 +556,20 @@ mqtt.publish(MQTT_TOPIC_TTS_REQ, buf, len);
 * 处理从K230接收的数据（仅检测数据）- 限制每次处理的最大字符数避免阻塞
 */
 void processK230Data() {
-int maxChars = 100;  // 每次最多处理100个字符，避免阻塞
+    // 【诊断】每5秒打印K230串口状态，确认K230是否在发数据
+    static unsigned long lastK230Diag = 0;
+    if (millis() - lastK230Diag > 5000) {
+        lastK230Diag = millis();
+        Serial.printf("[K230诊断] 串口可用:%d 缓冲:%d\n", k230Serial.available(), k230_receiveBuffer.length());
+    }
+    int maxChars = 100;  // 每次最多处理100个字符，避免阻塞
 while (k230Serial.available() > 0 && maxChars-- > 0) {
 char c = k230Serial.read();
 if (c == '\n') {
 k230_receiveBuffer.trim();
 if (k230_receiveBuffer.length() > 0) {
 if (k230_receiveBuffer.startsWith("DET:")) {
+    Serial.printf("[K230] 收到检测:%s' + BS + 'n", k230_receiveBuffer.c_str());  // 诊断
 parseK230SingleDetection(k230_receiveBuffer);
 String targetName = k230_receiveBuffer.substring(4);
 int targetIndex = getK230TargetIndex(targetName.c_str());
