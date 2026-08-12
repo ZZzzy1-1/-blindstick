@@ -1006,6 +1006,11 @@ void checkObstacleAndAlert() {
             // 增加障碍物提醒次数统计
             obstacle_count++;
             saveStatsToRTC();
+
+            // 【修复】标记正在请求TTS，让"正在播报"抑制逻辑生效
+            // （之前is_tts_requesting从未被设为true，导致避障播报不受抑制，
+            //   VoiceTask被频繁挂起，语音识别无法工作）
+            setTTSRequesting(true);
         }
     }
 }
@@ -1962,14 +1967,16 @@ int httpCode = http.GET();
 if (httpCode != 200) {
 Serial.printf("[TTS-URL] 下载失败: %d\n", httpCode);
 http.end();
+setTTSRequesting(false);  // 【修复】重置TTS状态
 if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
 return;
 }
 int len = http.getSize();
-if (len <= 0 || len > 120000) {  // 限制最大120KB，避免内存不足
+if (len <= 0 || len > 200000) {  // 【修复】限制最大200KB（120KB太短，开机语音约128KB被拒）
 Serial.printf("[TTS-URL] 音频大小无效或太大: %d\n", len);
 http.end();
 if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
+setTTSRequesting(false);  // 【修复】重置TTS状态
 return;
 }
 // 检查可用内存（使用ESP-IDF风格API）
@@ -1983,12 +1990,14 @@ audioBuffer = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
 audioBuffer = (uint8_t*)malloc(len);
 } else {
 http.end();
+setTTSRequesting(false);  // 【修复】重置TTS状态
 if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
 return;
 }
 if (!audioBuffer) {
 Serial.println("[TTS-URL] 内存分配失败");
 http.end();
+setTTSRequesting(false);  // 【修复】重置TTS状态
 if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
 return;
 }
