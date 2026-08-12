@@ -386,74 +386,50 @@ void smartAvoid() {
     float L = dir_smt[1];  // 左方
     float R = dir_smt[2];  // 右方
 
-    // 【修复】计算左右安全距离差，用于决策
-    // 使用三元运算符避免 max() 模板类型推导问题
-    float leftSafeSpace = ((f - FRONT_CRITICAL) > 0.0f ? (f - FRONT_CRITICAL) : 0.0f) +
-                          ((L - SIDE_WARNING) > 0.0f ? (L - SIDE_WARNING) : 0.0f);
-    float rightSafeSpace = ((f - FRONT_CRITICAL) > 0.0f ? (f - FRONT_CRITICAL) : 0.0f) +
-                           ((R - SIDE_WARNING) > 0.0f ? (R - SIDE_WARNING) : 0.0f);
+    bool leftBlocked = (L < SIDE_WARNING);
+    bool rightBlocked = (R < SIDE_WARNING);
 
-    // --- 步骤 A：计算左侧物体的【向右排斥力】---
-    float leftForce = 0.0;
-    if (L < SIDE_WARNING) {
-        // 越近力越大，非线性响应
-        leftForce = pow((SIDE_WARNING - L) / SIDE_WARNING, 1.5) * STEER_MAX_PWM;
-    }
-
-    // --- 步骤 B：计算右侧物体的【向左排斥力】---
-    float rightForce = 0.0;
-    if (R < SIDE_WARNING) {
-        rightForce = pow((SIDE_WARNING - R) / SIDE_WARNING, 1.5) * STEER_MAX_PWM;
-    }
-
-    // 【新增】步骤 C：前方障碍物紧急处理
+    // ===== 前方有障碍物（最紧急）=====
     if (f < FRONT_CRITICAL) {
-        // 前方有障碍物，需要选择转向方向
-        // 优先选择安全空间更大的一侧
-        if (leftSafeSpace > rightSafeSpace + 20.0f) {
-            // 左边明显更安全，左转（负值）
-            int steerPower = -STEER_MAX_PWM;
-            // 根据前方距离调整强度
-            if (f > 50.0f) {
-                steerPower = -STEER_SLOW_PWM;  // 距离还够，缓慢转向
-            }
-            motorControl(steerPower);
-            Serial.printf("[避障] 前方%.0fcm，左转(左边%.0fcm vs 右边%.0fcm)\n", f, L, R);
+        // 【修复】情况1：前方+左右都被堵 → 被包围，停止转动（避免无意义空转）
+        if (leftBlocked && rightBlocked) {
+            motorControl(0);
+            Serial.printf("[避障] 被包围(F:%.0f L:%.0f R:%.0f)，停止转动\n", f, L, R);
+            return;
         }
-        else if (rightSafeSpace > leftSafeSpace + 20.0f) {
-            // 右边明显更安全，右转（正值）
-            int steerPower = STEER_MAX_PWM;
-            if (f > 50.0f) {
-                steerPower = STEER_SLOW_PWM;
-            }
-            motorControl(steerPower);
-            Serial.printf("[避障] 前方%.0fcm，右转(左边%.0fcm vs 右边%.0fcm)\n", f, L, R);
-        }
-        else {
-            // 两边差不多，使用力平衡决策
-            float netForce = leftForce - rightForce;
-            if (abs(netForce) < 30.0f) {
-                // 力相近，默认左转（可以改成你喜欢的一侧）
-                motorControl(-STEER_SLOW_PWM);
-                Serial.printf("[避障] 前方%.0fcm，默认左转(左右相近)\n", f);
-            } else {
-                motorControl((int)constrain(netForce, -STEER_MAX_PWM, STEER_MAX_PWM));
-            }
+        // 情况2：转向更空的一侧
+        if (L > R) {
+            // 左边更空 → 左转（负值）
+            int power = (f < 50.0f) ? -STEER_MAX_PWM : -STEER_SLOW_PWM;
+            motorControl(power);
+            Serial.printf("[避障] 前方%.0fcm，左转(左%.0f vs 右%.0f)\n", f, L, R);
+        } else {
+            // 右边更空 → 右转（正值）
+            int power = (f < 50.0f) ? STEER_MAX_PWM : STEER_SLOW_PWM;
+            motorControl(power);
+            Serial.printf("[避障] 前方%.0fcm，右转(左%.0f vs 右%.0f)\n", f, L, R);
         }
         return;
     }
 
-    // 情况 2：前方安全，仅侧边有障碍物 -> 低速微调
-    if (leftForce > 0 || rightForce > 0) {
-        float netSteerSignal = leftForce - rightForce;
-        // 限制在低速范围内
-        int slowSteer = (int)constrain(netSteerSignal, -STEER_SLOW_PWM, STEER_SLOW_PWM);
-        motorControl(slowSteer);
-    }
-    // 情况 3：无障碍物，停机
-    else {
+    // ===== 前方安全，处理侧边障碍物 =====
+    // 【修复】左右都被堵 → 停止（两边都出不去，不要乱转）
+    if (leftBlocked && rightBlocked) {
         motorControl(0);
+        return;
     }
+    // 左边有障碍物 → 右转
+    if (leftBlocked) {
+        motorControl(STEER_SLOW_PWM);
+        return;
+    }
+    // 右边有障碍物 → 左转
+    if (rightBlocked) {
+        motorControl(-STEER_SLOW_PWM);
+        return;
+    }
+    // 无障碍物 → 停机
+    motorControl(0);
 }
 // ==================== 雷达处理 ====================
 // ==================== K230视觉检测处理 ====================
@@ -927,22 +903,21 @@ void checkObstacleAndAlert() {
     }
 
     // 【修复】检查是否正在播报其他内容
+    // 【修复】正在播放TTS时抑制新的避障播报，避免连续播报导致语音识别被一直挂起
+    // 仅当距离极度危险(<40cm)时才打断当前播放紧急播报
     if (is_ai_talking || getTTSRequesting()) {
-        // 【调试】打印状态
-        Serial.printf("[避障跳过] is_ai_talking=%d, is_tts_requesting=%d\n",
-                      is_ai_talking, is_tts_requesting);
-        // 如果是紧急情况，可以打断当前播报
-        if (!urgentAlert) {
-            return;  // 非紧急情况，等待当前播报完成
+        bool criticalDanger = (f < 40.0f) || (L < 35.0f) || (R < 35.0f);
+        if (!criticalDanger) {
+            return;  // 正在播报且非极端危险，跳过本次（下轮再试），给语音识别留时间
         }
-        // 紧急情况：发送打断信号
+        // 极端危险：发送打断信号，让避障播报优先
         StaticJsonDocument<256> doc;
         doc["type"] = "interrupt";
         doc["priority"] = PRIO_HIGH;
         char buf[256];
         size_t len = serializeJson(doc, buf, sizeof(buf));
         mqtt.publish("blindstick/tts/control", buf, len);
-        delay(50);  // 短暂等待打断生效
+        delay(50);
     }
 
     // 构建告警文本
@@ -992,7 +967,7 @@ void checkObstacleAndAlert() {
     static float lastAlertFront = 0;
     static float lastAlertLeft = 0;
     static float lastAlertRight = 0;
-    const unsigned long ALERT_COOLDOWN_MS = 4000;  // 4秒内不重复相同告警
+    const unsigned long ALERT_COOLDOWN_MS = 8000;  // 【修复】8秒内不重复相同告警，给语音识别留时间
 
     if (alert_text == lastAlertText && (now - lastAlertTime) < ALERT_COOLDOWN_MS) {
         return;  // 相同告警在冷却期内，跳过
@@ -1000,7 +975,7 @@ void checkObstacleAndAlert() {
 
     // 【修复】检查距离变化，如果距离变化很小也跳过
     float distChange = abs(f - lastAlertFront) + abs(L - lastAlertLeft) + abs(R - lastAlertRight);
-    if (distChange < 30.0f && (now - lastAlertTime) < ALERT_COOLDOWN_MS * 2) {
+    if (distChange < 50.0f && (now - lastAlertTime) < ALERT_COOLDOWN_MS * 2) {
         // 距离变化不大，延长冷却期
         return;
     }
