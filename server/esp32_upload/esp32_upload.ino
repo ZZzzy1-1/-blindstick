@@ -384,8 +384,11 @@ void smartAvoid() {
     float R = dir_smt[2];  // 右方
 
     // 【修复】计算左右安全距离差，用于决策
-    float leftSafeSpace = max(0.0f, f - FRONT_CRITICAL) + max(0.0f, L - SIDE_WARNING);
-    float rightSafeSpace = max(0.0f, f - FRONT_CRITICAL) + max(0.0f, R - SIDE_WARNING);
+    // 使用三元运算符避免 max() 模板类型推导问题
+    float leftSafeSpace = ((f - FRONT_CRITICAL) > 0.0f ? (f - FRONT_CRITICAL) : 0.0f) +
+                          ((L - SIDE_WARNING) > 0.0f ? (L - SIDE_WARNING) : 0.0f);
+    float rightSafeSpace = ((f - FRONT_CRITICAL) > 0.0f ? (f - FRONT_CRITICAL) : 0.0f) +
+                           ((R - SIDE_WARNING) > 0.0f ? (R - SIDE_WARNING) : 0.0f);
 
     // --- 步骤 A：计算左侧物体的【向右排斥力】---
     float leftForce = 0.0;
