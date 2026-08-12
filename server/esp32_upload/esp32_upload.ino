@@ -185,12 +185,13 @@ default: return "未知";
 #define SIDE_WARNING_CM     180.0
 #define AVOID_TURN_HOLD_MS 2000
 // ==================== 雷达角度扇区 ====================
-#define ANG_FRONT_MIN  350
-#define ANG_FRONT_MAX  10
-#define ANG_LEFT_MIN   70
-#define ANG_LEFT_MAX   110
-#define ANG_RIGHT_MIN  250
-#define ANG_RIGHT_MAX  290
+// 【修复】删除重复定义，只保留一组
+#define ANG_FRONT_MIN  330
+#define ANG_FRONT_MAX  30
+#define ANG_LEFT_MIN   60
+#define ANG_LEFT_MAX   120
+#define ANG_RIGHT_MIN  240
+#define ANG_RIGHT_MAX  300
 // 【加快】MQTT上传间隔从200ms改为100ms（10Hz刷新率，平衡实时性和稳定性）
 #define UPLOAD_INTERVAL_MS  100
 #define STEER_MAX_PWM  255
@@ -329,73 +330,124 @@ volatile float dir_smt[NUM_DIR] = {400.0f, 400.0f, 400.0f};
 // ==================== 智能避障参数（用户算法）====================
 #define STEER_MAX_PWM 230
 #define STEER_SLOW_PWM 180
-#define FRONT_CRITICAL 60.0
-#define SIDE_WARNING   50.0
-#define ANG_FRONT_MIN  330
-#define ANG_FRONT_MAX  30
-#define ANG_LEFT_MIN   60
-#define ANG_LEFT_MAX   120
-#define ANG_RIGHT_MIN  240
-#define ANG_RIGHT_MAX  300
-float frontDist = 200.0;
-float leftDist  = 200.0;
-float rightDist = 200.0;
+#define FRONT_CRITICAL 80.0    // 【修复】与告警阈值一致，避免冲突
+#define SIDE_WARNING   80.0    // 【修复】与前方阈值相同，公平比较
+
+// 【新增】有效的雷达距离范围
+#define RADAR_MIN_VALID_CM 20.0
+#define RADAR_MAX_VALID_CM 400.0
+
+float frontDist = 400.0;  // 【修复】初始值改为最大值
+float leftDist  = 400.0;
+float rightDist = 400.0;
 // ==================== 电机控制 ====================
 // ==================== 电机控制（正数右转，负数左转）====================
 void motorControl(int steerPower) {
-int safePower = constrain(steerPower, -STEER_MAX_PWM, STEER_MAX_PWM);
-if (safePower > 15) {
-// 👉 产生向右的动力
-digitalWrite(MOTOR_IN1, LOW);
-digitalWrite(MOTOR_IN2, HIGH);
-analogWrite(MOTOR_PWM, safePower);
+    int safePower = constrain(steerPower, -STEER_MAX_PWM, STEER_MAX_PWM);
+    if (safePower > 15) {
+        // 👉 产生向右的动力
+        digitalWrite(MOTOR_IN1, LOW);
+        digitalWrite(MOTOR_IN2, HIGH);
+        analogWrite(MOTOR_PWM, safePower);
+        last_motor_dir = "right";
+    }
+    else if (safePower < -15) {
+        // 👈 产生向左的动力
+        digitalWrite(MOTOR_IN1, HIGH);
+        digitalWrite(MOTOR_IN2, LOW);
+        analogWrite(MOTOR_PWM, abs(safePower));
+        last_motor_dir = "left";
+    }
+    else {
+        // 🛑 危机解除，释放电机滑行
+        digitalWrite(MOTOR_IN1, LOW);
+        digitalWrite(MOTOR_IN2, LOW);
+        analogWrite(MOTOR_PWM, 0);
+        last_motor_dir = "stop";
+    }
+
+    // 【新增】调试输出电机状态
+    static unsigned long lastMotorDebug = 0;
+    if (millis() - lastMotorDebug > 500) {
+        lastMotorDebug = millis();
+        if (safePower != 0) {
+            Serial.printf("[电机] 方向:%s 功率:%d 雷达F:%.0f L:%.0f R:%.0f\n",
+                          last_motor_dir.c_str(), abs(safePower), frontDist, leftDist, rightDist);
+        }
+    }
 }
-else if (safePower < -15) {
-// 👈 产生向左的动力
-digitalWrite(MOTOR_IN1, HIGH);
-digitalWrite(MOTOR_IN2, LOW);
-analogWrite(MOTOR_PWM, abs(safePower));
-}
-else {
-// 🛑 危机解除，释放电机滑行
-digitalWrite(MOTOR_IN1, LOW);
-digitalWrite(MOTOR_IN2, LOW);
-analogWrite(MOTOR_PWM, 0);
-}
-}
-// ==================== 避障决策（智能左右权重避障算法）====================
+// ==================== 避障决策（修复版 - 智能左右权重避障算法）====================
 void smartAvoid() {
-float leftForce = 0.0;
-float rightForce = 0.0;
-// --- 步骤 A：计算左侧物体的【向右排斥力】 ---
-if (leftDist < SIDE_WARNING) {
-leftForce = (SIDE_WARNING - leftDist) * 4.0;
-}
-// --- 步骤 B：计算右侧物体的【向左排斥力】 ---
-if (rightDist < SIDE_WARNING) {
-rightForce = (SIDE_WARNING - rightDist) * 4.0;
-}
-// --- 步骤 C：综合大局进行合力判断 ---
-// 情况 1：正前方小于60cm，紧急全速避障
-if (frontDist < FRONT_CRITICAL) {
-if (leftDist > rightDist) {
-motorControl(-STEER_MAX_PWM);  // 左边更空，满功率左转
-} else {
-motorControl(STEER_MAX_PWM);   // 右边更空，满功率右转
-}
-return;
-}
-// 情况 2：前方安全，仅侧边有障碍物 -> 低速微调
-if (leftForce > 0 || rightForce > 0) {
-float netSteerSignal = leftForce - rightForce;
-float scaleRatio = STEER_SLOW_PWM / (SIDE_WARNING * 4.0f);
-int slowSteer = netSteerSignal * scaleRatio;
-motorControl(slowSteer);
-}
-// 情况 3：无障碍物，停机
-else {
-motorControl(0);
-}
+    // 【修复】使用平滑后的数据 dir_smt 进行决策
+    float f = dir_smt[0];  // 前方
+    float L = dir_smt[1];  // 左方
+    float R = dir_smt[2];  // 右方
+
+    // 【修复】计算左右安全距离差，用于决策
+    float leftSafeSpace = max(0.0f, f - FRONT_CRITICAL) + max(0.0f, L - SIDE_WARNING);
+    float rightSafeSpace = max(0.0f, f - FRONT_CRITICAL) + max(0.0f, R - SIDE_WARNING);
+
+    // --- 步骤 A：计算左侧物体的【向右排斥力】---
+    float leftForce = 0.0;
+    if (L < SIDE_WARNING) {
+        // 越近力越大，非线性响应
+        leftForce = pow((SIDE_WARNING - L) / SIDE_WARNING, 1.5) * STEER_MAX_PWM;
+    }
+
+    // --- 步骤 B：计算右侧物体的【向左排斥力】---
+    float rightForce = 0.0;
+    if (R < SIDE_WARNING) {
+        rightForce = pow((SIDE_WARNING - R) / SIDE_WARNING, 1.5) * STEER_MAX_PWM;
+    }
+
+    // 【新增】步骤 C：前方障碍物紧急处理
+    if (f < FRONT_CRITICAL) {
+        // 前方有障碍物，需要选择转向方向
+        // 优先选择安全空间更大的一侧
+        if (leftSafeSpace > rightSafeSpace + 20.0f) {
+            // 左边明显更安全，左转（负值）
+            int steerPower = -STEER_MAX_PWM;
+            // 根据前方距离调整强度
+            if (f > 50.0f) {
+                steerPower = -STEER_SLOW_PWM;  // 距离还够，缓慢转向
+            }
+            motorControl(steerPower);
+            Serial.printf("[避障] 前方%.0fcm，左转(左边%.0fcm vs 右边%.0fcm)\n", f, L, R);
+        }
+        else if (rightSafeSpace > leftSafeSpace + 20.0f) {
+            // 右边明显更安全，右转（正值）
+            int steerPower = STEER_MAX_PWM;
+            if (f > 50.0f) {
+                steerPower = STEER_SLOW_PWM;
+            }
+            motorControl(steerPower);
+            Serial.printf("[避障] 前方%.0fcm，右转(左边%.0fcm vs 右边%.0fcm)\n", f, L, R);
+        }
+        else {
+            // 两边差不多，使用力平衡决策
+            float netForce = leftForce - rightForce;
+            if (abs(netForce) < 30.0f) {
+                // 力相近，默认左转（可以改成你喜欢的一侧）
+                motorControl(-STEER_SLOW_PWM);
+                Serial.printf("[避障] 前方%.0fcm，默认左转(左右相近)\n", f);
+            } else {
+                motorControl((int)constrain(netForce, -STEER_MAX_PWM, STEER_MAX_PWM));
+            }
+        }
+        return;
+    }
+
+    // 情况 2：前方安全，仅侧边有障碍物 -> 低速微调
+    if (leftForce > 0 || rightForce > 0) {
+        float netSteerSignal = leftForce - rightForce;
+        // 限制在低速范围内
+        int slowSteer = (int)constrain(netSteerSignal, -STEER_SLOW_PWM, STEER_SLOW_PWM);
+        motorControl(slowSteer);
+    }
+    // 情况 3：无障碍物，停机
+    else {
+        motorControl(0);
+    }
 }
 // ==================== 雷达处理 ====================
 // ==================== K230视觉检测处理 ====================
@@ -534,55 +586,60 @@ k230_receiveBuffer += c;
 }
 }
 void processRadarPacket() {
-uint16_t fsa = payload_buf[0] | (payload_buf[1] << 8);
-uint16_t lsa = payload_buf[2] | (payload_buf[3] << 8);
-float angleFSA = (fsa >> 1) / 64.0f;
-float angleLSA = (lsa >> 1) / 64.0f;
-float diffAngle = angleLSA - angleFSA;
-if (diffAngle < 0) diffAngle += 360.0f;
-// 重置三个方向的距离
-if (angleFSA >= ANG_FRONT_MIN || angleFSA <= ANG_FRONT_MAX) {
-frontDist = 200.0;
-}
-else if (angleFSA >= ANG_LEFT_MIN && angleFSA <= ANG_LEFT_MAX) {
-leftDist = 200.0;  // 修正：左方区域对应leftDist
-}
-else if (angleFSA >= ANG_RIGHT_MIN && angleFSA <= ANG_RIGHT_MAX) {
-rightDist = 200.0;  // 修正：右方区域对应rightDist
-}
-for (int i = 0; i < packet_lsn; i++) {
-uint16_t si = payload_buf[6 + i * 2] | (payload_buf[6 + i * 2 + 1] << 8);
-float distanceMm = si / 4.0f;
-if (distanceMm > 50.0f && distanceMm < 6000.0f) {
-float cm = distanceMm / 10.0f;
-float currentAngle = angleFSA;
-if (packet_lsn > 1) currentAngle += (diffAngle / (packet_lsn - 1)) * i;
-if (currentAngle >= 360.0f) currentAngle -= 360.0f;
-if (currentAngle >= ANG_FRONT_MIN || currentAngle <= ANG_FRONT_MAX) {
-if (cm < frontDist) frontDist = cm;
-}
-else if (currentAngle >= ANG_LEFT_MIN && currentAngle <= ANG_LEFT_MAX) {
-if (cm < leftDist) leftDist = cm;  // 修正：左方区域存入leftDist
-}
-else if (currentAngle >= ANG_RIGHT_MIN && currentAngle <= ANG_RIGHT_MAX) {
-if (cm < rightDist) rightDist = cm;  // 修正：右方区域存入rightDist
-}
-}
-}
-// EMA平滑处理
-dir_smt[0] = SMOOTH_A * frontDist + (1.0f - SMOOTH_A) * dir_smt[0];
-dir_smt[1] = SMOOTH_A * leftDist + (1.0f - SMOOTH_A) * dir_smt[1];
-dir_smt[2] = SMOOTH_A * rightDist + (1.0f - SMOOTH_A) * dir_smt[2];
-// 同步回用户变量
-frontDist = dir_smt[0];
-leftDist = dir_smt[1];
-rightDist = dir_smt[2];
-// 调试输出雷达数据（每1秒输出一次）
-static unsigned long lastRadarDebug = 0;
-if (millis() - lastRadarDebug > 1000) {
-lastRadarDebug = millis();
-Serial.printf("[雷达数据] 前:%.0fcm 左:%.0fcm 右:%.0fcm\n", dir_smt[0], dir_smt[1], dir_smt[2]);
-}
+    uint16_t fsa = payload_buf[0] | (payload_buf[1] << 8);
+    uint16_t lsa = payload_buf[2] | (payload_buf[3] << 8);
+    float angleFSA = (fsa >> 1) / 64.0f;
+    float angleLSA = (lsa >> 1) / 64.0f;
+    float diffAngle = angleLSA - angleFSA;
+    if (diffAngle < 0) diffAngle += 360.0f;
+
+    // 【修复】移除这里错误的重置逻辑，让数据自然更新
+    // 原始代码在这里重置三个方向的距离是错误的，会导致数据丢失
+
+    for (int i = 0; i < packet_lsn; i++) {
+        uint16_t si = payload_buf[6 + i * 2] | (payload_buf[6 + i * 2 + 1] << 8);
+        float distanceMm = si / 4.0f;
+
+        // 【修复】添加有效性检查
+        if (distanceMm > (RADAR_MIN_VALID_CM * 10.0f) && distanceMm < (RADAR_MAX_VALID_CM * 10.0f)) {
+            float cm = distanceMm / 10.0f;
+            float currentAngle = angleFSA;
+            if (packet_lsn > 1) currentAngle += (diffAngle / (packet_lsn - 1)) * i;
+            if (currentAngle >= 360.0f) currentAngle -= 360.0f;
+
+            // 【修复】使用统一的扇区判断逻辑
+            // 前方：330-360 或 0-30
+            if (currentAngle >= ANG_FRONT_MIN || currentAngle <= ANG_FRONT_MAX) {
+                if (cm < frontDist) frontDist = cm;
+            }
+            // 左方：60-120
+            else if (currentAngle >= ANG_LEFT_MIN && currentAngle <= ANG_LEFT_MAX) {
+                if (cm < leftDist) leftDist = cm;
+            }
+            // 右方：240-300
+            else if (currentAngle >= ANG_RIGHT_MIN && currentAngle <= ANG_RIGHT_MAX) {
+                if (cm < rightDist) rightDist = cm;
+            }
+        }
+    }
+
+    // 【新增】限制最大距离为400cm，避免无效数据
+    if (frontDist > RADAR_MAX_VALID_CM) frontDist = RADAR_MAX_VALID_CM;
+    if (leftDist > RADAR_MAX_VALID_CM) leftDist = RADAR_MAX_VALID_CM;
+    if (rightDist > RADAR_MAX_VALID_CM) rightDist = RADAR_MAX_VALID_CM;
+
+    // EMA平滑处理
+    dir_smt[0] = SMOOTH_A * frontDist + (1.0f - SMOOTH_A) * dir_smt[0];
+    dir_smt[1] = SMOOTH_A * leftDist + (1.0f - SMOOTH_A) * dir_smt[1];
+    dir_smt[2] = SMOOTH_A * rightDist + (1.0f - SMOOTH_A) * dir_smt[2];
+
+    // 调试输出雷达数据（每1秒输出一次）
+    static unsigned long lastRadarDebug = 0;
+    if (millis() - lastRadarDebug > 1000) {
+        lastRadarDebug = millis();
+        Serial.printf("[雷达数据] 原始:前:%.0fcm 左:%.0fcm 右:%.0fcm | 平滑:前:%.0fcm 左:%.0fcm 右:%.0fcm\n",
+                      frontDist, leftDist, rightDist, dir_smt[0], dir_smt[1], dir_smt[2]);
+    }
 }
 void parseGPSNMEA() {
 static char nmea[256];
@@ -808,93 +865,159 @@ static unsigned long last_alert_text_time = 0;
 #define TTS_TRIGGER_DISTANCE_CM 60     // 距离小于60cm触发紧急播报
 // 【加快】连续检测从2次改为1次，更快响应
 #define TTS_TRIGGER_COUNT 1
-// ==================== 障碍物检测和播报（三向雷达版）====================
+// ==================== 障碍物检测和播报（三向雷达版 - 修复版）====================
 void checkObstacleAndAlert() {
-// 三向雷达: [0]=前方, [1]=左方, [2]=右方
-float f = dir_smt[0];
-float L = dir_smt[1];
-float R = dir_smt[2];
-// 调试输出（每2秒一次）
-static unsigned long lastObstacleDebug = 0;
-if (millis() - lastObstacleDebug > 2000) {
-lastObstacleDebug = millis();
-Serial.printf("[避障检测] F:%.0f(%s) L:%.0f(%s) R:%.0f(%s)\n",
-f, f < 80.0f ? "警告" : "正常",
-L, L < 50.0f ? "警告" : "正常",
-R, R < 50.0f ? "警告" : "正常");
-}
-// 阈值定义
-const float FRONT_ALERT_CM = 80.0f;
-const float SIDE_ALERT_CM = 50.0f;
-unsigned long now = millis();
-// 找出最近的障碍物
-float minDist = min(f, min(L, R));
-static int consecutiveAlerts = 0;
-	// 【修复】判断哪个方向有障碍物（简化逻辑，直接检测）
-bool has_obstacle = false;
-String alert_text = "";
-	// 优先级1：前方障碍物
-	if (f < FRONT_ALERT_CM) {
-		has_obstacle = true;
-		if (L > R && L > SIDE_ALERT_CM) {
-			alert_text = "前方有障碍物，请向左绕行";
-		} else if (R >= L && R > SIDE_ALERT_CM) {
-			alert_text = "前方有障碍物，请向右绕行";
-		} else {
-			alert_text = "前方有障碍物，请注意避让";
-		}
-	}
-	// 优先级2：左方障碍物（前方安全时）
-	else if (L < SIDE_ALERT_CM) {
-		has_obstacle = true;
-		alert_text = "左方有障碍物，请向右绕行";
-	}
-	// 优先级3：右方障碍物（前方安全时）
-	else if (R < SIDE_ALERT_CM) {
-		has_obstacle = true;
-		alert_text = "右方有障碍物，请向左绕行";
-	}
-// 连续检测计数
-if (has_obstacle) {
-consecutiveAlerts++;
-} else {
-consecutiveAlerts = 0;
-}
-// 触发条件检查
-if (has_obstacle && consecutiveAlerts >= TTS_TRIGGER_COUNT) {
-// 基础检查
-if (is_ai_talking || getTTSRequesting()) {
-return;
-}
-// 策略1：距离很近（<60cm）立即播报
-bool isUrgent = minDist < TTS_TRIGGER_DISTANCE_CM;
-// 策略2：普通情况间隔8秒
-bool timeOK = (now - last_alert_time >= ALERT_INTERVAL_MS);
-if (!isUrgent && !timeOK) {
-return;
-}
-// 去重检查
-if (alert_text == last_alert_text && (now - last_alert_text_time) < ALERT_TEXT_DUPLICATE_MS) {
-return;
-}
-// 避障语音使用云端TTS生成
-if (mqtt.connected()) {
-StaticJsonDocument<256> ttsDoc;
-char buf[256];
-ttsDoc["text"] = alert_text;
-ttsDoc["priority"] = PRIO_HIGH;  // 避障使用高优先级
-size_t len = serializeJson(ttsDoc, buf, sizeof(buf));
-mqtt.publish(MQTT_TOPIC_TTS_REQ, buf, len);
-// 增加障碍物提醒次数统计
-obstacle_count++;
-saveStatsToRTC();
-}
-// 更新记录
-last_alert_time = now;
-last_alert_text = alert_text;
-last_alert_text_time = now;
-consecutiveAlerts = 0;
-}
+    // 三向雷达: [0]=前方, [1]=左方, [2]=右方
+    float f = dir_smt[0];
+    float L = dir_smt[1];
+    float R = dir_smt[2];
+
+    // 【修复】调整阈值，使用更合理的告警距离
+    const float FRONT_ALERT_CM = 100.0f;  // 前方告警阈值
+    const float SIDE_ALERT_CM = 80.0f;    // 侧边告警阈值
+
+    unsigned long now = millis();
+
+    // 【修复】独立的连续检测计数器，每个方向单独计数
+    static int frontConsecutive = 0;
+    static int leftConsecutive = 0;
+    static int rightConsecutive = 0;
+
+    // 检测各方向障碍物
+    bool frontHasObstacle = (f < FRONT_ALERT_CM);
+    bool leftHasObstacle = (L < SIDE_ALERT_CM);
+    bool rightHasObstacle = (R < SIDE_ALERT_CM);
+
+    // 更新连续计数器（每方向独立）
+    if (frontHasObstacle) frontConsecutive++; else frontConsecutive = 0;
+    if (leftHasObstacle) leftConsecutive++; else leftConsecutive = 0;
+    if (rightHasObstacle) rightConsecutive++; else rightConsecutive = 0;
+
+    // 【修复】简化触发逻辑：只要有任意方向连续检测到2次就触发
+    bool shouldAlert = (frontConsecutive >= 2) || (leftConsecutive >= 2) || (rightConsecutive >= 2);
+
+    // 【修复】强制播报：如果距离小于60cm，立即播报（不等待连续检测）
+    bool urgentAlert = (f < 60.0f) || (L < 50.0f) || (R < 50.0f);
+
+    // 调试输出（每2秒一次）
+    static unsigned long lastObstacleDebug = 0;
+    if (now - lastObstacleDebug > 2000) {
+        lastObstacleDebug = now;
+        Serial.printf("[避障检测] F:%.0f(%s) L:%.0f(%s) R:%.0f(%s) 连续:%d/%d/%d\n",
+                      f, frontHasObstacle ? "警告" : "正常",
+                      L, leftHasObstacle ? "警告" : "正常",
+                      R, rightHasObstacle ? "警告" : "正常",
+                      frontConsecutive, leftConsecutive, rightConsecutive);
+    }
+
+    if (!shouldAlert && !urgentAlert) {
+        return;  // 没有需要播报的情况
+    }
+
+    // 【修复】检查是否正在播报其他内容
+    if (is_ai_talking || getTTSRequesting()) {
+        // 如果是紧急情况，可以打断当前播报
+        if (!urgentAlert) {
+            return;  // 非紧急情况，等待当前播报完成
+        }
+        // 紧急情况：发送打断信号
+        StaticJsonDocument<256> doc;
+        doc["type"] = "interrupt";
+        doc["priority"] = PRIO_HIGH;
+        char buf[256];
+        size_t len = serializeJson(doc, buf, sizeof(buf));
+        mqtt.publish("blindstick/tts/control", buf, len);
+        delay(50);  // 短暂等待打断生效
+    }
+
+    // 构建告警文本
+    String alert_text = "";
+
+    // 【修复】优先级1：前方障碍物（最紧急）
+    if (frontConsecutive >= 2 || f < 60.0f) {
+        if (L > R + 30.0f) {
+            alert_text = "前方有障碍物，请向左绕行";
+        } else if (R > L + 30.0f) {
+            alert_text = "前方有障碍物，请向右绕行";
+        } else if (L > SIDE_ALERT_CM && R > SIDE_ALERT_CM) {
+            // 两边都有空间，选择更空的一边
+            alert_text = (L > R) ? "前方有障碍物，建议向左绕行" : "前方有障碍物，建议向右绕行";
+        } else if (L > SIDE_ALERT_CM) {
+            alert_text = "前方有障碍物，请向左绕行";
+        } else if (R > SIDE_ALERT_CM) {
+            alert_text = "前方有障碍物，请向右绕行";
+        } else {
+            alert_text = "前方和两侧都有障碍物，请小心慢行";
+        }
+    }
+    // 优先级2：左方障碍物（仅当前方安全时）
+    else if (leftConsecutive >= 2 || L < 50.0f) {
+        if (R > SIDE_ALERT_CM) {
+            alert_text = "左方有障碍物，请向右绕行";
+        } else {
+            alert_text = "左方有障碍物，请注意避让";
+        }
+    }
+    // 优先级3：右方障碍物（仅当前方安全时）
+    else if (rightConsecutive >= 2 || R < 50.0f) {
+        if (L > SIDE_ALERT_CM) {
+            alert_text = "右方有障碍物，请向左绕行";
+        } else {
+            alert_text = "右方有障碍物，请注意避让";
+        }
+    }
+
+    if (alert_text.length() == 0) {
+        return;
+    }
+
+    // 【修复】去重检查 - 基于告警文本内容
+    static String lastAlertText = "";
+    static unsigned long lastAlertTime = 0;
+    static float lastAlertFront = 0;
+    static float lastAlertLeft = 0;
+    static float lastAlertRight = 0;
+    const unsigned long ALERT_COOLDOWN_MS = 4000;  // 4秒内不重复相同告警
+
+    if (alert_text == lastAlertText && (now - lastAlertTime) < ALERT_COOLDOWN_MS) {
+        return;  // 相同告警在冷却期内，跳过
+    }
+
+    // 【修复】检查距离变化，如果距离变化很小也跳过
+    float distChange = abs(f - lastAlertFront) + abs(L - lastAlertLeft) + abs(R - lastAlertRight);
+    if (distChange < 30.0f && (now - lastAlertTime) < ALERT_COOLDOWN_MS * 2) {
+        // 距离变化不大，延长冷却期
+        return;
+    }
+
+    // 发送TTS请求
+    if (mqtt.connected()) {
+        Serial.printf("[避障播报] %s (F:%.0f L:%.0f R:%.0f)\n", alert_text.c_str(), f, L, R);
+
+        StaticJsonDocument<256> ttsDoc;
+        char buf[256];
+        ttsDoc["text"] = alert_text;
+        ttsDoc["priority"] = PRIO_HIGH;  // 避障使用高优先级
+        size_t len = serializeJson(ttsDoc, buf, sizeof(buf));
+
+        if (mqtt.publish(MQTT_TOPIC_TTS_REQ, buf, len)) {
+            // 更新记录
+            lastAlertText = alert_text;
+            lastAlertTime = now;
+            lastAlertFront = f;
+            lastAlertLeft = L;
+            lastAlertRight = R;
+
+            // 重置连续计数器
+            frontConsecutive = 0;
+            leftConsecutive = 0;
+            rightConsecutive = 0;
+
+            // 增加障碍物提醒次数统计
+            obstacle_count++;
+            saveStatsToRTC();
+        }
+    }
 }
 // ==================== TTS请求超时时间 ====================
 #define TTS_REQUEST_TIMEOUT_MS 10000
@@ -1036,7 +1159,20 @@ K230_UART_ID, K230_RX_PIN, K230_TX_PIN);
 unsigned long lastUpload = 0;
 unsigned long lastStatusPrint = 0;
 int radarByteCount = 0;
+// 【新增】雷达数据定时重置周期
+unsigned long lastRadarReset = 0;
+const unsigned long RADAR_RESET_INTERVAL_MS = 500;  // 每500ms重置一次数据
+
 while (true) {
+// 【新增】定时重置距离数据，确保数据新鲜度
+unsigned long now = millis();
+if (now - lastRadarReset >= RADAR_RESET_INTERVAL_MS) {
+lastRadarReset = now;
+frontDist = RADAR_MAX_VALID_CM;
+leftDist = RADAR_MAX_VALID_CM;
+rightDist = RADAR_MAX_VALID_CM;
+}
+
 // 接收雷达数据
 int availableBytes = Serial1.available();
 if (availableBytes > 0) {
@@ -1054,16 +1190,16 @@ case READ_PAYLOAD: payload_buf[payload_idx++] = b; if (payload_idx >= payload_ex
 }
 parseGPSNMEA();
 processK230Data();
-unsigned long now = millis();
+unsigned long now2 = millis();
 smartAvoid();
 // GPS 波特率自动检测：每4秒检查一次，如果没收到有效NMEA则切换波特率
-if (!gps_baud_locked && (now - gps_baud_try_start > 4000)) {
+if (!gps_baud_locked && (now2 - gps_baud_try_start > 4000)) {
 if (!gps_got_nmea) {
 // 当前波特率收不到有效NMEA，切换下一个（最多完整试2轮后停止，避免无限空转）
 gps_baud_index = (gps_baud_index + 1) % gps_baud_count;
 gpsSerial.begin(gps_baud_table[gps_baud_index]);
 gpsSerial.listen();  // 切换波特率后也要重新listen
-gps_baud_try_start = now;
+gps_baud_try_start = now2;
 Serial.printf("[GPS] 当前波特率无有效NMEA，切换到:%d\n", gps_baud_table[gps_baud_index]);
 } else {
 // 收到有效NMEA，锁定波特率
@@ -1072,8 +1208,8 @@ Serial.printf("[GPS] 波特率已锁定: %d (累计收到%d字节)\n", gps_baud_
 }
 }
 // 每3秒打印一次状态
-if (now - lastStatusPrint > 3000) {
-lastStatusPrint = now;
+if (now2 - lastStatusPrint > 3000) {
+lastStatusPrint = now2;
 Serial.printf("[状态] WiFi:%s MQTT:%s 雷达字节:%d 雷达F:%.0f GPS可用:%d GPS字节:%lu 卫星:%d 波特率:%d\n",
 WiFi.status() == WL_CONNECTED ? "连接" : "断开",
 mqtt.connected() ? "连接" : "断开",
@@ -1095,8 +1231,8 @@ if (getTTSRequesting() && (millis() - tts_request_start_time > TTS_REQUEST_TIMEO
 setTTSRequesting(false);
 }
 checkObstacleAndAlert();
-if (now - lastUpload >= UPLOAD_INTERVAL_MS) {
-lastUpload = now;
+if (now2 - lastUpload >= UPLOAD_INTERVAL_MS) {
+lastUpload = now2;
 publishSensorData();
 }
 }
@@ -2079,4 +2215,3 @@ stream_buf_used -= play_size;
 }
 }
 }
-

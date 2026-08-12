@@ -279,6 +279,27 @@ const MQTT_CONFIG = {
 };
 
 let mqttClient = null;
+// 【新增】心跳检测相关变量
+let lastDataTime = 0;
+const HEARTBEAT_INTERVAL = 5000;  // 5秒无数据视为断开
+const RECONNECT_INTERVAL = 3000;  // 3秒后重连
+
+// ================= 心跳检测 =================
+function startHeartbeatCheck() {
+    setInterval(() => {
+        if (AppState.mqttConnected) {
+            const now = Date.now();
+            if (now - lastDataTime > HEARTBEAT_INTERVAL) {
+                console.warn('[MQTT] 心跳超时，数据已', (now - lastDataTime) / 1000, '秒未更新');
+                // 数据超时，尝试重新订阅
+                if (mqttClient && mqttClient.connected) {
+                    console.log('[MQTT] 重新订阅传感器主题...');
+                    mqttClient.subscribe(MQTT_CONFIG.topics.sensors);
+                }
+            }
+        }
+    }, 2000);  // 每2秒检查一次
+}
 
 // ================= MQTT 连接 =================
 function connectMQTT() {
@@ -298,11 +319,11 @@ function connectMQTT() {
             username: MQTT_CONFIG.username,
             password: MQTT_CONFIG.password,
             clean: true,
-            reconnectPeriod: 5000,
+            reconnectPeriod: 3000,  // 【修复】缩短重连间隔到3秒
             connectTimeout: 10000,
             rejectUnauthorized: false,  // 允许自签名证书
             protocolVersion: 4,  // MQTT 3.1.1
-            keepalive: 60
+            keepalive: 30  // 【修复】缩短心跳间隔到30秒
         });
         console.log('[MQTT] 正在连接:', url);
     } catch (e) {
@@ -313,6 +334,7 @@ function connectMQTT() {
 
     mqttClient.on('connect', () => {
         AppState.mqttConnected = true;
+        lastDataTime = Date.now();  // 【新增】重置心跳时间
         showToast('已接入 MQTT 数据流');
         console.log('[MQTT] 连接成功，ClientId:', MQTT_CONFIG.clientId);
 
@@ -329,6 +351,7 @@ function connectMQTT() {
     });
 
     mqttClient.on('message', async (topic, payload) => {
+        lastDataTime = Date.now();  // 【新增】更新最后数据时间
         await handleMqttMessage(topic, payload);
     });
 
@@ -338,11 +361,13 @@ function connectMQTT() {
     });
 
     mqttClient.on('offline', () => {
+        console.warn('[MQTT] 连接离线');
         AppState.mqttConnected = false;
         updateModuleStatus({ main: false, vision: false, radar: false, gps: false, voice: false });
     });
 
     mqttClient.on('reconnect', () => {
+        console.log('[MQTT] 正在重连...');
         showToast('MQTT 重连中...');
     });
 
@@ -849,6 +874,7 @@ function init() {
     initMap();
     initDetectionStats();
     connectMQTT();
+    startHeartbeatCheck();  // 【新增】启动心跳检测
     loadHomeCitySettings();
     initModal();
 
