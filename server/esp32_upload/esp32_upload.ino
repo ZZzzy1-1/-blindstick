@@ -1201,6 +1201,10 @@ Serial.println("[任务] RadarMotorUploadTask 启动");
 // 雷达使用Serial1（硬件串口）
 Serial1.begin(115200, SERIAL_8N1, RADAR_RX_PIN, -1);
 Serial.printf("[雷达] Serial1初始化 RX=GPIO%d 波特率=115200\n", RADAR_RX_PIN);
+// 【修复】发送YDLIDAR启动命令，让雷达开始扫描输出数据（之前只启动电机没发命令，导致收不到数据全是400）
+delay(200);  // 等待串口就绪
+Serial1.write(YDLIDAR_CMD_START, sizeof(YDLIDAR_CMD_START));
+Serial.println("[雷达] 已发送YDLIDAR启动命令");
 // GPS改为软串口（波特率自动检测）
 gps_baud_index = 0;
 gpsSerial.begin(gps_baud_table[gps_baud_index]);
