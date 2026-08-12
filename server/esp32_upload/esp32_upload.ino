@@ -1468,6 +1468,11 @@ if (millis() - lastVoiceHeartbeat > 30000) {
 lastVoiceHeartbeat = millis();
 Serial.println("[语音识别] 运行中（持续监听语音）");
 }
+    // 【修复】正在播放TTS时等待，不录音（避免被挂起导致录音不完整）
+    if (getTTSRequesting() || is_ai_talking) {
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        continue;
+    }
 // 录音并识别（3秒）
 String result = doVoiceRecognition();
 if (result.length() > 0) {
@@ -1507,6 +1512,11 @@ String doVoiceRecognition() {
     size_t rawRead = 0;
     unsigned long startTime = millis();
     while (millis() - startTime < (unsigned long)RECORD_SECONDS * 1000 && rawRead < RAW_RECORD_BYTES) {
+        // 【修复】录音中TTS开始播放，放弃当前录音（VoiceTask会等待播放完成再重新录）
+        if (getTTSRequesting() || is_ai_talking) {
+            free(rawBuffer);
+            return "";
+        }
         size_t bytesRead = 0;
         i2s_read(I2S_PORT, rawBuffer + rawRead, RAW_RECORD_BYTES - rawRead, &bytesRead, 50);
         rawRead += bytesRead;
@@ -2047,10 +2057,6 @@ return;
 lastText = currentText;
 lastPlayTime = now;
 Serial.printf("[TTS-URL] 收到URL，开始下载...\n");
-// 暂停语音识别（释放网络带宽）
-if (VoiceTaskHandle != NULL) {
-vTaskSuspend(VoiceTaskHandle);
-}
 // HTTP下载音频 - 优化超时设置
 WiFiClientSecure client;
 client.setInsecure();
@@ -2058,25 +2064,19 @@ client.setTimeout(20000);  // 增加到20秒，给大文件足够时间
 HTTPClient http;
 if (!http.begin(client, url)) {
 Serial.println("[TTS-URL] HTTP初始化失败");
-setTTSRequesting(false);  // 重置标志
-if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
-return;
+setTTSRequesting(false);  // 重置标志return;
 }
 http.setTimeout(25000);  // 增加到25秒
 int httpCode = http.GET();
 if (httpCode != 200) {
 Serial.printf("[TTS-URL] 下载失败: %d\n", httpCode);
 http.end();
-setTTSRequesting(false);  // 【修复】重置TTS状态
-if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
-return;
+setTTSRequesting(false);  // 【修复】重置TTS状态return;
 }
 int len = http.getSize();
 if (len <= 0 || len > 200000) {  // 【修复】限制最大200KB（120KB太短，开机语音约128KB被拒）
 Serial.printf("[TTS-URL] 音频大小无效或太大: %d\n", len);
-http.end();
-if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
-setTTSRequesting(false);  // 【修复】重置TTS状态
+http.end();setTTSRequesting(false);  // 【修复】重置TTS状态
 return;
 }
 // 检查可用内存（使用ESP-IDF风格API）
@@ -2090,16 +2090,12 @@ audioBuffer = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
 audioBuffer = (uint8_t*)malloc(len);
 } else {
 http.end();
-setTTSRequesting(false);  // 【修复】重置TTS状态
-if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
-return;
+setTTSRequesting(false);  // 【修复】重置TTS状态return;
 }
 if (!audioBuffer) {
 Serial.println("[TTS-URL] 内存分配失败");
 http.end();
-setTTSRequesting(false);  // 【修复】重置TTS状态
-if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
-return;
+setTTSRequesting(false);  // 【修复】重置TTS状态return;
 }
 // 读取数据 - 使用更大的缓冲区
 WiFiClient* stream = http.getStreamPtr();
@@ -2171,14 +2167,7 @@ if (ttsPriority >= PRIO_HIGH) {
     if (obstacleGone) {
         Serial.printf("[TTS-URL] 障碍物已消失(F:%.0f L:%.0f R:%.0f)，跳过播放\n", curF, curL, curR);
         free(audioBuffer);
-        setTTSRequesting(false);
-        if (VoiceTaskHandle != NULL) {
-            eTaskState taskState = eTaskGetState(VoiceTaskHandle);
-            if (taskState == eSuspended) {
-                vTaskResume(VoiceTaskHandle);
-            }
-        }
-        return;
+        setTTSRequesting(false);        return;
     }
 }
 
@@ -2188,21 +2177,12 @@ Serial.println("[TTS-URL] 播放完成(部分下载)");
 // 重置TTS请求标志
 setTTSRequesting(false);
 ttsPlayEndTime = millis();  // 【新增】记录播放结束时间，进入静默期
-// 恢复语音识别
-if (VoiceTaskHandle != NULL) {
-eTaskState taskState = eTaskGetState(VoiceTaskHandle);
-if (taskState == eSuspended) {
-vTaskResume(VoiceTaskHandle);
-}
-}
 return;
 }
 // 下载太少，放弃并释放内存
 free(audioBuffer);
 // 重置TTS请求标志
-setTTSRequesting(false);
-if (VoiceTaskHandle != NULL) vTaskResume(VoiceTaskHandle);
-return;
+setTTSRequesting(false);return;
 }
 Serial.printf("[TTS-URL] 下载完成，播放中...\n");
 // 跳过WAV头并播放
@@ -2223,14 +2203,7 @@ if (ttsPriority >= PRIO_HIGH) {
     if (obstacleGone) {
         Serial.printf("[TTS-URL] 障碍物已消失(F:%.0f L:%.0f R:%.0f)，跳过播放\n", curF, curL, curR);
         free(audioBuffer);
-        setTTSRequesting(false);
-        if (VoiceTaskHandle != NULL) {
-            eTaskState taskState = eTaskGetState(VoiceTaskHandle);
-            if (taskState == eSuspended) {
-                vTaskResume(VoiceTaskHandle);
-            }
-        }
-        return;
+        setTTSRequesting(false);        return;
     }
 }
 
@@ -2240,13 +2213,6 @@ Serial.println("[TTS-URL] 播放完成");
 // 重置TTS请求标志（播放完成，可以发送下一个请求）
 setTTSRequesting(false);
 ttsPlayEndTime = millis();  // 【新增】记录播放结束时间，进入静默期
-// 恢复语音识别 - 确保正确恢复
-if (VoiceTaskHandle != NULL) {
-eTaskState taskState = eTaskGetState(VoiceTaskHandle);
-if (taskState == eSuspended) {
-vTaskResume(VoiceTaskHandle);
-}
-}
 }
 // ==================== 流式TTS实现（新版简化逻辑）====================
 void initStreamingTTS() {
