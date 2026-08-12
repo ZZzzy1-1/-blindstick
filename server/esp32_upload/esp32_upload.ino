@@ -1419,21 +1419,27 @@ if (WiFi.status() != WL_CONNECTED) {
 vTaskDelete(NULL);
 return;
 }
-// 等待开机语音播放完成（最多等10秒，避免阻塞太久）
-int waitStartup = 0;
-while (!startup_announced && waitStartup < 10) {
-vTaskDelay(1000 / portTICK_PERIOD_MS);
-waitStartup++;
-}
-// 主循环：录音4秒 -> 识别 -> 处理结果
+// 【修复】不再依赖 startup_announced（RTC变量在重启后为true，导致等待10秒才启动识别）
+// 开机语音播放时会由 handleTTSUrl 自动挂起/恢复本任务，无需主动等待
+// 等待2秒让系统初始化完成（WiFi/MQTT/I2S就绪）
+vTaskDelay(2000 / portTICK_PERIOD_MS);
+Serial.println("[语音识别] 语音识别任务启动，持续监听中...");
+// 主循环：录音3秒 -> 识别 -> 处理结果
+unsigned long lastVoiceHeartbeat = 0;
 while (true) {
 if (WiFi.status() != WL_CONNECTED) {
 vTaskDelay(5000 / portTICK_PERIOD_MS);
 continue;
 }
-// 录音并识别（4秒）
+// 【新增】心跳日志，每30秒打印一次，确认任务存活
+if (millis() - lastVoiceHeartbeat > 30000) {
+lastVoiceHeartbeat = millis();
+Serial.println("[语音识别] 运行中（持续监听语音）");
+}
+// 录音并识别（3秒）
 String result = doVoiceRecognition();
 if (result.length() > 0) {
+Serial.printf("[语音识别] 识别到: %s\n", result.c_str());
 handleVoiceCommand(result.c_str());
 // 短暂等待让系统处理，不阻塞TTS
 vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -1683,7 +1689,7 @@ mqtt_reconnect();
 }
 xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 8192, NULL, 3, &RadarTaskHandle, 0);
 xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
-xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 8192, NULL, 2, &VoiceTaskHandle, 1);
+xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 16384, NULL, 2, &VoiceTaskHandle, 1);  // 【修复】增大栈空间防止ASR请求时栈溢出
 }
 void loop() {
 vTaskDelete(NULL);
@@ -2231,7 +2237,8 @@ Serial.printf("[流式TTS] 会话结束，共%d段\n", segments);
 if (stream_buf_used > 0 && stream_playing) {
 playPcmData(stream_buffer, stream_buf_used);
 }
-if (VoiceTaskHandle != NULL && stream_priority < PRIO_HIGH) {
+// 【修复】无论优先级高低都必须恢复语音识别，否则高优先级播放后任务永久挂起
+if (VoiceTaskHandle != NULL) {
 eTaskState taskState = eTaskGetState(VoiceTaskHandle);
 if (taskState == eSuspended) {
 vTaskResume(VoiceTaskHandle);
