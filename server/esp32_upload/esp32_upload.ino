@@ -1944,6 +1944,7 @@ return;
 }
 const char* url = doc["url"];
 const char* text = doc["text"];
+int ttsPriority = doc["priority"] | PRIO_NORMAL;  // 【新增】解析优先级
 if (!url || strlen(url) == 0) {
 Serial.println("[TTS-URL] URL为空");
 return;
@@ -2070,6 +2071,27 @@ int offset = 0;
 if (totalRead > 44 && audioBuffer[0] == 'R' && audioBuffer[1] == 'I') {
 offset = 44;
 }
+
+// 【新增】播放前障碍物状态检查（与完整下载分支一致）
+if (ttsPriority >= PRIO_HIGH) {
+    float curF = dir_smt[0];
+    float curL = dir_smt[1];
+    float curR = dir_smt[2];
+    bool obstacleGone = (curF > 180.0f) && (curL > 150.0f) && (curR > 150.0f);
+    if (obstacleGone) {
+        Serial.printf("[TTS-URL] 障碍物已消失(F:%.0f L:%.0f R:%.0f)，跳过播放\n", curF, curL, curR);
+        free(audioBuffer);
+        setTTSRequesting(false);
+        if (VoiceTaskHandle != NULL) {
+            eTaskState taskState = eTaskGetState(VoiceTaskHandle);
+            if (taskState == eSuspended) {
+                vTaskResume(VoiceTaskHandle);
+            }
+        }
+        return;
+    }
+}
+
 playPcmData(audioBuffer + offset, totalRead - offset);
 free(audioBuffer);
 Serial.println("[TTS-URL] 播放完成(部分下载)");
@@ -2097,6 +2119,30 @@ int offset = 0;
 if (len > 44 && audioBuffer[0] == 'R' && audioBuffer[1] == 'I') {
 offset = 44;
 }
+
+// 【新增】播放前障碍物状态检查
+// 由于TTS合成+下载有延迟(约10秒)，播放时障碍物可能已经消失
+// 如果是避障告警(高优先级)且当前三个方向都安全，则跳过播放
+if (ttsPriority >= PRIO_HIGH) {
+    float curF = dir_smt[0];
+    float curL = dir_smt[1];
+    float curR = dir_smt[2];
+    // 使用比告警阈值更宽松的安全判定（避免边缘抖动误判）
+    bool obstacleGone = (curF > 180.0f) && (curL > 150.0f) && (curR > 150.0f);
+    if (obstacleGone) {
+        Serial.printf("[TTS-URL] 障碍物已消失(F:%.0f L:%.0f R:%.0f)，跳过播放\n", curF, curL, curR);
+        free(audioBuffer);
+        setTTSRequesting(false);
+        if (VoiceTaskHandle != NULL) {
+            eTaskState taskState = eTaskGetState(VoiceTaskHandle);
+            if (taskState == eSuspended) {
+                vTaskResume(VoiceTaskHandle);
+            }
+        }
+        return;
+    }
+}
+
 playPcmData(audioBuffer + offset, len - offset);
 free(audioBuffer);
 Serial.println("[TTS-URL] 播放完成");

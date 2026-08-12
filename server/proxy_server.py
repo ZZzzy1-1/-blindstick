@@ -223,6 +223,16 @@ class MQTTAudioSender:
     def handle_tts_request(self, text, priority=0):
         """处理TTS请求：调用百度TTS并推送URL到ESP32"""
         try:
+            # 【优化】先检查缓存：相同文本的音频已存在则直接复用，跳过百度TTS合成
+            file_hash = hashlib.md5(text.encode()).hexdigest()[:8]
+            filename = f"tts_{file_hash}.wav"
+            filepath = os.path.join(AUDIO_CACHE_DIR, filename)
+
+            if os.path.exists(filepath):
+                print(f"[TTS] 缓存命中，直接复用: {filename}")
+                self._push_tts_url(filename, text, priority)
+                return
+
             token = get_baidu_token()
             if not token:
                 print("[TTS] Cannot get token")
@@ -248,41 +258,13 @@ class MQTTAudioSender:
                 audio_data = resp.content
                 print(f"[TTS] Synthesis success: {len(audio_data)} bytes")
 
-                # 保存音频文件
-                timestamp = int(time.time())
-                file_hash = hashlib.md5(text.encode()).hexdigest()[:8]
-                filename = f"tts_{timestamp}_{file_hash}.wav"
-                filepath = os.path.join(AUDIO_CACHE_DIR, filename)
+                # 保存音频文件（固定文件名，相同文本复用）
                 os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
-
                 with open(filepath, 'wb') as f:
                     f.write(audio_data)
+                print(f"[TTS] 音频已缓存: {filename}")
 
-                # 生成公网URL并推送
-                full_url = f"https://blindstick-4.onrender.com/audio/{filename}"
-                url_payload = json.dumps({
-                    "type": "tts_url",
-                    "url": full_url,
-                    "text": text[:30],
-                    "priority": priority
-                })
-
-                # 【修复】检测发布是否成功，失败则重试
-                if self.client and self.connected:
-                    result = self.client.publish("blindstick/tts/url", url_payload)
-                    # 检查返回的 (rc, mid) 元组，rc=0 表示成功
-                    rc = result.rc if hasattr(result, 'rc') else result[0]
-                    if rc == 0:
-                        print(f"[MQTT] TTS URL pushed: {full_url}")
-                    else:
-                        print(f"[MQTT] TTS URL发布失败 rc={rc}, 将重试...")
-                        time.sleep(1)
-                        try:
-                            self.client.publish("blindstick/tts/url", url_payload)
-                        except Exception as retry_e:
-                            print(f"[MQTT] TTS URL重试失败: {retry_e}")
-                else:
-                    print(f"[MQTT] MQTT未连接，无法推送TTS URL: {full_url}")
+                self._push_tts_url(filename, text, priority)
             else:
                 print(f"[TTS] Synthesis failed: {resp.text[:200]}")
 
@@ -290,6 +272,33 @@ class MQTTAudioSender:
             print(f"[TTS] Handle request error: {e}")
             import traceback
             traceback.print_exc()
+
+    def _push_tts_url(self, filename, text, priority=0):
+        """生成公网URL并推送给ESP32（含发布失败检测与重试）"""
+        full_url = f"https://blindstick-4.onrender.com/audio/{filename}"
+        url_payload = json.dumps({
+            "type": "tts_url",
+            "url": full_url,
+            "text": text[:30],
+            "priority": priority
+        })
+
+        # 检测发布是否成功，失败则重试
+        if self.client and self.connected:
+            result = self.client.publish("blindstick/tts/url", url_payload)
+            # 检查返回的 (rc, mid) 元组，rc=0 表示成功
+            rc = result.rc if hasattr(result, 'rc') else result[0]
+            if rc == 0:
+                print(f"[MQTT] TTS URL pushed: {full_url}")
+            else:
+                print(f"[MQTT] TTS URL发布失败 rc={rc}, 将重试...")
+                time.sleep(1)
+                try:
+                    self.client.publish("blindstick/tts/url", url_payload)
+                except Exception as retry_e:
+                    print(f"[MQTT] TTS URL重试失败: {retry_e}")
+        else:
+            print(f"[MQTT] MQTT未连接，无法推送TTS URL: {full_url}")
 
     def connect(self):
         if not MQTT_AVAILABLE:
