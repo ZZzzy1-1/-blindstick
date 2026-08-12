@@ -496,7 +496,9 @@ async function handleMqttMessage(topic, payload) {
             if (msg.stats) {
                 AppState.reportData.totalMileage = msg.stats.total_mileage || AppState.reportData.totalMileage;
                 AppState.reportData.navCount = msg.stats.nav_count || AppState.reportData.navCount;
-                AppState.reportData.obstacleCount = msg.stats.obstacle_count || AppState.reportData.obstacleCount;
+                // 【修复】障碍物提醒数取前后端较大值：ESP32重启后从RTC恢复累计值，前端也有实时检测计数，
+                // 直接用ESP32值覆盖会导致前端计数被拉低/不增加
+                AppState.reportData.obstacleCount = Math.max(AppState.reportData.obstacleCount, msg.stats.obstacle_count || 0);
                 AppState.reportData.detourCount = msg.stats.detour_count || AppState.reportData.detourCount;
 
                 // 更新UI显示
@@ -1095,10 +1097,12 @@ function addEventLog(category, message) {
 
     const item = document.createElement('div');
     item.className = `event-item ${itemClass}`;
+    // 【修复】障碍物事件不显示"障碍物"标题，直接显示检测描述（如"右方检测到障碍物，距离 42cm"）
+    const titleHtml = (category === '障碍物') ? '' : `<div class="event-title">${category}</div>`;
     item.innerHTML = `
         <div class="event-time">${time}</div>
         <div class="event-content">
-            <div class="event-title">${category}</div>
+            ${titleHtml}
             <div class="event-desc">${message}</div>
         </div>
     `;

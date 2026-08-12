@@ -227,6 +227,8 @@ volatile bool  is_blocked  = false;
 volatile bool  is_ai_talking = false;
 volatile unsigned long ai_talking_start_time = 0;  // 【新增】记录开始时间
 const unsigned long AI_TALKING_TIMEOUT_MS = 15000;  // 【新增】15秒超时
+volatile unsigned long ttsPlayEndTime = 0;  // 【新增】TTS播放结束时间
+const unsigned long TTS_PLAY_SILENT_MS = 5000;  // 【新增】播放后5秒静默期，给语音识别完整录音窗口
 volatile bool  is_tts_requesting = false;  // TTS请求状态标志，防止重复发送
 unsigned long  tts_request_start_time = 0;
 // TTS请求标志互斥锁（防止竞态条件）
@@ -920,6 +922,14 @@ void checkObstacleAndAlert() {
         return;  // 没有需要播报的情况
     }
 
+    // 【新增】播放后静默期检查：TTS刚播放完，给语音识别完整录音窗口（除非极端危险）
+    if (millis() - ttsPlayEndTime < TTS_PLAY_SILENT_MS) {
+        bool criticalDanger = (f < 40.0f) || (L < 35.0f) || (R < 35.0f);
+        if (!criticalDanger) {
+            return;  // 静默期内且非极端危险，跳过本次播报
+        }
+    }
+
     // 【修复】检查是否正在播报其他内容
     // 【修复】正在播放TTS时抑制新的避障播报，避免连续播报导致语音识别被一直挂起
     // 仅当距离极度危险(<40cm)时才打断当前播放紧急播报
@@ -1480,8 +1490,15 @@ int nonZeroCount = 0;
 for (int i = 0; i < totalRead / 2; i++) {
 if (samples[i] > 100 || samples[i] < -100) nonZeroCount++;
 }
+// 【诊断】每5秒打印一次录音统计，帮助排查语音识别问题
+static unsigned long lastDiagTime = 0;
+if (millis() - lastDiagTime > 5000) {
+lastDiagTime = millis();
+Serial.printf("[语音诊断] 录音:%d字节 非静音样本:%d\n", totalRead, nonZeroCount);
+}
 if (nonZeroCount < 100) {
 // 录音数据几乎是静音，跳过识别
+Serial.printf("[语音诊断] 录音静音(nonZero=%d)，跳过识别\n", nonZeroCount);
 free(buffer);
 return "";
 }
@@ -1534,7 +1551,14 @@ result.replace("？", "");
 result.replace("！", "");
 result.trim();
 }
+} else {
+// 【诊断】ASR返回错误
+int errNo = respDoc["err_no"] | -1;
+Serial.printf("[语音诊断] ASR错误 err_no=%d 响应:%s\n", errNo, response.substring(0, 80).c_str());
 }
+} else {
+// 【诊断】ASR HTTP失败
+Serial.printf("[语音诊断] ASR HTTP失败 code=%d\n", httpCode);
 }
 http.end();
 return result;
@@ -2114,6 +2138,7 @@ free(audioBuffer);
 Serial.println("[TTS-URL] 播放完成(部分下载)");
 // 重置TTS请求标志
 setTTSRequesting(false);
+ttsPlayEndTime = millis();  // 【新增】记录播放结束时间，进入静默期
 // 恢复语音识别
 if (VoiceTaskHandle != NULL) {
 eTaskState taskState = eTaskGetState(VoiceTaskHandle);
@@ -2165,6 +2190,7 @@ free(audioBuffer);
 Serial.println("[TTS-URL] 播放完成");
 // 重置TTS请求标志（播放完成，可以发送下一个请求）
 setTTSRequesting(false);
+ttsPlayEndTime = millis();  // 【新增】记录播放结束时间，进入静默期
 // 恢复语音识别 - 确保正确恢复
 if (VoiceTaskHandle != NULL) {
 eTaskState taskState = eTaskGetState(VoiceTaskHandle);
