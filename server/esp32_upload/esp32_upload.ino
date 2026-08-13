@@ -76,8 +76,9 @@ static const uint8_t YDLIDAR_CMD_STOP[]  = { 0xA5, 0x65, 0x00, 0x65, 0x01, 0x00,
 static const uint8_t YDLIDAR_CMD_RESET[] = { 0xA5, 0x40, 0x00, 0x40, 0x01, 0x00, 0x40, 0x97 };
 // ==================== GPS软串口配置 ====================
 // GPS改为软串口（原K230引脚）
-#define GPS_SOFT_RX_PIN     16   // GPS TX → ESP32 GPIO37 (软串口RX)
-#define GPS_SOFT_TX_PIN     17   // GPS RX → ESP32 GPIO38 (软串口TX)
+// 【修复】RX/TX接反：ATGM336H TX → GPIO17(软串口RX)，GPS RX → GPIO16(软串口TX)
+#define GPS_SOFT_RX_PIN     17   // GPS TX → ESP32 GPIO17 (软串口RX)
+#define GPS_SOFT_TX_PIN     16   // GPS RX → ESP32 GPIO16 (软串口TX)
 SoftwareSerial gpsSerial(GPS_SOFT_RX_PIN, GPS_SOFT_TX_PIN);  // GPS软串口
 // ==================== K230硬件串口配置 ====================
 // K230使用硬件串口UART2
@@ -673,6 +674,9 @@ else if (idx > 0 && idx < 255) {
 nmea[idx++] = c;
 if (c == '\n' || c == '\r') {
 nmea[idx] = '\0';
+// 【修复】只要收到完整的$开头NMEA句子就认为波特率正确并锁定，
+// 不必等解析到带经纬度的GGA（无卫星定位时经纬度字段为空，sscanf会失败导致永不锁定）
+if (nmea[0] == '$') gps_got_nmea = true;
 // 调试：每5秒打印收到的NMEA原文（判断是否有GPS数据进来）
 if (millis() - lastNmeaDump > 5000) {
 lastNmeaDump = millis();

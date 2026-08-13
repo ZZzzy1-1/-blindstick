@@ -69,7 +69,11 @@ const AppState = {
     // 标记是否已收到过真实的雷达数据
     radarDataReceived: false,
     // 标记是否已收到设备启动事件
-    deviceStarted: false
+    deviceStarted: false,
+    // 【新增】视觉分类累计检测次数（每次"新出现" +1，连续帧去重）
+    detectionTotals: {},
+    // 上次计入累计的视觉目标类别（用于去重：目标消失/切换后再出现才+1）
+    lastCountedClass: null
 };
 
 // ================= 计算两点间距离（米）====================
@@ -488,8 +492,14 @@ async function handleMqttMessage(topic, payload) {
                     confidence: 0.85,
                     x: 80, y: 80, w: 160, h: 160
                 }];
+                // 【新增】视觉分类累计计数：同一目标连续帧只算1次，目标消失/切换后再出现才+1
+                if (AppState.lastCountedClass !== cls) {
+                    AppState.detectionTotals[cls] = (AppState.detectionTotals[cls] || 0) + 1;
+                    AppState.lastCountedClass = cls;
+                }
             } else {
                 AppState.videoDetections = [];
+                AppState.lastCountedClass = null;  // 目标消失，下次出现重新计数
             }
 
             // ====== 今日出行统计数据（来自ESP32）======
@@ -698,12 +708,13 @@ function initDetectionStats() {
 }
 
 function updateDetectionStats(counts) {
+    // 【修改】显示各类别累计检测次数（不再显示当前帧0/1）
     CATEGORY_GROUPS.forEach(g => {
         const el = document.querySelector(`.stat[data-class="${g.key}"] .stat-count`);
-        if (el) el.textContent = counts[g.key] || 0;
+        if (el) el.textContent = AppState.detectionTotals[g.key] || 0;
     });
 
-    // 更新 FPS/检测状态显示
+    // 更新 FPS/检测状态显示（仍基于当前帧是否有目标）
     const fpsEl = document.getElementById('fpsDisplay');
     if (fpsEl) {
         const hasDetections = Object.values(counts).some(c => c > 0);

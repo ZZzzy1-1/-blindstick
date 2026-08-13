@@ -1,10 +1,7 @@
 '''
-实验名称：14类物体检测（YOLOv8）+ 串口输出到ESP32
-运行说明：
-  1. 适配 14 类自定义目标检测模型。
-  2. 检测通过串口发送给ESP32。
-  3. ESP32通过MQTT上传到云端生成语音播报。
-  4. 数据流向：K230 → 串口 → ESP32 → MQTT → 云端TTS
+实验名称：物体检测（基于yolov8n）+ ESP32 串口通信
+实验平台：01Studio CanMV K230
+教程：wiki.01studio.cc
 '''
 
 from libs.PipeLine import PipeLine, ScopedTiming
@@ -13,190 +10,201 @@ from libs.AI2D import Ai2d
 import os
 import ujson
 from media.media import *
-from media.sensor import *
+from time import *
 import nncase_runtime as nn
 import ulab.numpy as np
 import time
+import utime
 import image
+import random
 import gc
 import sys
+import aidemo
 
-# ==================== 📡 0. 串口输出配置（发送给 ESP32）====================
-try:
-    from machine import UART, FPIOA
+# ======================= 新加：串口初始化（对接ESP32）=======================
+from machine import UART, FPIOA
 
-    # 使用UART2，GPIO5/6
-    K230_UART_ID = 2          # UART2（不是UART1）
-    K230_UART_BAUD = 115200
-    K230_UART_TX_PIN = 5      # GPIO5 -> ESP32 RX
-    K230_UART_RX_PIN = 6      # GPIO6 -> ESP32 TX（可选）
-    uart = UART(K230_UART_ID, K230_UART_BAUD, tx=K230_UART_TX_PIN, rx=K230_UART_RX_PIN)
-    K230_UART_AVAILABLE = True
-    print(f"[串口] UART{K230_UART_ID} 初始化 TX=GPIO{K230_UART_TX_PIN} RX=GPIO{K230_UART_RX_PIN} 波特={K230_UART_BAUD}")
-except Exception as e:
-    K230_UART_AVAILABLE = False
-    print(f"[串口] 初始化失败: {e}，K230无法输出检测结果")
+# K230 引脚映射：
+# UART2_TX = IO11
+# UART2_RX = IO12
+fpioa = FPIOA()
+fpioa.set_function(11, FPIOA.UART2_TXD)
+fpioa.set_function(12, FPIOA.UART2_RXD)
 
-# ==================== 📡 1. WiFi 功能已禁用 ====================
-# 数据流向：K230 → 串口 → ESP32 → MQTT → 云端TTS
-# 不在K230端直接联网，所有检测通过串口发给ESP32处理
+# 初始化串口，波特率 115200（必须与ESP32一致）
+uart = UART(2, baudrate=115200)
+# ==========================================================================
 
-print("[系统] K230仅通过串口输出，WiFi已禁用")
+# 自定义YOLOv8检测类
+class ObjectDetectionApp(AIBase):
+    def __init__(self,kmodel_path,labels,model_input_size,max_boxes_num,confidence_threshold=0.5,nms_threshold=0.2,rgb888p_size=[224,224],display_size=[1920,1080],debug_mode=0):
+        super().__init__(kmodel_path,model_input_size,rgb888p_size,debug_mode)
+        self.kmodel_path=kmodel_path
+        self.labels=labels
+        self.model_input_size=model_input_size
+        self.confidence_threshold=confidence_threshold
+        self.nms_threshold=nms_threshold
+        self.max_boxes_num=max_boxes_num
+        self.rgb888p_size=[ALIGN_UP(rgb888p_size[0],16),rgb888p_size[1]]
+        self.display_size=[ALIGN_UP(display_size[0],16),display_size[1]]
+        self.debug_mode=debug_mode
+        self.color_four=[(255, 220, 20, 60), (255, 119, 11, 32), (255, 0, 0, 142), (255, 0, 0, 230),
+                         (255, 106, 0, 228), (255, 0, 60, 100), (255, 0, 80, 100), (255, 0, 0, 70),
+                         (255, 0, 0, 192), (255, 250, 170, 30), (255, 100, 170, 30), (255, 220, 220, 0),
+                         (255, 175, 116, 175), (255, 250, 0, 30), (255, 165, 42, 42), (255, 255, 77, 255),
+                         (255, 0, 226, 252), (255, 182, 182, 255), (255, 0, 82, 0), (255, 120, 166, 157)]
+        self.x_factor = float(self.rgb888p_size[0])/self.model_input_size[0]
+        self.y_factor = float(self.rgb888p_size[1])/self.model_input_size[1]
+        self.ai2d=Ai2d(debug_mode)
+        self.ai2d.set_ai2d_dtype(nn.ai2d_format.NCHW_FMT,nn.ai2d_format.NCHW_FMT,np.uint8, np.uint8)
 
-# 【更新】14类特定场景字典定义
-LABEL_MAP = {
-    'blind_track': ("盲道", "#00d4ff"),
-    'curb': ("马路牙子", "#7bed9f"),
-    'crosswalk': ("斑马线", "#ffffff"),
-    'pole': ("立柱", "#1e90ff"),
-    'ashcan': ("垃圾桶", "#747d8c"),
-    'reflective_cone': ("反光锥", "#ffa502"),
-    'red_light': ("红灯", "#ff4757"),
-    'yellow_light': ("黄灯", "#ffa502"),
-    'green_light': ("绿灯", "#2ed573"),
-    'stop_sign': ("标志牌", "#ff4757"),
-    'person': ("行人", "#ff4757"),
-    'vehicle': ("车辆", "#ff6348"),
-    'stairs': ("楼梯台阶", "#ced6e0"),
-    'puddle': ("水坑", "#1e90ff"),
-}
+    def config_preprocess(self,input_image_size=None):
+        with ScopedTiming("set preprocess config",self.debug_mode > 0):
+            ai2d_input_size=input_image_size if input_image_size else self.rgb888p_size
+            self.ai2d.resize(nn.interp_method.tf_bilinear, nn.interp_mode.half_pixel)
+            self.ai2d.build([1,3,ai2d_input_size[1],ai2d_input_size[0]],[1,3,self.model_input_size[1],self.model_input_size[0]])
 
-def upload_detections(detections):
-    """
-    仅通过串口发送给ESP32，由ESP32负责MQTT上传
-    数据流向：K230 → 串口 → ESP32 → MQTT → 云端TTS
-    """
-    send_detections_uart(detections)
+    def postprocess(self,results):
+        with ScopedTiming("postprocess",self.debug_mode > 0):
+            result=results[0]
+            result = result.reshape((result.shape[0] * result.shape[1], result.shape[2]))
+            output_data = result.transpose()
+            boxes_ori = output_data[:,0:4]
+            scores_ori = output_data[:,4:]
+            confs_ori = np.max(scores_ori,axis=-1)
+            inds_ori = np.argmax(scores_ori,axis=-1)
+            boxes,scores,inds = [],[],[]
+            for i in range(len(boxes_ori)):
+                if confs_ori[i] > self.confidence_threshold:
+                    scores.append(confs_ori[i])
+                    inds.append(inds_ori[i])
+                    x = boxes_ori[i,0]
+                    y = boxes_ori[i,1]
+                    w = boxes_ori[i,2]
+                    h = boxes_ori[i,3]
+                    left = int((x - 0.5 * w) * self.x_factor)
+                    top = int((y - 0.5 * h) * self.y_factor)
+                    right = int((x + 0.5 * w) * self.x_factor)
+                    bottom = int((y + 0.5 * h) * self.y_factor)
+                    boxes.append([left,top,right,bottom])
+            if len(boxes)==0:
+                return []
+            boxes = np.array(boxes)
+            scores = np.array(scores)
+            inds = np.array(inds)
+            keep = self.nms(boxes,scores,self.nms_threshold)
+            dets = np.concatenate((boxes, scores.reshape((len(boxes),1)), inds.reshape((len(boxes),1))), axis=1)
+            dets_out = []
+            for keep_i in keep:
+                dets_out.append(dets[keep_i])
+            dets_out = np.array(dets_out)
+            dets_out = dets_out[:self.max_boxes_num, :]
+            return dets_out
 
+    def draw_result(self,pl,dets):
+        with ScopedTiming("display_draw",self.debug_mode >0):
+            if dets:
+                pl.osd_img.clear()
+                for det in dets:
+                    x1, y1, x2, y2 = map(lambda x: int(round(x, 0)), det[:4])
+                    x= x1*self.display_size[0] // self.rgb888p_size[0]
+                    y= y1*self.display_size[1] // self.rgb888p_size[1]
+                    w = (x2 - x1) * self.display_size[0] // self.rgb888p_size[0]
+                    h = (y2 - y1) * self.display_size[1] // self.rgb888p_size[1]
+                    pl.osd_img.draw_rectangle(x,y, w, h, color=self.get_color(int(det[5])),thickness=4)
+                    pl.osd_img.draw_string_advanced( x , y-50,32," " + self.labels[int(det[5])] + " " + str(round(det[4],2)) , color=self.get_color(int(det[5])))
+            else:
+                pl.osd_img.clear()
 
-def send_detections_uart(detections):
-    """
-    通过 UART 将检测结果发送给 ESP32
-    单目标简单格式：DET:类名\n
-    多目标扩展格式：DETS:类1,置信度1,x1,y1,w1,h1;类2,置信度2,x2,y2,w2,h2
-    无检测：NONE
-    """
-    if not K230_UART_AVAILABLE:
-        return
-    try:
-        if not detections or len(detections) == 0:
-            line = "NONE\n"
-        elif len(detections) == 1:
-            # 单目标：简单格式 DET:类名
-            cls = detections[0].get("class", "")
-            line = "DET:" + cls + "\n"
-        else:
-            # 多目标：扩展格式 DETS:class,conf,cx,cy,w,h;...
-            parts = []
-            for d in detections[:5]:  # 最多5个
-                cls = d.get("class", "")
-                conf = d.get("confidence", 0)
-                cx = d.get("x", 0)
-                cy = d.get("y", 0)
-                w = d.get("w", 0)
-                h = d.get("h", 0)
-                parts.append("{},{},{},{},{},{}".format(cls, conf, cx, cy, w, h))
-            line = "DETS:" + ";".join(parts) + "\n"
-
-        # MicroPython UART 直接接受字符串
-        uart.write(line)
-        print("[串口→ESP32]", line.strip())
-    except Exception as e:
-        print("[串口] 发送失败:", e)
-
-# ==================== 🎯 2. 自定义检测类 ====================
-class CustomObjectDetectionApp(AIBase):
-    def __init__(self, kmodel_path, labels, model_input_size, max_boxes_num, confidence_threshold=0.28, nms_threshold=0.25, rgb888p_size=[224,224], display_size=[1920,1080], debug_mode=0):
-        super().__init__(kmodel_path, model_input_size, rgb888p_size, debug_mode)
-        self.kmodel_path = kmodel_path
-        self.labels = labels
-        self.model_input_size = model_input_size
-        self.confidence_threshold = confidence_threshold
-        self.nms_threshold = nms_threshold
-        self.max_boxes_num = max_boxes_num
-        self.rgb888p_size = [ALIGN_UP(rgb888p_size[0], 16), rgb888p_size[1]]
-        self.display_size = [ALIGN_UP(display_size[0], 16), display_size[1]]
-        self.x_factor = float(self.rgb888p_size[0]) / self.model_input_size[0]
-        self.y_factor = float(self.rgb888p_size[1]) / self.model_input_size[1]
-        self.color_list = [(255, 220, 20, 60), (255, 119, 11, 32), (255, 0, 0, 142), (255, 0, 0, 230)]
-        self.ai2d = Ai2d(debug_mode)
-        self.ai2d.set_ai2d_dtype(nn.ai2d_format.NCHW_FMT, nn.ai2d_format.NCHW_FMT, np.uint8, np.uint8)
-
-    def config_preprocess(self, input_image_size=None):
-        ai2d_input_size = input_image_size if input_image_size else self.rgb888p_size
-        self.ai2d.resize(nn.interp_method.tf_bilinear, nn.interp_mode.half_pixel)
-        self.ai2d.build([1, 3, ai2d_input_size[1], ai2d_input_size[0]], [1, 3, self.model_input_size[1], self.model_input_size[0]])
-
-    def postprocess(self, results):
-        result = results[0].reshape((results[0].shape[0] * results[0].shape[1], results[0].shape[2]))
-        output_data = result.transpose()
-        boxes_ori, scores_ori = output_data[:, 0:4], output_data[:, 4:]
-        confs_ori, inds_ori = np.max(scores_ori, axis=-1), np.argmax(scores_ori, axis=-1)
-        boxes, scores, inds = [], [], []
-        for i in range(len(boxes_ori)):
-            if confs_ori[i] > self.confidence_threshold:
-                scores.append(confs_ori[i]); inds.append(inds_ori[i])
-                x, y, w, h = boxes_ori[i, 0], boxes_ori[i, 1], boxes_ori[i, 2], boxes_ori[i, 3]
-                boxes.append([int((x-0.5*w)*self.x_factor), int((y-0.5*h)*self.y_factor), int((x+0.5*w)*self.x_factor), int((y+0.5*h)*self.y_factor)])
-        if len(boxes) == 0: return []
-        keep = self.nms(boxes, scores, self.nms_threshold)
-        return [[boxes[i][0], boxes[i][1], boxes[i][2], boxes[i][3], scores[i], inds[i]] for i in keep][:self.max_boxes_num]
-
-    def nms(self, boxes, scores, thresh):
-        x1 = [float(b[0]) for b in boxes]; y1 = [float(b[1]) for b in boxes]
-        x2 = [float(b[2]) for b in boxes]; y2 = [float(b[3]) for b in boxes]
-        scores_list = [float(s) for s in scores]
-        areas = [(x2[i]-x1[i]+1)*(y2[i]-y1[i]+1) for i in range(len(x1))]
-        order = sorted(range(len(scores_list)), key=lambda k: scores_list[k], reverse=True)
+    def nms(self,boxes,scores,thresh):
+        x1,y1,x2,y2 = boxes[:, 0],boxes[:, 1],boxes[:, 2],boxes[:, 3]
+        areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+        order = np.argsort(scores,axis = 0)[::-1]
         keep = []
-        while len(order) > 0:
-            i = order[0]; keep.append(i)
+        while order.size > 0:
+            i = order[0]
+            keep.append(i)
+            new_x1,new_x2,new_y1,new_y2,new_areas = [],[],[],[],[]
+            for order_i in order:
+                new_x1.append(x1[order_i])
+                new_x2.append(x2[order_i])
+                new_y1.append(y1[order_i])
+                new_y2.append(y2[order_i])
+                new_areas.append(areas[order_i])
+            new_x1 = np.array(new_x1)
+            new_x2 = np.array(new_x2)
+            new_y1 = np.array(new_y1)
+            new_y2 = np.array(new_y2)
+            xx1 = np.maximum(x1[i], new_x1)
+            yy1 = np.maximum(y1[i], new_y1)
+            xx2 = np.minimum(x2[i], new_x2)
+            yy2 = np.minimum(y2[i], new_y2)
+            w = np.maximum(0.0, xx2 - xx1 + 1)
+            h = np.maximum(0.0, yy2 - yy1 + 1)
+            inter = w * h
+            new_areas = np.array(new_areas)
+            ovr = inter / (areas[i] + new_areas - inter)
             new_order = []
-            for j in order[1:]:
-                xx1, yy1 = max(x1[i], x1[j]), max(y1[i], y1[j])
-                xx2, yy2 = min(x2[i], x2[j]), min(y2[i], y2[j])
-                w, h = max(0.0, xx2-xx1+1), max(0.0, yy2-yy1+1)
-                if (w*h) / (areas[i]+areas[j]-(w*h)) < thresh: new_order.append(j)
-            order = new_order
+            for ovr_i,ind in enumerate(ovr):
+                if ind < thresh:
+                    new_order.append(order[ovr_i])
+            order = np.array(new_order,dtype=np.uint8)
         return keep
 
-    def draw_result(self, pl, dets):
-        pl.osd_img.clear()
-        for det in dets:
-            x, y = det[0]*self.display_size[0]//self.rgb888p_size[0], det[1]*self.display_size[1]//self.rgb888p_size[1]
-            w, h = (det[2]-det[0])*self.display_size[0]//self.rgb888p_size[0], (det[3]-det[1])*self.display_size[1]//self.rgb888p_size[1]
-            pl.osd_img.draw_rectangle(x, y, w, h, color=self.color_list[int(det[5])%len(self.color_list)], thickness=4)
-            cls_name = self.labels[int(det[5])] if int(det[5]) < len(self.labels) else "unknown"
-            pl.osd_img.draw_string_advanced(x, y-35, 26, f" {cls_name} {round(det[4],2)}", color=(255, 255, 255, 255))
+    def get_color(self, x):
+        idx=x%len(self.color_four)
+        return self.color_four[idx]
 
-# ==================== 🚀 3. 主程序 ====================
-if __name__ == "__main__":
-    rgb888p_size, display_size = [320, 320], [800, 480]
-    # 【更新】指向你的 14 类模型
-    kmodel_path = "/sdcard/examples/kmodel/best.kmodel"
-    # 【更新】14 类标签顺序
-    labels = [
-        'blind_track', 'curb', 'crosswalk', 'pole', 'ashcan',
-        'reflective_cone', 'red_light', 'yellow_light', 'green_light', 'stop_sign',
-        'person', 'vehicle', 'stairs', 'puddle'
-    ]
 
-    pl = PipeLine(rgb888p_size=rgb888p_size, display_size=display_size, display_mode='st7701')
-    pl.create(Sensor(width=1920, height=1080))
-    ob_det = CustomObjectDetectionApp(kmodel_path, labels=labels, model_input_size=[320, 320], max_boxes_num=15, confidence_threshold=0.15, rgb888p_size=rgb888p_size, display_size=display_size)
+if __name__=="__main__":
+    display_mode="lcd"
+    if display_mode=="hdmi":
+        display_size=[1920,1080]
+    else:
+        display_size=[800,480]
+
+    kmodel_path="/sdcard/examples/kmodel/best.kmodel"
+    labels = [  'blind_track', 'curb', 'crosswalk', 'pole', 'ashcan', 'reflective_cone', 'red_light', 'yellow_light', 'green_light', 'stop_sign', 'person', 'vehicle', 'stairs', 'puddle']
+    confidence_threshold = 0.2
+    nms_threshold = 0.2
+    max_boxes_num = 50
+    rgb888p_size=[320,320]
+
+    # 初始化PipeLine
+    pl=PipeLine(rgb888p_size=rgb888p_size,display_size=display_size,display_mode=display_mode)
+    pl.create()
+    ob_det=ObjectDetectionApp(kmodel_path,labels=labels,model_input_size=[320,320],max_boxes_num=max_boxes_num,confidence_threshold=confidence_threshold,nms_threshold=nms_threshold,rgb888p_size=rgb888p_size,display_size=display_size,debug_mode=0)
     ob_det.config_preprocess()
 
-    frame_counter = 0
-    while True:
-        img = pl.get_frame()
-        res = ob_det.run(img)
-        ob_det.draw_result(pl, res)
+    clock = time.clock()
 
-        frame_counter += 1
-        if frame_counter % 3 == 0:
-            # 【修复】无检测时也发送NONE，避免ESP32保留旧检测目标
-            # res为空时 upload_detections([]) 内部会发送 "NONE\n"
-            upload_detections([{"x": int(d[0]), "y": int(d[1]), "w": int(d[2]-d[0]), "h": int(d[3]-d[1]), "label": LABEL_MAP.get(labels[int(d[5])], (labels[int(d[5])], "#00d4ff"))[0], "class": labels[int(d[5])], "confidence": round(float(d[4]), 2)} for d in res])
+    try:
+        while True:
+            os.exitpoint()
+            clock.tick()
 
-        pl.show_image()
-        gc.collect()
+            img=pl.get_frame()
+            res=ob_det.run(img)
+            ob_det.draw_result(pl,res)
+            pl.show_image()
+            gc.collect()
+
+            # ===================== 新加：串口发送检测结果给 ESP32 =====================
+            if len(res) > 0:
+                # 获取第一个检测目标
+                label_idx = int(res[0][5])
+                label_name = labels[label_idx]
+                # 发送格式：DET:person\n
+                send_data = f"DET:{label_name}\n"
+                uart.write(send_data)
+                print("发送给ESP32：" + send_data)
+            else:
+                uart.write("NONE\n")
+                print("发送给ESP32：NONE\n")
+            # ==========================================================================
+
+    except Exception as e:
+        sys.print_exception(e)
+    finally:
+        ob_det.deinit()
+        pl.destroy()
