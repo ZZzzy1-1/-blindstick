@@ -151,6 +151,7 @@ void VoiceRecognitionTask(void* pvParameters);
 String doVoiceRecognition();
 void handleVoiceCommand(const char* text);
 String base64Encode(const uint8_t* data, size_t len);  // Base64编码
+size_t base64ToBuffer(const uint8_t* data, size_t len, char* out);  // Base64写缓冲区（省内部堆）
 // ==================== 工具函数实现 ====================
 /**
 * URL编码
@@ -760,6 +761,7 @@ mqtt.setBufferSize(2048);
 espClient.setInsecure();
 espClient.setHandshakeTimeout(12);
 if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
+Serial.println("[MQTT] 连接成功");
 mqtt.subscribe(MQTT_TOPIC_TTS_AUDIO);
 mqtt.subscribe("blindstick/tts/control");
 mqtt.subscribe("blindstick/tts/stream/+");
@@ -778,6 +780,7 @@ startup_announced_rtc = true;
 }
 return true;
 } else {
+Serial.printf("[MQTT] 连接失败 state=%d（-4超时 -2失败 5未授权 4凭据错 2客户端ID）\n", mqtt.state());
 retry_count++;
 if (retry_count >= 10) retry_count = 0;
 return false;
@@ -1301,6 +1304,15 @@ gps_baud_table[gps_baud_index]);
 radarByteCount = 0;  // 重置计数
 }
 if (WiFi.status() == WL_CONNECTED) {
+// 【诊断】MQTT连接状态变化检测（定位掉线时机）
+static bool mqttPrevState = false;
+bool mqttCurState = mqtt.connected();
+if (mqttPrevState && !mqttCurState) {
+Serial.printf("[MQTT] 掉线! state=%d\n", mqtt.state());
+} else if (!mqttPrevState && mqttCurState) {
+Serial.println("[MQTT] 重连成功");
+}
+mqttPrevState = mqttCurState;
 if (!mqtt.connected()) {
 mqtt_reconnect();
 }
@@ -1561,8 +1573,11 @@ String doVoiceRecognition() {
         rawRead += bytesRead;
     }
 
-    // 分配16bit PCM缓冲区
-    uint8_t* pcmBuffer = (uint8_t*)malloc(PCM_RECORD_BYTES);
+    // 分配16bit PCM缓冲区（优先PSRAM，减少内部堆压力）
+    uint8_t* pcmBuffer = (uint8_t*)heap_caps_malloc(PCM_RECORD_BYTES, MALLOC_CAP_SPIRAM);
+    if (!pcmBuffer) {
+        pcmBuffer = (uint8_t*)malloc(PCM_RECORD_BYTES);
+    }
     if (!pcmBuffer) {
         free(rawBuffer);
         Serial.println("[语音诊断] PCM缓冲区分配失败");
@@ -1600,33 +1615,45 @@ String doVoiceRecognition() {
         return "";
     }
 
-    // Base64编码
-    String base64Audio = base64Encode(pcmBuffer, totalRead);
-    free(pcmBuffer);
-    if (base64Audio.length() == 0) {
-        Serial.println("[语音诊断] Base64编码失败");
+    // 【内存修复】base64+JSON改用PSRAM/堆缓冲，避免大String占内部堆挤掉MQTT的TLS连接
+    size_t b64Cap = ((totalRead + 2) / 3) * 4 + 1;
+    char* b64Buf = (char*)heap_caps_malloc(b64Cap, MALLOC_CAP_SPIRAM);
+    if (!b64Buf) {
+        b64Buf = (char*)malloc(b64Cap);
+    }
+    if (!b64Buf) {
+        free(pcmBuffer);
+        Serial.println("[语音诊断] Base64缓冲分配失败");
         return "";
     }
+    base64ToBuffer(pcmBuffer, totalRead, b64Buf);
+    free(pcmBuffer);
     // 【代理ASR】改走Render后端 /api/asr 转发百度识别（热点拦ESP32直连百度，后端可达）
     WiFiClientSecure client;
     client.setInsecure();
     client.setTimeout(20000);
     HTTPClient http;
     if (!http.begin(client, "https://blindstick-4.onrender.com/api/asr")) {
+        free(b64Buf);
         Serial.println("[语音诊断] 代理ASR HTTP初始化失败（连不上 Render 后端）");
         return "";
     }
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(20000);
-    // 构建JSON请求（使用手动拼接避免内存问题）
-    String jsonPayload;
-    jsonPayload.reserve(base64Audio.length() + 100);
-    jsonPayload = "{\"speech\":\"";
-    jsonPayload += base64Audio;
-    jsonPayload += "\",\"len\":";
-    jsonPayload += totalRead;
-    jsonPayload += "}";
-    int httpCode = http.POST(jsonPayload);
+    // 构造JSON body到PSRAM/堆缓冲（不再用大String）
+    size_t jsonCap = b64Cap + 64;
+    char* jsonBuf = (char*)heap_caps_malloc(jsonCap, MALLOC_CAP_SPIRAM);
+    if (!jsonBuf) {
+        jsonBuf = (char*)malloc(jsonCap);
+    }
+    if (!jsonBuf) {
+        free(b64Buf);
+        Serial.println("[语音诊断] JSON缓冲分配失败");
+        return "";
+    }
+    int jsonLen = snprintf(jsonBuf, jsonCap, "{\"speech\":\"%s\",\"len\":%u}", b64Buf, (unsigned)totalRead);
+    free(b64Buf);  // 释放base64，降低峰值
+    int httpCode = http.POST((uint8_t*)jsonBuf, jsonLen);
     String result = "";
     if (httpCode == 200) {
         String response = http.getString();
@@ -1651,6 +1678,7 @@ String doVoiceRecognition() {
         Serial.printf("[语音诊断] 代理ASR HTTP失败 code=%d\n", httpCode);
     }
     http.end();
+    free(jsonBuf);
     return result;
 }
 /**
@@ -1674,6 +1702,31 @@ encoded += (remain > 2) ? base64Chars[temp[2] & 0x3F] : '=';
 i += 3;
 }
 return encoded;
+}
+/**
+* Base64写入缓冲区（不产生大String，用于PSRAM内存优化）
+*/
+size_t base64ToBuffer(const uint8_t* data, size_t len, char* out) {
+static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+size_t oi = 0;
+size_t i = 0;
+for (; i + 3 <= len; i += 3) {
+uint32_t v = ((uint32_t)data[i] << 16) | ((uint32_t)data[i+1] << 8) | data[i+2];
+out[oi++] = b64[(v >> 18) & 0x3F];
+out[oi++] = b64[(v >> 12) & 0x3F];
+out[oi++] = b64[(v >> 6) & 0x3F];
+out[oi++] = b64[v & 0x3F];
+}
+if (i < len) {
+uint32_t v = (uint32_t)data[i] << 16;
+if (i + 1 < len) v |= (uint32_t)data[i+1] << 8;
+out[oi++] = b64[(v >> 18) & 0x3F];
+out[oi++] = b64[(v >> 12) & 0x3F];
+out[oi++] = (i + 1 < len) ? b64[(v >> 6) & 0x3F] : '=';
+out[oi++] = '=';
+}
+out[oi] = '\0';
+return oi;
 }
 // ==================== setup / loop ====================
 void setup() {
@@ -1856,9 +1909,9 @@ WiFiClientSecure client;
 client.setInsecure();
 client.setTimeout(15000);
 HTTPClient http;
-String url = "https://api.map.baidu.com/place/v2/search?query=" + urlEncode(keyword) +
-"&region=" + urlEncode(home_city.c_str()) +
-"&output=json&ak=e9R2xrzLSwLzjMH5fdqHz4dLB0gXwIZW&page_size=5";
+// 【代理】地点搜索改走Render后端 /api/places（热点拦ESP32直连百度地图API）
+String url = "https://blindstick-4.onrender.com/api/places?query=" + urlEncode(keyword) +
+"&region=" + urlEncode(home_city.c_str());
 if (!http.begin(client, url)) return false;
 http.setTimeout(15000);
 http.setReuse(false);
@@ -1934,10 +1987,10 @@ WiFiClientSecure client;
 client.setInsecure();
 client.setTimeout(15000);
 HTTPClient http;
-String url = "https://api.map.baidu.com/directionlite/v1/walking?origin=" +
+// 【代理】路线规划改走Render后端 /api/directions（热点拦ESP32直连百度地图API）
+String url = "https://blindstick-4.onrender.com/api/directions?origin=" +
 String(originLat, 6) + "," + String(originLng, 6) +
-"&destination=" + String(destLat, 6) + "," + String(destLng, 6) +
-"&ak=e9R2xrzLSwLzjMH5fdqHz4dLB0gXwIZW";
+"&destination=" + String(destLat, 6) + "," + String(destLng, 6);
 if (!http.begin(client, url)) return false;
 http.setTimeout(15000);
 http.setReuse(false);

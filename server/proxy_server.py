@@ -482,6 +482,65 @@ def asr_proxy():
         traceback.print_exc()
         return jsonify({"err_no": -5, "msg": str(e)}), 500
 
+# ==================== Places Proxy（ESP32地点搜索代理）====================
+@app.route('/api/places', methods=['GET'])
+def places_proxy():
+    """ESP32地点搜索代理：热点拦ESP32直连百度地图API，改由后端转发
+    请求: /api/places?query=湖北师范大学&region=黄石市
+    响应: 百度地图Place API原始JSON（status + results[].name/location）
+    """
+    keyword = request.args.get('query', '')
+    region = request.args.get('region', '黄石市')
+    if not keyword:
+        return jsonify({"status": 1, "message": "missing query"}), 400
+    try:
+        params = {
+            "query": keyword,
+            "region": region,
+            "output": "json",
+            "ak": "e9R2xrzLSwLzjMH5fdqHz4dLB0gXwIZW",
+            "page_size": 5,
+        }
+        resp = requests.get("https://api.map.baidu.com/place/v2/search", params=params, timeout=15, verify=False)
+        data = resp.json()
+        print(f"[Places] '{keyword}' status={data.get('status')} results={len(data.get('results', []))}")
+        return jsonify(data)
+    except Exception as e:
+        print(f"[Places] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"status": 2, "message": str(e)}), 500
+
+# ==================== Directions Proxy（ESP32步行路线代理）====================
+@app.route('/api/directions', methods=['GET'])
+def directions_proxy():
+    """ESP32步行路线代理：热点拦ESP32直连百度地图API，改由后端转发
+    请求: /api/directions?origin=lat,lng&destination=lat,lng
+    响应: 百度directionlite步行路线原始JSON
+    """
+    origin = request.args.get('origin', '')
+    destination = request.args.get('destination', '')
+    if not origin or not destination:
+        return jsonify({"status": 1, "message": "missing origin/destination"}), 400
+    try:
+        params = {
+            "origin": origin,
+            "destination": destination,
+            "ak": "e9R2xrzLSwLzjMH5fdqHz4dLB0gXwIZW",
+        }
+        resp = requests.get("https://api.map.baidu.com/directionlite/v1/walking", params=params, timeout=15, verify=False)
+        data = resp.json()
+        if data.get("status") == 0 and data.get("result") and data["result"].get("routes"):
+            print(f"[Directions] OK, routes={len(data['result']['routes'])}")
+        else:
+            print(f"[Directions] status={data.get('status')} msg={data.get('message')}")
+        return jsonify(data)
+    except Exception as e:
+        print(f"[Directions] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"status": 2, "message": str(e)}), 500
+
 # ==================== Main ====================
 if __name__ == '__main__':
     import urllib3
