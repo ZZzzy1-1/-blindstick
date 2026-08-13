@@ -440,6 +440,48 @@ def health_check():
         "mode": "mqtt_only"
     })
 
+# ==================== ASR Proxy（ESP32语音识别代理）====================
+@app.route('/api/asr', methods=['POST'])
+def asr_proxy():
+    """ESP32识别代理：热点拦ESP32直连百度，改由后端转发
+    请求: {"speech": "<base64 PCM 16k单声道>", "len": <音频字节数>}
+    响应: {"err_no": 0, "text": "识别文字"} 或 {"err_no": x, "msg": "..."}
+    """
+    try:
+        data = request.get_json(force=True, silent=True)
+        if not data:
+            return jsonify({"err_no": -1, "msg": "invalid json"}), 400
+        speech = data.get("speech", "")
+        length = data.get("len", 0)
+        if not speech or not length:
+            return jsonify({"err_no": -2, "msg": "missing speech/len"}), 400
+
+        token = get_baidu_token()
+        if not token:
+            return jsonify({"err_no": -3, "msg": "cannot get baidu token"}), 500
+
+        payload = {
+            "format": "pcm",
+            "rate": 16000,
+            "channel": 1,
+            "cuid": "blindstick_proxy",
+            "token": token,
+            "dev_pid": 1537,
+            "speech": speech,
+            "len": int(length),
+        }
+        resp = requests.post("https://vop.baidu.com/server_api", json=payload, timeout=15, verify=False)
+        rdata = resp.json()
+        print(f"[ASR] Baidu err_no={rdata.get('err_no')} result={rdata.get('result')}")
+        if rdata.get("err_no") == 0 and rdata.get("result"):
+            return jsonify({"err_no": 0, "text": rdata["result"][0]})
+        return jsonify({"err_no": rdata.get("err_no", -4), "msg": rdata.get("err_msg", "asr error")})
+    except Exception as e:
+        print(f"[ASR] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"err_no": -5, "msg": str(e)}), 500
+
 # ==================== Main ====================
 if __name__ == '__main__':
     import urllib3

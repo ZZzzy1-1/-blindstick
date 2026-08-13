@@ -141,6 +141,7 @@ struct TTSUrlMsg {
 QueueHandle_t ttsUrlQueue = NULL;
 void TTSUrlPlayerTask(void* pvParameters);
 void handleTTSUrlDownload(const TTSUrlMsg* msg);
+void probeRenderConnectivity();
 
 void playPcmData(uint8_t* data, int len);
 void stopCurrentPlayback();
@@ -148,7 +149,6 @@ const char* getPrioName(int p);
 // 流式语音识别相关
 void VoiceRecognitionTask(void* pvParameters);
 String doVoiceRecognition();
-String getBaiduToken();
 void handleVoiceCommand(const char* text);
 String base64Encode(const uint8_t* data, size_t len);  // Base64编码
 // ==================== 工具函数实现 ====================
@@ -226,6 +226,8 @@ volatile bool nav_active = false;
 String current_destination = "";  // 【新增】当前导航目的地，用于MQTT上报
 volatile bool  is_blocked  = false;
 volatile bool  is_ai_talking = false;
+// 【新增】最近一次实际播放的TTS文本（回声抑制用）
+char lastPlayedTtsText[128] = "";
 volatile unsigned long ai_talking_start_time = 0;  // 【新增】记录开始时间
 const unsigned long AI_TALKING_TIMEOUT_MS = 15000;  // 【新增】15秒超时
 volatile unsigned long ttsPlayEndTime = 0;  // 【新增】TTS播放结束时间
@@ -563,27 +565,27 @@ void processK230Data() {
         lastK230Diag = millis();
         Serial.printf("[K230诊断] 串口可用:%d 缓冲:%d\n", k230Serial.available(), k230_receiveBuffer.length());
     }
-    int maxChars = 100;  // 每次最多处理100个字符，避免阻塞
+    // 【修改】每次尽量读空K230缓冲（上限1024字符），避障忙时K230数据不再被覆盖丢弃
+    int maxChars = k230Serial.available();
+    if (maxChars > 1024) maxChars = 1024;
+    // 【修改】乱码可能让缓冲区堆积垃圾：超过512字符直接丢弃，防止无限增长
+    if (k230_receiveBuffer.length() > 512) {
+        k230_receiveBuffer = "";
+    }
 while (k230Serial.available() > 0 && maxChars-- > 0) {
 char c = k230Serial.read();
 if (c == '\n') {
 k230_receiveBuffer.trim();
 if (k230_receiveBuffer.length() > 0) {
-if (k230_receiveBuffer.startsWith("DET:")) {
-    Serial.printf("[K230] 收到检测:%s' + BS + 'n", k230_receiveBuffer.c_str());  // 诊断
-parseK230SingleDetection(k230_receiveBuffer);
-String targetName = k230_receiveBuffer.substring(4);
-int targetIndex = getK230TargetIndex(targetName.c_str());
-if (targetIndex >= 0) {
-unsigned long now = millis();
-if (now - k230_lastAlertTime[targetIndex] >= K230_ALERT_COOLDOWN_MS) {
-sendK230_TTSRequest(targetName.c_str());
-k230_lastAlertTime[targetIndex] = now;
-}
-}
-}
-else if (k230_receiveBuffer.startsWith("DETS:")) {
-parseK230MultiDetections(k230_receiveBuffer);
+// 【修改】乱码会包在有效帧前面（如 垃圾...DET:vehicle），只认行首会漏掉大部分帧。
+// 改为在整行里搜索帧标记，取标记之后的子串解析，垃圾自动被丢弃
+int detsIdx = k230_receiveBuffer.indexOf("DETS:");
+int detIdx  = k230_receiveBuffer.indexOf("DET:");
+int noneIdx = k230_receiveBuffer.indexOf("NONE");
+if (detsIdx >= 0) {
+    String frame = k230_receiveBuffer.substring(detsIdx);
+    Serial.printf("[K230] 收到多目标: %s\n", frame.c_str());
+parseK230MultiDetections(frame);
 for (int i = 0; i < k230_detection_count; i++) {
 int targetIndex = getK230TargetIndex(k230_detections[i].targetClass.c_str());
 if (targetIndex >= 0) {
@@ -595,8 +597,20 @@ break;
 }
 }
 }
+} else if (detIdx >= 0) {
+    String frame = k230_receiveBuffer.substring(detIdx);
+    Serial.printf("[K230] 收到检测: %s\n", frame.c_str());
+parseK230SingleDetection(frame);
+String targetName = frame.substring(4);
+int targetIndex = getK230TargetIndex(targetName.c_str());
+if (targetIndex >= 0) {
+unsigned long now = millis();
+if (now - k230_lastAlertTime[targetIndex] >= K230_ALERT_COOLDOWN_MS) {
+sendK230_TTSRequest(targetName.c_str());
+k230_lastAlertTime[targetIndex] = now;
 }
-else if (k230_receiveBuffer == "NONE") {
+}
+} else if (noneIdx >= 0) {
 k230_detection_count = 0;
 }
 k230_receiveBuffer = "";
@@ -1216,6 +1230,8 @@ gpsSerial.listen();  // 必须listen才会开始接收RX数据
 gps_baud_try_start = millis();
 Serial.printf("[GPS] 软串口初始化，尝试波特率=%d\n", gps_baud_table[gps_baud_index]);
 // K230硬件串口UART2
+// 【修复】加大K230串口接收缓冲区：避障日志刷屏、主循环变慢时，K230数据不被顶掉
+k230Serial.setRxBufferSize(4096);  // 必须在begin()之前调用
 k230Serial.begin(K230_UART_BAUD, SERIAL_8N1, K230_RX_PIN, K230_TX_PIN);
 Serial.printf("[K230] UART%d初始化 RX=GPIO%d TX=GPIO%d\n",
 K230_UART_ID, K230_RX_PIN, K230_TX_PIN);
@@ -1456,6 +1472,15 @@ i2s_zero_dma_buffer(I2S_PORT_OUT);
 /**
 * 流式语音识别任务（非阻塞优化版）
 */
+// 【新增】回声抑制：识别结果是否等于刚播放的TTS文本（喇叭声被麦克风收回）
+bool isTtsEcho(const char* result) {
+    if (result == NULL || result[0] == '\0' || lastPlayedTtsText[0] == '\0') return false;
+    String r = String(result);
+    String t = String(lastPlayedTtsText);
+    if (r.indexOf(t) >= 0 || t.indexOf(r) >= 0) return true;  // 双方互相包含视为回声
+    return false;
+}
+
 void VoiceRecognitionTask(void* pvParameters) {
 // 等待WiFi连接（最多60秒）
 int waitCount = 0;
@@ -1484,14 +1509,16 @@ if (millis() - lastVoiceHeartbeat > 30000) {
 lastVoiceHeartbeat = millis();
 Serial.println("[语音识别] 运行中（持续监听语音）");
 }
-    // 【修复】正在播放TTS时等待，不录音（避免被挂起导致录音不完整）
-    if (getTTSRequesting() || is_ai_talking) {
-        vTaskDelay(500 / portTICK_PERIOD_MS);
-        continue;
-    }
+    // 【修改】持续识别：不再因TTS请求/播放而暂停录音（两路I2S独立，TTS回声由isTtsEcho过滤）
 // 录音并识别（3秒）
 String result = doVoiceRecognition();
 if (result.length() > 0) {
+// 【新增】回声抑制：识别结果就是刚播放的TTS文本时忽略，防自激循环
+if (isTtsEcho(result.c_str())) {
+Serial.printf("[语音识别] 忽略TTS回声: %s\n", result.c_str());
+vTaskDelay(500 / portTICK_PERIOD_MS);
+continue;
+}
 Serial.printf("[语音识别] 识别到: %s\n", result.c_str());
 handleVoiceCommand(result.c_str());
 // 短暂等待让系统处理，不阻塞TTS
@@ -1528,11 +1555,7 @@ String doVoiceRecognition() {
     size_t rawRead = 0;
     unsigned long startTime = millis();
     while (millis() - startTime < (unsigned long)RECORD_SECONDS * 1000 && rawRead < RAW_RECORD_BYTES) {
-        // 【修复】录音中TTS开始播放，放弃当前录音（VoiceTask会等待播放完成再重新录）
-        if (getTTSRequesting() || is_ai_talking) {
-            free(rawBuffer);
-            return "";
-        }
+        // 【修改】持续录音：TTS播放中不中断录音（回声交给isTtsEcho过滤）
         size_t bytesRead = 0;
         i2s_read(I2S_PORT, rawBuffer + rawRead, RAW_RECORD_BYTES - rawRead, &bytesRead, 50);
         rawRead += bytesRead;
@@ -1577,103 +1600,58 @@ String doVoiceRecognition() {
         return "";
     }
 
-    // 获取百度Token
-    String token = getBaiduToken();
-    if (token.length() == 0) {
-        free(pcmBuffer);
-        return "";
-    }
     // Base64编码
     String base64Audio = base64Encode(pcmBuffer, totalRead);
     free(pcmBuffer);
     if (base64Audio.length() == 0) {
+        Serial.println("[语音诊断] Base64编码失败");
         return "";
     }
-// 发送ASR请求
-WiFiClientSecure client;
-client.setInsecure();
-client.setTimeout(15000);
-HTTPClient http;
-if (!http.begin(client, "https://vop.baidu.com/server_api")) {
-return "";
-}
-http.addHeader("Content-Type", "application/json");
-http.setTimeout(15000);
-// 构建JSON请求（使用手动拼接避免内存问题）
-String jsonPayload;
-jsonPayload.reserve(base64Audio.length() + 200);
-jsonPayload = "{\"format\":\"pcm\",\"rate\":16000,\"channel\":1,\"cuid\":\"esp32_blindstick\",\"token\":\"";
-jsonPayload += token;
-jsonPayload += "\",\"dev_pid\":1537,\"speech\":\"";
-jsonPayload += base64Audio;
-jsonPayload += "\",\"len\":";
-jsonPayload += totalRead;
-jsonPayload += "}";
-int httpCode = http.POST(jsonPayload);
-String result = "";
-if (httpCode == 200) {
-String response = http.getString();
-StaticJsonDocument<1024> respDoc;
-DeserializationError error = deserializeJson(respDoc, response);
-if (!error && respDoc["err_no"] == 0) {
-JsonArray results = respDoc["result"];
-if (results.size() > 0) {
-result = results[0].as<String>();
-// 去除标点符号
-result.replace("。", "");
-result.replace("，", "");
-result.replace("？", "");
-result.replace("！", "");
-result.trim();
-}
-} else {
-// 【诊断】ASR返回错误
-int errNo = respDoc["err_no"] | -1;
-Serial.printf("[语音诊断] ASR错误 err_no=%d 响应:%s\n", errNo, response.substring(0, 80).c_str());
-}
-} else {
-// 【诊断】ASR HTTP失败
-Serial.printf("[语音诊断] ASR HTTP失败 code=%d\n", httpCode);
-}
-http.end();
-return result;
-}
-/**
-* 获取百度Access Token（带缓存）
-*/
-String getBaiduToken() {
-// 检查缓存的token是否有效（提前5分钟过期）
-static String cached_token = "";
-static unsigned long expire_time = 0;
-if (cached_token.length() > 0 && millis() < expire_time - 300000) {
-return cached_token;
-}
-WiFiClientSecure client;
-client.setInsecure();
-client.setTimeout(10000);
-HTTPClient http;
-String url = "https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials";
-url += "&client_id=" + BAIDU_API_KEY;
-url += "&client_secret=" + BAIDU_SECRET_KEY;
-if (!http.begin(client, url)) {
-return "";
-}
-http.setTimeout(10000);
-int httpCode = http.GET();
-if (httpCode == 200) {
-String response = http.getString();
-StaticJsonDocument<512> doc;
-DeserializationError error = deserializeJson(doc, response);
-if (!error && doc.containsKey("access_token")) {
-cached_token = doc["access_token"].as<String>();
-int expiresIn = doc["expires_in"] | 2592000;
-expire_time = millis() + (expiresIn * 1000);
-http.end();
-return cached_token;
-}
-}
-http.end();
-return "";
+    // 【代理ASR】改走Render后端 /api/asr 转发百度识别（热点拦ESP32直连百度，后端可达）
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(20000);
+    HTTPClient http;
+    if (!http.begin(client, "https://blindstick-4.onrender.com/api/asr")) {
+        Serial.println("[语音诊断] 代理ASR HTTP初始化失败（连不上 Render 后端）");
+        return "";
+    }
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(20000);
+    // 构建JSON请求（使用手动拼接避免内存问题）
+    String jsonPayload;
+    jsonPayload.reserve(base64Audio.length() + 100);
+    jsonPayload = "{\"speech\":\"";
+    jsonPayload += base64Audio;
+    jsonPayload += "\",\"len\":";
+    jsonPayload += totalRead;
+    jsonPayload += "}";
+    int httpCode = http.POST(jsonPayload);
+    String result = "";
+    if (httpCode == 200) {
+        String response = http.getString();
+        StaticJsonDocument<1024> respDoc;
+        DeserializationError error = deserializeJson(respDoc, response);
+        if (!error && respDoc["err_no"] == 0) {
+            result = respDoc["text"].as<String>();
+            // 去除标点符号
+            result.replace("。", "");
+            result.replace("，", "");
+            result.replace("？", "");
+            result.replace("！", "");
+            result.trim();
+        } else {
+            // 【诊断】代理ASR返回错误
+            int errNo = respDoc["err_no"] | -1;
+            const char* msg = respDoc["msg"] | "";
+            Serial.printf("[语音诊断] 代理ASR错误 err_no=%d msg=%s\n", errNo, msg);
+        }
+    } else {
+        // 【诊断】代理ASR HTTP失败
+        Serial.printf("[语音诊断] 代理ASR HTTP失败 code=%d\n", httpCode);
+    }
+    http.end();
+    return result;
 }
 /**
 * Base64编码
@@ -1768,6 +1746,8 @@ i2s_out_init();
 i2s_init();
 // 播放测试音确认扬声器工作
 playLocalStartupTone();
+// 【修复】覆盖热点下发的DNS，改用国内公共DNS（热点DNS常解析不到onrender.com导致下载-1）
+WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, IPAddress(223, 5, 5, 5), IPAddress(114, 114, 114, 114));
 // 连接WiFi
 WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 unsigned long wifi_start = millis();
@@ -1776,6 +1756,8 @@ if (millis() - wifi_start > 30000) break;
 delay(500);
 }
 if (WiFi.status() == WL_CONNECTED) {
+// 【新增】探测ESP32到Render的连通性（诊断TTS下载-1）
+probeRenderConnectivity();
 // 配置MQTT
 espClient.setInsecure();
 espClient.setHandshakeTimeout(8);
@@ -1799,6 +1781,29 @@ xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 16384, NULL, 2, &V
 }
 void loop() {
 vTaskDelete(NULL);
+}
+
+// ==================== Render连通性探测（诊断TTS下载-1用）====================
+void probeRenderConnectivity() {
+Serial.println("\n[NET-PROBE] 测试 blindstick-4.onrender.com:443 ...");
+IPAddress renderIP;
+int dnsRes = WiFi.hostByName("blindstick-4.onrender.com", renderIP);
+if (dnsRes != 1) {
+Serial.printf("[NET-PROBE] DNS解析失败(res=%d) → 热点/运营商DNS解析不到onrender.com\n", dnsRes);
+} else {
+Serial.printf("[NET-PROBE] DNS解析成功: %s\n", renderIP.toString().c_str());
+WiFiClientSecure probe;
+probe.setInsecure();
+probe.setTimeout(8000);
+bool ok = probe.connect("blindstick-4.onrender.com", 443);
+if (ok) {
+Serial.println("[NET-PROBE] TCP+TLS连接成功 → 网络层OK，下载-1是别的原因");
+probe.stop();
+} else {
+Serial.println("[NET-PROBE] TCP+TLS连接失败 → 热点/运营商挡了ESP32到Render的443");
+}
+}
+Serial.println("[NET-PROBE] 结束\n");
 }
 // ==================== 工具函数 ====================
 /**
@@ -2187,6 +2192,7 @@ if (ttsPriority >= PRIO_HIGH) {
     }
 }
 
+snprintf(lastPlayedTtsText, sizeof(lastPlayedTtsText), "%s", text ? text : "");
 playPcmData(audioBuffer + offset, totalRead - offset);
 free(audioBuffer);
 Serial.println("[TTS-URL] 播放完成(部分下载)");
@@ -2223,6 +2229,7 @@ if (ttsPriority >= PRIO_HIGH) {
     }
 }
 
+snprintf(lastPlayedTtsText, sizeof(lastPlayedTtsText), "%s", text ? text : "");
 playPcmData(audioBuffer + offset, len - offset);
 free(audioBuffer);
 Serial.println("[TTS-URL] 播放完成");
