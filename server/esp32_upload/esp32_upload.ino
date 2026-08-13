@@ -1331,6 +1331,24 @@ publishSensorData();
 vTaskDelay(10 / portTICK_PERIOD_MS);
 }
 }
+// ==================== Render保活任务（防免费版休眠，避免ASR/TTS冷启动）====================
+void RenderKeepAliveTask(void* pvParameters) {
+while (true) {
+if (WiFi.status() == WL_CONNECTED) {
+WiFiClientSecure kaClient;
+kaClient.setInsecure();
+kaClient.setTimeout(3);
+HTTPClient httpKA;
+if (httpKA.begin(kaClient, "https://blindstick-4.onrender.com/health")) {
+httpKA.setTimeout(3000);
+int code = httpKA.GET();
+httpKA.end();
+Serial.printf("[保活] /health code=%d\n", code);
+}
+}
+vTaskDelay(45000 / portTICK_PERIOD_MS);
+}
+}
 // ==================== Core 1 导航任务（带路口播报）====================
 void NavigationTask(void* pvParameters) {
 Serial.println("[导航] 启动");
@@ -1563,15 +1581,98 @@ String doVoiceRecognition() {
         return "";
     }
 
-    // 录音3秒（32bit原始数据）
-    size_t rawRead = 0;
-    unsigned long startTime = millis();
-    while (millis() - startTime < (unsigned long)RECORD_SECONDS * 1000 && rawRead < RAW_RECORD_BYTES) {
-        // 【修改】持续录音：TTS播放中不中断录音（回声交给isTtsEcho过滤）
-        size_t bytesRead = 0;
-        i2s_read(I2S_PORT, rawBuffer + rawRead, RAW_RECORD_BYTES - rawRead, &bytesRead, 50);
-        rawRead += bytesRead;
+    // 【VAD录音】不再固定录3秒，检测到说话才开始捕获、停嘴约0.5秒即结束发送
+    // 阈值与分块参数（串口会打印静音能量，便于调节阈值）
+    const int VOICE_AVG_THRESHOLD = 120;              // 块内|样本|均值超过该值判定为有声
+    const size_t VAD_BLOCK_BYTES = 640 * 4;           // 40ms @16kHz 32bit = 2560字节
+    const int START_BLOCKS = 2;                       // 连续2块有声才确认说话（抗突发噪声）
+    const int END_SILENT_BLOCKS = 12;                 // 连续12块(480ms)静音视为说完
+    const int MIN_SPEECH_MS = 300;                    // 最短语音300ms，更短视为噪声
+    const unsigned long NO_SPEECH_TIMEOUT_MS = 10000; // 10秒无人说话则退出本轮继续监听
+
+    uint8_t* blockBuf = (uint8_t*)malloc(VAD_BLOCK_BYTES);
+    if (!blockBuf) {
+        free(rawBuffer);
+        Serial.println("[语音诊断] VAD块缓冲分配失败");
+        return "";
     }
+    size_t capturedBytes = 0;   // 已捕获的32bit字节数
+    int speechMs = 0;           // 语音时长（仅计有声块）
+    int totalMs = 0;            // 本段总时长（含末尾静音，用于3秒上限）
+    int silentBlocks = 0;
+    int state = 0;              // 0=静音 1=疑似开始 2=语音中
+    bool speechStarted = false;
+    unsigned long vadStart = millis();
+
+    while (true) {
+        // 超时保护：麦克风无声/异常时避免卡死
+        if (!speechStarted && (millis() - vadStart > NO_SPEECH_TIMEOUT_MS)) break;
+        size_t got = 0;
+        esp_err_t e = i2s_read(I2S_PORT, blockBuf, VAD_BLOCK_BYTES, &got, 100);
+        if (e != ESP_OK || got < VAD_BLOCK_BYTES / 2) continue;   // 数据不足，等下一块
+        int n = got / 4;
+        int32_t* s32 = (int32_t*)blockBuf;
+        long long sum = 0;
+        for (int i = 0; i < n; i++) {
+            int32_t v = s32[i] >> 14;
+            if (v < 0) v = -v;
+            sum += v;
+        }
+        int avg = (int)(sum / n);
+        int blockMs = n * 1000 / SAMPLE_RATE;
+        bool voiced = (avg > VOICE_AVG_THRESHOLD);
+
+        if (state == 0) {
+            // 静音中：每2秒打印一次能量，便于调试麦克风增益/阈值
+            static unsigned long lastE = 0;
+            if (millis() - lastE > 2000) {
+                lastE = millis();
+                Serial.printf("[语音诊断] VAD静音 能量=%d 阈值=%d\n", avg, VOICE_AVG_THRESHOLD);
+            }
+            if (voiced) { state = 1; silentBlocks = 0; }
+            continue;
+        }
+        if (state == 1) {
+            if (voiced) {
+                // 确认开口，开始捕获
+                state = 2; speechStarted = true;
+                speechMs = blockMs; totalMs = blockMs;
+                memcpy(rawBuffer, blockBuf, got);
+                capturedBytes = got;
+            } else if (++silentBlocks >= START_BLOCKS) {
+                state = 0;   // 突发噪声，误触发
+            }
+            continue;
+        }
+        // state==2 语音中
+        if (voiced) {
+            if (capturedBytes + got <= RAW_RECORD_BYTES) {
+                memcpy(rawBuffer + capturedBytes, blockBuf, got);
+                capturedBytes += got;
+            }
+            speechMs += blockMs;
+            totalMs += blockMs;
+            silentBlocks = 0;
+        } else {
+            totalMs += blockMs;
+            if (++silentBlocks >= END_SILENT_BLOCKS) {
+                if (speechMs >= MIN_SPEECH_MS) break;       // 说完，末尾静音未记录
+                // 过短视为噪声，丢弃并回到静音监听
+                state = 0; speechStarted = false;
+                capturedBytes = 0; speechMs = 0; totalMs = 0;
+                Serial.println("[语音诊断] VAD捕获过短(噪声)，丢弃");
+            }
+        }
+        if (totalMs >= RECORD_SECONDS * 1000) break;   // 3秒上限
+    }
+    free(blockBuf);
+    size_t rawRead = capturedBytes;
+    if (rawRead < VAD_BLOCK_BYTES / 2) {
+        Serial.println("[语音诊断] VAD未捕获到语音，继续监听...");
+        free(rawBuffer);
+        return "";
+    }
+    Serial.printf("[语音诊断] VAD捕获语音 %dms %d字节\n", speechMs, (int)rawRead);
 
     // 分配16bit PCM缓冲区（优先PSRAM，减少内部堆压力）
     uint8_t* pcmBuffer = (uint8_t*)heap_caps_malloc(PCM_RECORD_BYTES, MALLOC_CAP_SPIRAM);
@@ -1822,6 +1923,7 @@ mqtt_reconnect();
 xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 8192, NULL, 3, &RadarTaskHandle, 0);
 xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
 xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 16384, NULL, 2, &VoiceTaskHandle, 1);  // 【修复】增大栈空间防止ASR请求时栈溢出
+xTaskCreatePinnedToCore(RenderKeepAliveTask, "RenderKA", 16384, NULL, 1, NULL, 1);  // 每45秒ping /health防休眠
     // 【修复】创建TTS URL异步播放队列和任务（独立播放，不阻塞MQTT主循环和传感器上传）
     ttsUrlQueue = xQueueCreate(4, sizeof(TTSUrlMsg));
     if (ttsUrlQueue != NULL) {
@@ -2054,7 +2156,8 @@ String destination = extractDestination(text);
 // 如果没有触发词，提示用户
 if (destination.length() < 2) {
 Serial.println("[语音识别] 无触发词，忽略");
-// 可选：播放提示音告诉用户需要说触发词
+// 【新增】提示音：没听懂就"嘀"一声让用户重说（TTS播放中不响，避免抢扬声器）
+if (!is_ai_talking) playLocalStartupTone();
 return;
 }
 if (destination.length() < 2) {
