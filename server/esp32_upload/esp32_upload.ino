@@ -1179,11 +1179,24 @@ lastPublishDebug = millis();
 Serial.printf("[MQTT上传] 雷达 F:%.0f L:%.0f R:%.0f GPS:%.6f,%.6f\n",
 dir_smt[0], dir_smt[1], dir_smt[2], gps_lat, gps_lng);
 }
-// K230视觉检测数据 - 发送最新检测到的目标（取第一个）
+// K230视觉检测数据 - 发送最新检测到的目标
 if (k230_detection_count > 0 && millis() - k230_detections[0].timestamp < 5000) {
 doc["k230_class"] = k230_detections[0].targetClass;
 doc["k230_label"] = k230_detections[0].targetLabel;
-// 是否属于危险目标（用于前端红色高亮）
+// 【修复】发送真实坐标到网页（不再写死居中框），格式: [{class,label,x,y,w,h,conf}]
+JsonArray dets = doc.createNestedArray("k230_dets");
+int detCount = k230_detection_count > MAX_K230_DETECTIONS ? MAX_K230_DETECTIONS : k230_detection_count;
+for (int i = 0; i < detCount; i++) {
+JsonObject d = dets.createNestedObject();
+d["class"] = k230_detections[i].targetClass;
+d["label"] = k230_detections[i].targetLabel;
+d["x"] = k230_detections[i].x;
+d["y"] = k230_detections[i].y;
+d["w"] = k230_detections[i].w;
+d["h"] = k230_detections[i].h;
+d["conf"] = k230_detections[i].confidence;
+}
+// 是否属于危险目标（用于前端红色高亮，取第一个）
 bool isDanger = (k230_detections[0].targetClass == "red_light" ||
 k230_detections[0].targetClass == "person" ||
 k230_detections[0].targetClass == "vehicle" ||
@@ -1194,6 +1207,7 @@ doc["k230_danger"] = isDanger;
 doc["k230_class"] = "none";
 doc["k230_label"] = "";
 doc["k230_danger"] = false;
+doc["k230_dets"].to<JsonArray>();
 }
 // 添加今日出行统计数据
 JsonObject stats = doc.createNestedObject("stats");

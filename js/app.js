@@ -480,19 +480,26 @@ async function handleMqttMessage(topic, payload) {
             }
 
             // ====== K230 视觉检测数据 ======
-            if (msg.k230_class && msg.k230_class !== 'none' && msg.k230_class !== 'null') {
-                const cls = msg.k230_class;
-                const label = msg.k230_label || cls;
-                const meta = DETECTION_CLASSES[cls] || { label: label, color: '#ff4757' };
-                // 检测框使用固定位置（因为串口只传类别没有bbox）
-                AppState.videoDetections = [{
-                    class: cls,
-                    label: meta.label,
-                    color: meta.color,
-                    confidence: 0.85,
-                    x: 80, y: 80, w: 160, h: 160
-                }];
+            if (hasVisionData) {
+                // 【修复】优先用ESP32传的真实坐标（k230_dets），不再写死居中框
+                if (Array.isArray(msg.k230_dets) && msg.k230_dets.length > 0) {
+                    AppState.videoDetections = msg.k230_dets.map(d => {
+                        const meta = DETECTION_CLASSES[d.class] || { label: d.label || d.class, color: '#ff4757' };
+                        return { class: d.class, label: meta.label, color: meta.color,
+                                 x: d.x || 0, y: d.y || 0, w: d.w || 0, h: d.h || 0 };
+                    });
+                } else {
+                    // 无坐标时兜底：居中显示（老固件/未收到DETS帧）
+                    const cls = msg.k230_class;
+                    const label = msg.k230_label || cls;
+                    const meta = DETECTION_CLASSES[cls] || { label: label, color: '#ff4757' };
+                    AppState.videoDetections = [{
+                        class: cls, label: meta.label, color: meta.color,
+                        x: 80, y: 80, w: 160, h: 160
+                    }];
+                }
                 // 【新增】视觉分类累计计数：同一目标连续帧只算1次，目标消失/切换后再出现才+1
+                const cls = msg.k230_class;
                 if (AppState.lastCountedClass !== cls) {
                     AppState.detectionTotals[cls] = (AppState.detectionTotals[cls] || 0) + 1;
                     AppState.lastCountedClass = cls;
@@ -682,7 +689,7 @@ function drawVideoFrame() {
         ctx.strokeStyle = color; ctx.lineWidth = 2.5;
         ctx.strokeRect(rx, ry, rw, rh);
         ctx.fillStyle = hexToRgba(color, 0.15); ctx.fillRect(rx, ry, rw, rh);
-        const txt = `${label} ${Math.round((det.confidence || 0) * 100)}%`;
+        const txt = `${label}`;  // 【修改】不显示置信度，只显示类别
         ctx.font = 'bold 12px sans-serif';
         const tw = ctx.measureText(txt).width;
         ctx.fillStyle = hexToRgba(color, 0.85); ctx.fillRect(rx, ry - 22, tw + 10, 22);

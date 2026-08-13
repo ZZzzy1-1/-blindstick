@@ -191,11 +191,21 @@ if __name__=="__main__":
 
             # ===================== 新加：串口发送检测结果给 ESP32 =====================
             if len(res) > 0:
-                # 获取第一个检测目标
-                label_idx = int(res[0][5])
-                label_name = labels[label_idx]
-                # 发送格式：DET:person\n
-                send_data = f"DET:{label_name}\n"
+                # 【修复】发送真实坐标/置信度，格式：DETS:class,conf,x,y,w,h;class,conf,x,y,w,h;...
+                # 坐标在320x320画面内（rgb888p_size），与网页画框坐标系一致
+                parts = []
+                for det in res[:5]:
+                    label_idx = int(det[5])
+                    label_name = labels[label_idx]
+                    conf = round(float(det[4]), 2)
+                    x1, y1 = int(det[0]), int(det[1])
+                    x2, y2 = int(det[2]), int(det[3])
+                    # 裁剪到画面内，防止越界
+                    x1 = max(0, min(x1, 319)); y1 = max(0, min(y1, 319))
+                    x2 = max(0, min(x2, 319)); y2 = max(0, min(y2, 319))
+                    w = max(1, x2 - x1); h = max(1, y2 - y1)
+                    parts.append(f"{label_name},{conf},{x1},{y1},{w},{h}")
+                send_data = "DETS:" + ";".join(parts) + "\n"
                 uart.write(send_data)
                 print("发送给ESP32：" + send_data)
             else:
