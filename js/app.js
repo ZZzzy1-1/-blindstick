@@ -72,8 +72,8 @@ const AppState = {
     deviceStarted: false,
     // 【新增】视觉分类累计检测次数（每次"新出现" +1，连续帧去重）
     detectionTotals: {},
-    // 上次计入累计的视觉目标类别（用于去重：目标消失/切换后再出现才+1）
-    lastCountedClass: null
+    // 上次计入累计的视觉目标类别集合（用于去重：目标消失/切换后再出现才+1）
+    lastCountedClasses: new Set()
 };
 
 // ================= 计算两点间距离（米）====================
@@ -498,15 +498,22 @@ async function handleMqttMessage(topic, payload) {
                         x: 80, y: 80, w: 160, h: 160
                     }];
                 }
-                // 【新增】视觉分类累计计数：同一目标连续帧只算1次，目标消失/切换后再出现才+1
-                const cls = msg.k230_class;
-                if (AppState.lastCountedClass !== cls) {
-                    AppState.detectionTotals[cls] = (AppState.detectionTotals[cls] || 0) + 1;
-                    AppState.lastCountedClass = cls;
+                // 【新增】视觉分类累计计数：遍历所有检测目标，每类独立+1（连续帧去重，消失/切换后再出现才+1）
+                const curClasses = new Set();
+                if (Array.isArray(msg.k230_dets) && msg.k230_dets.length > 0) {
+                    msg.k230_dets.forEach(d => { if (d.class) curClasses.add(d.class); });
+                } else {
+                    if (msg.k230_class && msg.k230_class !== 'none') curClasses.add(msg.k230_class);
                 }
+                curClasses.forEach(c => {
+                    if (!AppState.lastCountedClasses.has(c)) {
+                        AppState.detectionTotals[c] = (AppState.detectionTotals[c] || 0) + 1;
+                    }
+                });
+                AppState.lastCountedClasses = curClasses;
             } else {
                 AppState.videoDetections = [];
-                AppState.lastCountedClass = null;  // 目标消失，下次出现重新计数
+                AppState.lastCountedClasses = new Set();  // 目标消失，下次出现重新计数
             }
 
             // ====== 今日出行统计数据（来自ESP32）======

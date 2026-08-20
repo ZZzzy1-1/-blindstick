@@ -329,7 +329,7 @@ const char* K230_ALERT_TARGETS[] = {
 const int K230_ALERT_TARGET_COUNT = 7;
 // 5秒防重复播报机制
 unsigned long k230_lastAlertTime[7] = {0};
-const unsigned long K230_ALERT_COOLDOWN_MS = 5000;
+const unsigned long K230_ALERT_COOLDOWN_MS = 8000;
 // K230串口接收缓冲区
 String k230_receiveBuffer = "";
 // K230最新检测数据（用于上传到大屏）
@@ -916,6 +916,9 @@ static String last_alert_text = "";
 static unsigned long last_alert_text_time = 0;
 // 【加快】去重时间从10秒改为5秒
 #define ALERT_TEXT_DUPLICATE_MS 5000
+// 【新增】避障播报固定间隙：无论文本/距离如何变化，8秒内最多播报一次（极端危险除外）
+#define AVOID_ALERT_MIN_INTERVAL_MS 8000
+static unsigned long lastAvoidAlertTime = 0;
 // 【优化】TTS触发阈值
 #define TTS_TRIGGER_DISTANCE_CM 60     // 距离小于60cm触发紧急播报
 // 【加快】连续检测从2次改为1次，更快响应
@@ -1042,6 +1045,13 @@ void checkObstacleAndAlert() {
         return;
     }
 
+    // 【新增】固定播报间隙：8秒内不重复播报，除非极端危险（障碍物<40cm/35cm）
+    // 解决文本变化（左绕→右绕）导致冷却失效、频繁播报的问题
+    bool criticalDanger = (f < 40.0f) || (L < 35.0f) || (R < 35.0f);
+    if (!criticalDanger && (now - lastAvoidAlertTime) < AVOID_ALERT_MIN_INTERVAL_MS) {
+        return;  // 8秒间隙内且非极端危险，跳过本次播报
+    }
+
     // 【修复】去重检查 - 基于告警文本内容
     static String lastAlertText = "";
     static unsigned long lastAlertTime = 0;
@@ -1078,6 +1088,7 @@ void checkObstacleAndAlert() {
             lastAlertFront = f;
             lastAlertLeft = L;
             lastAlertRight = R;
+            lastAvoidAlertTime = now;  // 【新增】记录本次播报时间，用于固定间隙
 
             // 重置连续计数器
             frontConsecutive = 0;
@@ -1151,7 +1162,7 @@ if (!mqtt.connected()) return;
 // 更新里程统计
 updateMileage();
 // 使用更大的JSON缓冲区容纳视觉检测数据
-StaticJsonDocument<1024> doc;
+StaticJsonDocument<2048> doc;  // 【修复】1024→2048：K230多目标时k230_dets数组会占满1024池，ArduinoJson静默丢框
 doc["device_id"] = "blind_stick_001";
 JsonObject radar = doc.createNestedObject("radar");
 // 三向雷达: [0]=前方, [1]=左方, [2]=右方

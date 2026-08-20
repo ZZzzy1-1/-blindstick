@@ -10,6 +10,7 @@ from libs.AI2D import Ai2d
 import os
 import ujson
 from media.media import *
+from media.sensor import *
 from time import *
 import nncase_runtime as nn
 import ulab.numpy as np
@@ -22,17 +23,15 @@ import sys
 import aidemo
 
 # ======================= 新加：串口初始化（对接ESP32）=======================
-from machine import UART, FPIOA
+# 【无屏型号】UART2 用 GPIO5/6（TX=GPIO5 -> ESP32 RX，RX=GPIO6）
+from machine import UART
 
-# K230 引脚映射：
-# UART2_TX = IO11
-# UART2_RX = IO12
-fpioa = FPIOA()
-fpioa.set_function(11, FPIOA.UART2_TXD)
-fpioa.set_function(12, FPIOA.UART2_RXD)
-
-# 初始化串口，波特率 115200（必须与ESP32一致）
-uart = UART(2, baudrate=115200)
+K230_UART_ID = 2          # UART2（不是UART1）
+K230_UART_BAUD = 115200
+K230_UART_TX_PIN = 5      # GPIO5 -> ESP32 RX
+K230_UART_RX_PIN = 6      # GPIO6 -> ESP32 TX（可选）
+uart = UART(K230_UART_ID, K230_UART_BAUD, tx=K230_UART_TX_PIN, rx=K230_UART_RX_PIN)
+print(f"[串口] UART{K230_UART_ID} 初始化 TX=GPIO{K230_UART_TX_PIN} RX=GPIO{K230_UART_RX_PIN} 波特={K230_UART_BAUD}")
 # ==========================================================================
 
 # 自定义YOLOv8检测类
@@ -157,11 +156,8 @@ class ObjectDetectionApp(AIBase):
 
 
 if __name__=="__main__":
-    display_mode="lcd"
-    if display_mode=="hdmi":
-        display_size=[1920,1080]
-    else:
-        display_size=[800,480]
+    display_mode="st7701"   # 【无屏型号】改用 st7701 模式（无屏幕显示）
+    display_size=[800,480]
 
     kmodel_path="/sdcard/examples/kmodel/best.kmodel"
     labels = [  'blind_track', 'curb', 'crosswalk', 'pole', 'ashcan', 'reflective_cone', 'red_light', 'yellow_light', 'green_light', 'stop_sign', 'person', 'vehicle', 'stairs', 'puddle']
@@ -170,9 +166,9 @@ if __name__=="__main__":
     max_boxes_num = 50
     rgb888p_size=[320,320]
 
-    # 初始化PipeLine
+    # 初始化PipeLine（无屏型号：显式指定Sensor分辨率）
     pl=PipeLine(rgb888p_size=rgb888p_size,display_size=display_size,display_mode=display_mode)
-    pl.create()
+    pl.create(Sensor(width=1920, height=1080))
     ob_det=ObjectDetectionApp(kmodel_path,labels=labels,model_input_size=[320,320],max_boxes_num=max_boxes_num,confidence_threshold=confidence_threshold,nms_threshold=nms_threshold,rgb888p_size=rgb888p_size,display_size=display_size,debug_mode=0)
     ob_det.config_preprocess()
 
