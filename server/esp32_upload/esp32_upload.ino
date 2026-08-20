@@ -916,9 +916,17 @@ static String last_alert_text = "";
 static unsigned long last_alert_text_time = 0;
 // 【加快】去重时间从10秒改为5秒
 #define ALERT_TEXT_DUPLICATE_MS 5000
-// 【新增】避障播报固定间隙：无论文本/距离如何变化，8秒内最多播报一次（极端危险除外）
-#define AVOID_ALERT_MIN_INTERVAL_MS 8000
+// 【新增】避障播报固定间隙：无论文本/距离如何变化，8秒内最多播报一次
+// 【修复】极端危险(障碍物极近)也设独立间隙(3秒)，防止"<40cm一直触发"导致连续播报/打断TTS/队列满
+#define AVOID_ALERT_MIN_INTERVAL_MS 8000      // 普通告警：8秒一次
+#define AVOID_ALERT_CRITICAL_INTERVAL_MS 3000 // 极端危险：3秒一次（仍允许打断当前TTS，但不再每帧都播）
 static unsigned long lastAvoidAlertTime = 0;
+// 【修复】极端危险判定：前方<30cm 或 侧方<25cm 才算（原<40/35太宽，31~39cm一直触发绕过间隙）
+#define CRITICAL_DANGER_F_CM 30.0f
+#define CRITICAL_DANGER_S_CM 25.0f
+static inline bool isCriticalDanger(float f, float L, float R) {
+    return (f < CRITICAL_DANGER_F_CM) || (L < CRITICAL_DANGER_S_CM) || (R < CRITICAL_DANGER_S_CM);
+}
 // 【优化】TTS触发阈值
 #define TTS_TRIGGER_DISTANCE_CM 60     // 距离小于60cm触发紧急播报
 // 【加快】连续检测从2次改为1次，更快响应
@@ -980,7 +988,7 @@ void checkObstacleAndAlert() {
 
     // 【新增】播放后静默期检查：TTS刚播放完，给语音识别完整录音窗口（除非极端危险）
     if (millis() - ttsPlayEndTime < TTS_PLAY_SILENT_MS) {
-        bool criticalDanger = (f < 40.0f) || (L < 35.0f) || (R < 35.0f);
+        bool criticalDanger = isCriticalDanger(f, L, R);
         if (!criticalDanger) {
             return;  // 静默期内且非极端危险，跳过本次播报
         }
@@ -988,9 +996,9 @@ void checkObstacleAndAlert() {
 
     // 【修复】检查是否正在播报其他内容
     // 【修复】正在播放TTS时抑制新的避障播报，避免连续播报导致语音识别被一直挂起
-    // 仅当距离极度危险(<40cm)时才打断当前播放紧急播报
+    // 仅当距离极度危险(<30cm)时才打断当前播放紧急播报
     if (is_ai_talking || getTTSRequesting()) {
-        bool criticalDanger = (f < 40.0f) || (L < 35.0f) || (R < 35.0f);
+        bool criticalDanger = isCriticalDanger(f, L, R);
         if (!criticalDanger) {
             return;  // 正在播报且非极端危险，跳过本次（下轮再试），给语音识别留时间
         }
@@ -1045,11 +1053,13 @@ void checkObstacleAndAlert() {
         return;
     }
 
-    // 【新增】固定播报间隙：8秒内不重复播报，除非极端危险（障碍物<40cm/35cm）
-    // 解决文本变化（左绕→右绕）导致冷却失效、频繁播报的问题
-    bool criticalDanger = (f < 40.0f) || (L < 35.0f) || (R < 35.0f);
-    if (!criticalDanger && (now - lastAvoidAlertTime) < AVOID_ALERT_MIN_INTERVAL_MS) {
-        return;  // 8秒间隙内且非极端危险，跳过本次播报
+    // 【新增】固定播报间隙：普通告警8秒一次，极端危险(<30cm)3秒一次
+    // 【修复】原实现"极端危险完全绕过间隙"导致前方31~39cm持续触发、连续打断TTS、队列满
+    //        现在临界危险也保留3秒短间隙，既不丢紧急提醒，也不再每帧轰炸
+    bool criticalDanger = isCriticalDanger(f, L, R);
+    unsigned long minInterval = criticalDanger ? AVOID_ALERT_CRITICAL_INTERVAL_MS : AVOID_ALERT_MIN_INTERVAL_MS;
+    if ((now - lastAvoidAlertTime) < minInterval) {
+        return;  // 间隙内，跳过本次播报
     }
 
     // 【修复】去重检查 - 基于告警文本内容
@@ -2176,6 +2186,16 @@ return true;
 */
 void handleVoiceCommand(const char* text) {
 Serial.printf("[语音识别] 识别结果: %s\n", text);
+// 【新增】发布识别结果到MQTT，让网页显示"识别到了什么"
+// 网页端只订阅了voice/pcm/*但固件从未发送PCM段，识别文本也无处展示 → 补发 voice/result
+if (mqtt.connected()) {
+    StaticJsonDocument<256> resDoc;
+    resDoc["text"] = text;
+    resDoc["ts"] = millis();
+    char resBuf[256];
+    size_t resLen = serializeJson(resDoc, resBuf, sizeof(resBuf));
+    mqtt.publish("blindstick/voice/result", resBuf, resLen);
+}
 // 提取目的地
 String destination = extractDestination(text);
 // 如果没有触发词，提示用户

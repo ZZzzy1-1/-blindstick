@@ -278,7 +278,8 @@ const MQTT_CONFIG = {
         voicePcm0: 'blindstick/voice/pcm/0',
         voicePcm1: 'blindstick/voice/pcm/1',
         voicePcm2: 'blindstick/voice/pcm/2',
-        voicePcm3: 'blindstick/voice/pcm/3'
+        voicePcm3: 'blindstick/voice/pcm/3',
+        voiceResult: 'blindstick/voice/result'
     }
 };
 
@@ -541,6 +542,22 @@ async function handleMqttMessage(topic, payload) {
                 nav_active:      msg.nav !== undefined ? msg.nav : msg.nav_active
             };
             updateRealtimeNav(navData);
+            return;
+        }
+
+        // --- 语音识别结果（ESP32发布识别到的文本，显示给用户看）---
+        if (topic === MQTT_CONFIG.topics.voiceResult) {
+            try {
+                const msg = JSON.parse(payload.toString());
+                const text = (msg.text || '').trim();
+                if (text) {
+                    console.log('[语音识别] 识别到:', text);
+                    addEventLog('语音', `识别到: ${text}`);
+                    updateModuleStatus({ voice: true });
+                }
+            } catch (e) {
+                console.error('[语音识别] 结果解析失败:', e);
+            }
             return;
         }
 

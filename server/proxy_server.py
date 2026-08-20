@@ -423,13 +423,20 @@ def static_files(filename):
 
 @app.route('/audio/<filename>')
 def serve_audio(filename):
-    """提供TTS音频文件下载（ESP32通过URL下载）"""
+    """提供TTS音频文件下载（ESP32通过URL下载）
+    【修复】send_from_directory 走流式/chunked传输（无Content-Length头），
+    ESP32的 http.getSize() 返回-1直接拒绝下载 → 改为整读进内存显式带Content-Length
+    """
     if '..' in filename or filename.startswith('/'):
         return "Invalid filename", 400
     filepath = os.path.join(AUDIO_CACHE_DIR, filename)
     if not os.path.exists(filepath):
         return "Audio file not found", 404
-    return send_from_directory(AUDIO_CACHE_DIR, filename, mimetype='audio/wav')
+    with open(filepath, 'rb') as f:
+        data = f.read()
+    resp = Response(data, mimetype='audio/wav')
+    resp.headers['Content-Length'] = str(len(data))
+    return resp
 
 @app.route('/health', methods=['GET'])
 def health_check():
