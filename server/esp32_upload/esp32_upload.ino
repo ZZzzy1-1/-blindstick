@@ -424,13 +424,21 @@ void smartAvoid() {
     bool leftTight = (L < 40.0f);
     bool rightTight = (R < 40.0f);
 
+    // 【修复】被包围日志只在进入/脱离状态变化时打印一次，避免每雷达周期刷屏淹没K230/TTS/ASR诊断日志
+    static bool wasSurrounded = false;
+    bool surrounded = (f < FRONT_CRITICAL) && leftTight && rightTight;
+    if (surrounded != wasSurrounded) {
+        wasSurrounded = surrounded;
+        Serial.printf(surrounded ? "[避障] 进入被包围(F:%.0f L:%.0f R:%.0f)，停止\n"
+                                 : "[避障] 脱离包围(F:%.0f L:%.0f R:%.0f)\n", f, L, R);
+    }
+
     // ===== 前方有障碍物 =====
     if (f < FRONT_CRITICAL) {
         // 两侧都非常堵(<40cm)才停止
         if (leftTight && rightTight) {
             motorControl(0);
             lastSteerDir = 0;
-            Serial.printf("[避障] 被包围(F:%.0f L:%.0f R:%.0f)，停止\n", f, L, R);
             return;
         }
         // 决定转向方向（带迟滞）
@@ -2534,7 +2542,7 @@ memcpy(tts_pcm_buf + tts_pcm_len, payload, length);
 tts_pcm_len += length;
 }
 void handleStreamControl(const char* payload, int length) {
-StaticJsonDocument<256> doc;
+StaticJsonDocument<512> doc;   // 【修复】256→512：stream_start 现在携带 text 字段（中文UTF-8每字3字节），256会池溢出导致解析失败、TTS会话起不来
 DeserializationError err = deserializeJson(doc, payload, length);
 if (err) {
 Serial.println("[流式TTS] 控制消息解析失败");
@@ -2564,6 +2572,9 @@ tts_pcm_assembling = true;
 tts_pcm_len = 0;
 is_ai_talking = true;  // 抑制避障重复播报
 ai_talking_start_time = millis();
+// 【修复】记录本次TTS文本供 isTtsEcho 回声过滤：此前MQTT流式路径漏记，
+// 喇叭声被麦克风收回后会被当成语音命令执行，是"语音识别不准确"的一大来源
+snprintf(lastPlayedTtsText, sizeof(lastPlayedTtsText), "%s", doc["text"] | "");
 if (VoiceTaskHandle != NULL) {
 vTaskSuspend(VoiceTaskHandle);
 }

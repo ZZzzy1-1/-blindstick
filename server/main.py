@@ -166,13 +166,27 @@ if __name__=="__main__":
     max_boxes_num = 50
     rgb888p_size=[320,320]
 
+    # 【诊断】先确认模型文件存在：之前模型缺失会在下面初始化里静默退出，串口一条都不发
+    if not os.path.exists(kmodel_path):
+        print(f"[K230] 错误：找不到模型文件 {kmodel_path}")
+        print("[K230] 请把 best.kmodel 放到SD卡 /sdcard/examples/kmodel/ 目录")
+        raise SystemExit(1)
+
     # 初始化PipeLine（无屏型号：显式指定Sensor分辨率）
-    pl=PipeLine(rgb888p_size=rgb888p_size,display_size=display_size,display_mode=display_mode)
-    pl.create(Sensor(width=1920, height=1080))
-    ob_det=ObjectDetectionApp(kmodel_path,labels=labels,model_input_size=[320,320],max_boxes_num=max_boxes_num,confidence_threshold=confidence_threshold,nms_threshold=nms_threshold,rgb888p_size=rgb888p_size,display_size=display_size,debug_mode=0)
-    ob_det.config_preprocess()
+    try:
+        pl=PipeLine(rgb888p_size=rgb888p_size,display_size=display_size,display_mode=display_mode)
+        pl.create(Sensor(width=1920, height=1080))
+        ob_det=ObjectDetectionApp(kmodel_path,labels=labels,model_input_size=[320,320],max_boxes_num=max_boxes_num,confidence_threshold=confidence_threshold,nms_threshold=nms_threshold,rgb888p_size=rgb888p_size,display_size=display_size,debug_mode=0)
+        ob_det.config_preprocess()
+    except Exception as e:
+        sys.print_exception(e)
+        print("[K230] 初始化失败：摄像头或模型加载出错，检查SD卡与摄像头接线")
+        raise SystemExit(1)
 
     clock = time.clock()
+
+    frame_no = 0                      # 【诊断】控制台打印计数器（每10帧打印一次发送）
+    last_heartbeat = utime.ticks_ms() # 【诊断】心跳时间戳（每秒打印FPS）
 
     try:
         while True:
@@ -203,11 +217,23 @@ if __name__=="__main__":
                     parts.append(f"{label_name},{conf},{x1},{y1},{w},{h}")
                 send_data = "DETS:" + ";".join(parts) + "\n"
                 uart.write(send_data)
-                print("发送给ESP32：" + send_data)
             else:
                 uart.write("NONE\n")
-                print("发送给ESP32：NONE\n")
             # ==========================================================================
+
+            # 【诊断】控制台只每10帧打印一次发送结果，避免刷屏淹没关键日志
+            # （串口 uart.write 仍是每帧都发，打印只是给调试看）
+            frame_no += 1
+            if frame_no % 10 == 1:
+                if len(res) > 0:
+                    print("发送给ESP32：" + send_data)
+                else:
+                    print("发送给ESP32：NONE")
+            # 【诊断】心跳：每秒打印一次FPS，确认脚本在跑、没被卡死
+            now_ms = utime.ticks_ms()
+            if now_ms - last_heartbeat > 1000:
+                last_heartbeat = now_ms
+                print(f"[K230心跳] 运行中 FPS={clock.fps():.1f}")
 
     except Exception as e:
         sys.print_exception(e)

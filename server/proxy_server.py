@@ -331,7 +331,11 @@ class MQTTAudioSender:
             "type": "stream_start",
             "priority": priority,
             "session_id": session_id,
-            "segments": segments
+            "segments": segments,
+            # 【修复】带上TTS文本，固件据此填充 lastPlayedTtsText，
+            # isTtsEcho 才能过滤喇叭回声（否则麦克风收回的TTS被当成语音命令）
+            # 限40字：足够isTtsEcho做包含匹配，又不超固件StaticJsonDocument<512>池
+            "text": (text or "")[:40]
         }))
         if rc != 0:
             print(f"[TTS] stream_start发布失败 rc={rc}，放弃本次播报")
