@@ -230,7 +230,7 @@ class MQTTAudioSender:
 
             if os.path.exists(filepath):
                 print(f"[TTS] 缓存命中，直接复用: {filename}")
-                self._push_tts_url(filename, text, priority)
+                self._push_tts_audio(filename, text, priority)
                 return
 
             token = get_baidu_token()
@@ -264,7 +264,7 @@ class MQTTAudioSender:
                     f.write(audio_data)
                 print(f"[TTS] 音频已缓存: {filename}")
 
-                self._push_tts_url(filename, text, priority)
+                self._push_tts_audio(filename, text, priority)
             else:
                 print(f"[TTS] Synthesis failed: {resp.text[:200]}")
 
@@ -273,32 +273,86 @@ class MQTTAudioSender:
             import traceback
             traceback.print_exc()
 
-    def _push_tts_url(self, filename, text, priority=0):
-        """生成公网URL并推送给ESP32（含发布失败检测与重试）"""
-        full_url = f"https://blindstick-4.onrender.com/audio/{filename}"
-        url_payload = json.dumps({
-            "type": "tts_url",
-            "url": full_url,
-            "text": text[:30],
-            "priority": priority
-        })
+    def _push_tts_audio(self, filename, text, priority=0):
+        """【修复】把TTS音频经MQTT分片推给ESP32，绕开被热点/运营商挡住的Render 443下载。
 
-        # 检测发布是否成功，失败则重试
-        if self.client and self.connected:
-            result = self.client.publish("blindstick/tts/url", url_payload)
-            # 检查返回的 (rc, mid) 元组，rc=0 表示成功
-            rc = result.rc if hasattr(result, 'rc') else result[0]
-            if rc == 0:
-                print(f"[MQTT] TTS URL pushed: {full_url}")
-            else:
-                print(f"[MQTT] TTS URL发布失败 rc={rc}, 将重试...")
-                time.sleep(1)
-                try:
-                    self.client.publish("blindstick/tts/url", url_payload)
-                except Exception as retry_e:
-                    print(f"[MQTT] TTS URL重试失败: {retry_e}")
-        else:
-            print(f"[MQTT] MQTT未连接，无法推送TTS URL: {full_url}")
+        链路：本函数 → blindstick/tts/control(stream_start/end) + blindstick/tts/stream/N 分片
+        → 固件重装成完整PCM → 独立播放任务播放。
+        每分片须小于固件 mqtt.setBufferSize(8192)，用4000字节留余量。
+        """
+        filepath = os.path.join(AUDIO_CACHE_DIR, filename)
+        if not os.path.exists(filepath):
+            print(f"[TTS] 音频文件不存在: {filepath}")
+            return
+        try:
+            with open(filepath, 'rb') as f:
+                audio = f.read()
+        except Exception as e:
+            print(f"[TTS] 读取音频失败: {e}")
+            return
+
+        # 去掉WAV头（解析到data chunk，不硬编码44字节——部分编码器头更长），固件按裸PCM播放
+        if len(audio) > 12 and audio[:4] == b'RIFF' and audio[8:12] == b'WAVE':
+            offset = 12
+            while offset + 8 <= len(audio):
+                chunk_id = audio[offset:offset + 4]
+                chunk_len = int.from_bytes(audio[offset + 4:offset + 8], 'little')
+                if chunk_id == b'data':
+                    offset += 8
+                    break
+                offset += 8 + chunk_len + (chunk_len & 1)  # 跳过对齐填充字节
+            audio = audio[offset:]
+
+        if len(audio) < 100:
+            print(f"[TTS] 音频过短({len(audio)}字节)，跳过")
+            return
+        if len(audio) > 200 * 1024:
+            print(f"[TTS] 音频过大({len(audio)}字节)，超过固件180KB上限，跳过")
+            return
+
+        if not (self.client and self.connected):
+            print(f"[TTS] MQTT未连接，无法推送音频: {filename}")
+            return
+
+        chunk_size = 4000
+        segments = (len(audio) + chunk_size - 1) // chunk_size
+        session_id = int(time.time() * 1000) % 100000
+
+        def pub(topic, payload):
+            try:
+                result = self.client.publish(topic, payload)
+                return result.rc if hasattr(result, 'rc') else result[0]
+            except Exception as e:
+                print(f"[TTS] 发布异常 {topic}: {e}")
+                return -1
+
+        # 1) 会话开始
+        rc = pub("blindstick/tts/control", json.dumps({
+            "type": "stream_start",
+            "priority": priority,
+            "session_id": session_id,
+            "segments": segments
+        }))
+        if rc != 0:
+            print(f"[TTS] stream_start发布失败 rc={rc}，放弃本次播报")
+            return
+
+        # 2) 逐片推送PCM
+        for i in range(segments):
+            chunk = audio[i * chunk_size:(i + 1) * chunk_size]
+            r = pub(f"blindstick/tts/stream/{i}", chunk)
+            if r != 0:
+                print(f"[TTS] 分片{i}发布失败 rc={r}，中断")
+                return
+            time.sleep(0.02)  # 让固件逐片消化，避免瞬时刷爆
+
+        # 3) 会话结束
+        pub("blindstick/tts/control", json.dumps({
+            "type": "stream_end",
+            "segments": segments,
+            "session_id": session_id
+        }))
+        print(f"[TTS] MQTT音频推送完成: {len(audio)}字节/{segments}片 session={session_id}")
 
     def connect(self):
         if not MQTT_AVAILABLE:

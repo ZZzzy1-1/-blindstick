@@ -36,10 +36,19 @@ volatile unsigned long stream_session_id = 0;   // 当前会话ID
 // 音频格式
 #define AUDIO_FORMAT_PCM_16K  0  // PCM 16kHz 16bit
 #define AUDIO_FORMAT_WAV      1  // WAV格式
-// 缓冲区配置（用于流式接收）
-#define STREAM_BUF_SIZE  8192   // 8KB流式缓冲区
-uint8_t* stream_buffer = NULL;
-volatile int stream_buf_used = 0;
+// 【修复】MQTT音频：Render分片推送(blindstick/tts/stream/N)，
+//        固件重装成完整PCM后入队，由独立任务播放。
+//        绕开被热点/运营商挡住的Render 443下载（URL路径getSize=-1无声）。
+#define TTS_MQTT_CHUNK_MAX  4000          // 每分片字节，须小于 mqtt.setBufferSize(8192)
+#define TTS_MQTT_BUF_MAX    (180 * 1024)  // 整句PCM上限180KB（约5.6秒@16kHz）
+uint8_t* tts_pcm_buf = NULL;              // 分片重装缓冲（PSRAM优先）
+volatile size_t tts_pcm_len = 0;
+volatile bool tts_pcm_assembling = false; // stream_start 后为 true，接收分片
+typedef struct {
+    uint8_t* data;
+    size_t len;
+} TTSPcmMsg;
+QueueHandle_t ttsPcmQueue = NULL;
 // TTS音频缓冲区（使用PSRAM动态分配，不占用主内存）
 #define TTS_AUDIO_BUF_SIZE  (80 * 1024)  // 减小到80KB，足够播放
 uint8_t* tts_rx_buf = NULL;  // 改为指针，动态分配
@@ -127,7 +136,9 @@ float calcDistance(float lat1, float lng1, float lat2, float lng2);
 // 流式TTS相关函数
 void initStreamingTTS();
 void handleStreamControl(const char* payload, int length);
-void handleStreamAudio(const char* topic, byte* payload, unsigned int length);
+void appendStreamChunk(byte* payload, unsigned int length);
+void TTSPcmPlayerTask(void* pvParameters);
+void purgeTTSQueue();
 // ==================== TTS URL 异步播放（独立任务，不阻塞MQTT主循环）====================
 // 【修复】之前handleTTSUrl在mqtt回调中同步下载+播放(约10秒)，阻塞了传感器数据上传，
 //        导致网页数据长时间不更新。改为独立任务异步播放。
@@ -756,8 +767,8 @@ if (WiFi.status() != WL_CONNECTED) return false;
 // 配置MQTT客户端参数
 mqtt.setSocketTimeout(10);
 mqtt.setKeepAlive(60);
-// 【修复】MQTT Buffer从128KB改为2KB（避免内存不足，JSON通常<1KB）
-mqtt.setBufferSize(2048);
+// 【修复】MQTT Buffer=8KB：既要容纳TTS音频分片(每片4KB)，又不会像128KB那样吃光内存
+mqtt.setBufferSize(8192);
 espClient.setInsecure();
 espClient.setHandshakeTimeout(12);
 if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
@@ -797,9 +808,9 @@ if (strcmp(topic, "blindstick/tts/control") == 0) {
 handleStreamControl((const char*)payload, length);
 return;
 }
-// ===== 流式TTS音频数据处理 =====
+// ===== 流式TTS音频分片（Render MQTT推送，重装后由独立任务播放）=====
 if (strncmp(topic, "blindstick/tts/stream/", 22) == 0) {
-handleStreamAudio(topic, payload, length);
+appendStreamChunk(payload, length);
 return;
 }
 // ===== TTS URL处理（新方案：接收URL并入队，由独立任务下载播放）=====
@@ -1002,14 +1013,21 @@ void checkObstacleAndAlert() {
         if (!criticalDanger) {
             return;  // 正在播报且非极端危险，跳过本次（下轮再试），给语音识别留时间
         }
-        // 极端危险：发送打断信号，让避障播报优先
-        StaticJsonDocument<256> doc;
-        doc["type"] = "interrupt";
-        doc["priority"] = PRIO_HIGH;
-        char buf[256];
-        size_t len = serializeJson(doc, buf, sizeof(buf));
-        mqtt.publish("blindstick/tts/control", buf, len);
-        delay(50);
+        // 【修复】自环保护：当前播的已经是避障告警(PRIO_HIGH)时，不打断自己，
+        //         否则会陷入"播报→打断→重新播报"的死循环刷屏。
+        if (is_ai_talking && stream_priority >= PRIO_HIGH) {
+            return;  // 已在播极端告警，等它播完即可
+        }
+        // 极端危险且正在播低优先级内容（如语音回复）：发送打断信号，让避障播报优先
+        if (is_ai_talking) {
+            StaticJsonDocument<256> doc;
+            doc["type"] = "interrupt";
+            doc["priority"] = PRIO_HIGH;
+            char buf[256];
+            size_t len = serializeJson(doc, buf, sizeof(buf));
+            mqtt.publish("blindstick/tts/control", buf, len);
+            delay(50);
+        }
     }
 
     // 构建告警文本
@@ -1968,6 +1986,15 @@ xTaskCreatePinnedToCore(RenderKeepAliveTask, "RenderKA", 16384, NULL, 1, NULL, 1
         Serial.println("[TTS-Player] 队列创建失败");
     }
 
+    // 【新增】MQTT音频播放队列和独立任务（Render分片推送 → 重装 → 本任务播放）
+    ttsPcmQueue = xQueueCreate(4, sizeof(TTSPcmMsg));
+    if (ttsPcmQueue != NULL) {
+        xTaskCreatePinnedToCore(TTSPcmPlayerTask, "TTSPcmPlayer", 16384, NULL, 3, NULL, 0);
+        Serial.println("[TTS-Pcm] MQTT音频播放任务已启动");
+    } else {
+        Serial.println("[TTS-Pcm] 播放队列创建失败");
+    }
+
 }
 void loop() {
 vTaskDelete(NULL);
@@ -2438,17 +2465,25 @@ Serial.println("[TTS-URL] 播放完成");
 setTTSRequesting(false);
 ttsPlayEndTime = millis();  // 【新增】记录播放结束时间，进入静默期
 }
-// ==================== 流式TTS实现（新版简化逻辑）====================
+// ==================== 流式TTS实现（MQTT分片重装 + 独立播放任务）====================
 void initStreamingTTS() {
-size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-if (psram_free > STREAM_BUF_SIZE + 10000) {
-stream_buffer = (uint8_t*)heap_caps_malloc(STREAM_BUF_SIZE, MALLOC_CAP_SPIRAM);
-} else {
-stream_buffer = (uint8_t*)malloc(STREAM_BUF_SIZE);
-}
 stream_playing = false;
 stream_priority = 0;
-stream_buf_used = 0;
+stream_session_id = 0;
+tts_pcm_assembling = false;
+tts_pcm_len = 0;
+// 分片重装缓冲：PSRAM优先，180KB（够容纳约5.6秒语音）
+size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+if (psram_free > TTS_MQTT_BUF_MAX + 10000) {
+tts_pcm_buf = (uint8_t*)heap_caps_malloc(TTS_MQTT_BUF_MAX, MALLOC_CAP_SPIRAM);
+} else {
+tts_pcm_buf = (uint8_t*)malloc(TTS_MQTT_BUF_MAX);
+}
+if (tts_pcm_buf) {
+Serial.printf("[流式TTS] 分片重装缓冲 %d KB 分配成功\n", TTS_MQTT_BUF_MAX / 1024);
+} else {
+Serial.println("[流式TTS] 分片重装缓冲分配失败，TTS将不可用");
+}
 }
 void playPcmData(uint8_t* data, int len) {
 if (!data || len < 2) return;
@@ -2473,8 +2508,30 @@ delay(audio_duration_ms + 100);
 void stopCurrentPlayback() {
 i2s_zero_dma_buffer(I2S_PORT_OUT);
 stream_playing = false;
-stream_buf_used = 0;
 Serial.println("[流式TTS] 停止当前播放");
+}
+// 清空待播队列（释放所有未播放的PCM）
+void purgeTTSQueue() {
+TTSPcmMsg m;
+int dropped = 0;
+while (ttsPcmQueue != NULL && xQueueReceive(ttsPcmQueue, &m, 0) == pdTRUE) {
+if (m.data) free(m.data);
+dropped++;
+}
+if (dropped > 0) Serial.printf("[流式TTS] 已清空%d条待播音频\n", dropped);
+}
+// 接收音频分片：只追加到重装缓冲，绝不播放（MQTT回调零阻塞，雷达保持实时）
+void appendStreamChunk(byte* payload, unsigned int length) {
+if (!tts_pcm_assembling) return;   // 未开始会话或已结束
+if (!tts_pcm_buf) return;
+if (tts_pcm_len + length > TTS_MQTT_BUF_MAX) {
+Serial.printf("[流式TTS] 整句超限(%d字节)，丢弃本句\n", (int)tts_pcm_len);
+tts_pcm_len = 0;
+tts_pcm_assembling = false;
+return;
+}
+memcpy(tts_pcm_buf + tts_pcm_len, payload, length);
+tts_pcm_len += length;
 }
 void handleStreamControl(const char* payload, int length) {
 StaticJsonDocument<256> doc;
@@ -2489,44 +2546,67 @@ unsigned long session_id = doc["session_id"] | 0;
 if (strcmp(type, "stream_start") == 0) {
 Serial.printf("[流式TTS] 开始新会话 priority=%s session=%lu\n",
 getPrioName(new_priority), session_id);
-if (stream_playing) {
-if (new_priority >= stream_priority) {
-Serial.printf("[流式TTS] 打断当前%s播放\n", getPrioName(stream_priority));
-stopCurrentPlayback();
-} else {
+// 新会话一律清空待播队列，避免旧音频串台
+purgeTTSQueue();
+// 正在播放时：同/高优先级打断，低优先级忽略
+if (is_ai_talking) {
+if (new_priority < stream_priority) {
 Serial.printf("[流式TTS] 忽略低优先级%s\n", getPrioName(new_priority));
 return;
 }
+i2s_zero_dma_buffer(I2S_PORT_OUT);
+Serial.printf("[流式TTS] 打断当前%s播放\n", getPrioName(stream_priority));
 }
 stream_playing = true;
 stream_priority = new_priority;
 stream_session_id = session_id;
-stream_buf_used = 0;
-is_ai_talking = true;  // 【修复】标记正在播放语音
-	ai_talking_start_time = millis();  // 【新增】记录开始时间
+tts_pcm_assembling = true;
+tts_pcm_len = 0;
+is_ai_talking = true;  // 抑制避障重复播报
+ai_talking_start_time = millis();
 if (VoiceTaskHandle != NULL) {
 vTaskSuspend(VoiceTaskHandle);
 }
 } else if (strcmp(type, "stream_end") == 0) {
 int segments = doc["segments"] | 0;
-Serial.printf("[流式TTS] 会话结束，共%d段\n", segments);
-if (stream_buf_used > 0 && stream_playing) {
-playPcmData(stream_buffer, stream_buf_used);
+Serial.printf("[流式TTS] 会话结束，共%d段，实收%d字节\n", segments, (int)tts_pcm_len);
+bool enqueued = false;
+if (tts_pcm_assembling && tts_pcm_len > 0) {
+TTSPcmMsg m;
+m.data = (uint8_t*)allocateBuffer(tts_pcm_len);  // PSRAM优先，避免大段PCM吃内部堆
+if (m.data) {
+memcpy(m.data, tts_pcm_buf, tts_pcm_len);
+m.len = tts_pcm_len;
+if (ttsPcmQueue != NULL && xQueueSend(ttsPcmQueue, &m, 0) == pdTRUE) {
+Serial.printf("[流式TTS] 已入队待播 %d 字节\n", (int)tts_pcm_len);
+enqueued = true;
+} else {
+free(m.data);
+Serial.println("[流式TTS] 播放队列已满，丢弃本次播报");
 }
-// 【修复】无论优先级高低都必须恢复语音识别，否则高优先级播放后任务永久挂起
-if (VoiceTaskHandle != NULL) {
+} else {
+Serial.println("[流式TTS] 内存分配失败，丢弃本次播报");
+}
+}
+// 【修复】没有实际入队播放时，当场恢复语音识别，防止永久挂起
+if (!enqueued && VoiceTaskHandle != NULL) {
 eTaskState taskState = eTaskGetState(VoiceTaskHandle);
 if (taskState == eSuspended) {
 vTaskResume(VoiceTaskHandle);
-Serial.println("[流式TTS] 语音识别已恢复");
+Serial.println("[流式TTS] 无音频可播，语音识别已恢复");
 }
 }
+tts_pcm_assembling = false;
+tts_pcm_len = 0;
 stream_playing = false;
-stream_buf_used = 0;
-is_ai_talking = false;  // 【修复】标记语音播放结束
-} else if (strcmp(type, "interrupt") == 0) {
+} else if (strcmp(type, "interrupt") == 0 || strcmp(type, "tts_interrupt") == 0) {
 Serial.printf("[流式TTS] 收到打断信号\n");
-stopCurrentPlayback();
+purgeTTSQueue();
+tts_pcm_assembling = false;
+tts_pcm_len = 0;
+i2s_zero_dma_buffer(I2S_PORT_OUT);
+stream_playing = false;
+is_ai_talking = false;  // 【修复】队列已清空不会播放，立即复位否则避障被抑制15秒
 if (VoiceTaskHandle != NULL) {
 eTaskState taskState = eTaskGetState(VoiceTaskHandle);
 if (taskState == eSuspended) {
@@ -2536,29 +2616,35 @@ Serial.println("[流式TTS] 语音识别已恢复");
 }
 }
 }
-void handleStreamAudio(const char* topic, byte* payload, unsigned int length) {
-if (!stream_playing) return;
-int segment_idx = 0;
-const char* last_slash = strrchr(topic, '/');
-if (last_slash) {
-segment_idx = atoi(last_slash + 1);
+// 独立播放任务：从队列取完整PCM播放，随后恢复语音识别（不阻塞MQTT回调/雷达任务）
+void TTSPcmPlayerTask(void* pvParameters) {
+TTSPcmMsg m;
+while (true) {
+if (xQueueReceive(ttsPcmQueue, &m, portMAX_DELAY) == pdTRUE) {
+if (m.data && m.len > 0) {
+// 播放前确保语音识别挂起，避免被录音打断
+if (VoiceTaskHandle != NULL) {
+eTaskState s = eTaskGetState(VoiceTaskHandle);
+if (s != eSuspended) vTaskSuspend(VoiceTaskHandle);
 }
-// 高优先级立即播放，不缓冲
-if (stream_priority == PRIO_HIGH) {
-Serial.printf("[流式TTS] 立即播放第%d段: %d字节\n", segment_idx, length);
-playPcmData(payload, length);
-return;
+// 跳过44字节WAV头
+int offset = 0;
+if (m.len > 44 && m.data[0] == 'R' && m.data[1] == 'I') offset = 44;
+Serial.printf("[流式TTS] 开始播放 %d 字节\n", (int)(m.len - offset));
+playPcmData(m.data + offset, m.len - offset);
+ttsPlayEndTime = millis();  // 进入静默期，给语音识别留录音窗口
+setTTSRequesting(false);    // 清除避障TTS请求标志
+// 播放完成，恢复语音识别
+if (VoiceTaskHandle != NULL) {
+eTaskState s = eTaskGetState(VoiceTaskHandle);
+if (s == eSuspended) {
+vTaskResume(VoiceTaskHandle);
+Serial.println("[流式TTS] 语音识别已恢复");
 }
-// 普通优先级使用缓冲
-if (stream_buffer && stream_buf_used + length <= STREAM_BUF_SIZE) {
-memcpy(stream_buffer + stream_buf_used, payload, length);
-stream_buf_used += length;
-// 缓冲区半满时播放一半
-if (stream_buf_used >= STREAM_BUF_SIZE / 2) {
-int play_size = stream_buf_used / 2;
-playPcmData(stream_buffer, play_size);
-memmove(stream_buffer, stream_buffer + play_size, stream_buf_used - play_size);
-stream_buf_used -= play_size;
+}
+}
+if (m.data) free(m.data);
+is_ai_talking = false;
 }
 }
 }
