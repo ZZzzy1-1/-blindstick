@@ -53,11 +53,6 @@ typedef struct {
 QueueHandle_t ttsPcmQueue = NULL;
 // TTS音频缓冲区（使用PSRAM动态分配，不占用主内存）
 #define TTS_AUDIO_BUF_SIZE  (80 * 1024)  // 减小到80KB，足够播放
-uint8_t* tts_rx_buf = NULL;  // 改为指针，动态分配
-volatile int     tts_rx_len = 0;
-volatile bool    tts_rx_ready = false;
-volatile unsigned long tts_rx_start = 0;
-#define TTS_RX_TIMEOUT_MS  5000
 // ==================== 百度语音 API 配置（仅用于语音识别）====================
 const String BAIDU_API_KEY        = "Xbxnhkwb2sxtB6HbH5BUTlUG";
 const String BAIDU_SECRET_KEY     = "Tw485P2BFGpPu8WeOVP6hy4S1BHqG4ON";
@@ -300,6 +295,8 @@ volatile unsigned long ai_talking_start_time = 0;  // 【新增】记录开始�
 const unsigned long AI_TALKING_TIMEOUT_MS = 15000;  // 【新增】15秒超时
 volatile unsigned long ttsPlayEndTime = 0;  // 【新增】TTS播放结束时间
 const unsigned long TTS_PLAY_SILENT_MS = 5000;  // 【新增】播放后5秒静默期，给语音识别完整录音窗口
+const unsigned long TTS_TAIL_GUARD_MS = 1500;  // 【新增】TTS播完后喇叭余音保护期，期间麦克风跳过录音
+                                             //        喇叭就在手杖上贴着麦克风，播完的余音+残留DMA音频会被VAD当成说话
 volatile bool  is_tts_requesting = false;  // TTS请求状态标志，防止重复发送
 unsigned long  tts_request_start_time = 0;
 // TTS请求标志互斥锁（防止竞态条件）
@@ -1829,6 +1826,19 @@ String doVoiceRecognition() {
             continue;
         }
 
+        // 【修复】TTS播完后的喇叭余音/残留DMA音频会被当成语音，识别成胡话（如"我宁愿爱我运动"）。
+        //         播放期间VoiceTask被挂起不会录音，但恢复录音的瞬间喇叭还在响/缓冲里还有播放音频，
+        //         余音保护期内跳过录音，给喇叭静下来留时间。
+        if (millis() - ttsPlayEndTime < TTS_TAIL_GUARD_MS) {
+            static unsigned long lastTtsTailVad = 0;
+            if (millis() - lastTtsTailVad > 3000) {
+                lastTtsTailVad = millis();
+                Serial.printf("[语音诊断] TTS余音期跳过录音(剩%lu ms)\n",
+                              TTS_TAIL_GUARD_MS - (millis() - ttsPlayEndTime));
+            }
+            continue;
+        }
+
         if (state == 0) {
             // 静音中：每2秒打印一次能量，便于调试麦克风增益/阈值
             static unsigned long lastE = 0;
@@ -2068,26 +2078,6 @@ psram_free = 8 * 1024 * 1024 - 500000;  // 8MB - 500KB预留
 }
 Serial.printf("PSRAM Free: %d bytes (%d KB)\n", psram_free, psram_free / 1024);
 Serial.printf("ESP.getPsramSize(): %d\n", ESP.getPsramSize());
-// 初始化TTS音频缓冲区（优先使用PSRAM）
-if (psram_ok && psram_free > TTS_AUDIO_BUF_SIZE + 10000) {
-tts_rx_buf = (uint8_t*)heap_caps_malloc(TTS_AUDIO_BUF_SIZE, MALLOC_CAP_SPIRAM);
-Serial.printf("TTS buffer allocated in PSRAM: %d KB\n", TTS_AUDIO_BUF_SIZE / 1024);
-} else {
-tts_rx_buf = (uint8_t*)malloc(TTS_AUDIO_BUF_SIZE);
-Serial.printf("TTS buffer allocated in HEAP: %d KB\n", TTS_AUDIO_BUF_SIZE / 1024);
-}
-// 如果分配失败，尝试更小的缓冲区
-if (tts_rx_buf == NULL) {
-int smaller_size = 40 * 1024;  // 40KB
-psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-if (psram_ok && psram_free > smaller_size + 5000) {
-tts_rx_buf = (uint8_t*)heap_caps_malloc(smaller_size, MALLOC_CAP_SPIRAM);
-Serial.printf("Using smaller TTS buffer in PSRAM: %d KB\n", smaller_size / 1024);
-} else {
-tts_rx_buf = (uint8_t*)malloc(smaller_size);
-Serial.printf("Using smaller TTS buffer in HEAP: %d KB\n", smaller_size / 1024);
-}
-}
 // ===== 从NVS恢复常住地设置（重启/烧录后仍保留用户设置的城市）=====
 homeCityPrefs.begin("home_city", false);
 String savedCity = homeCityPrefs.getString("city", "");
