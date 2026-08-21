@@ -167,7 +167,10 @@ if __name__=="__main__":
     rgb888p_size=[320,320]
 
     # 【诊断】先确认模型文件存在：之前模型缺失会在下面初始化里静默退出，串口一条都不发
-    if not os.path.exists(kmodel_path):
+    # （MicroPython 的 os 没有 .path，用 os.stat + try/except 判断文件存在）
+    try:
+        os.stat(kmodel_path)
+    except OSError:
         print(f"[K230] 错误：找不到模型文件 {kmodel_path}")
         print("[K230] 请把 best.kmodel 放到SD卡 /sdcard/examples/kmodel/ 目录")
         raise SystemExit(1)

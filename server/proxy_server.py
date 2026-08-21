@@ -50,6 +50,36 @@ def get_baidu_token():
         print(f"[Token] Error: {e}")
     return None
 
+def _baidu_asr(base64_speech, length):
+    """调用百度语音识别（HTTP路由与MQTT通道共用）
+    返回: (0, 识别文本) 或 (err_no, 错误描述)
+    """
+    try:
+        token = get_baidu_token()
+        if not token:
+            return (-3, "cannot get baidu token")
+        payload = {
+            "format": "pcm",
+            "rate": 16000,
+            "channel": 1,
+            "cuid": "blindstick_proxy",
+            "token": token,
+            "dev_pid": 1537,
+            "speech": base64_speech,
+            "len": int(length),
+        }
+        resp = requests.post("https://vop.baidu.com/server_api", json=payload, timeout=20, verify=False)
+        rdata = resp.json()
+        print(f"[ASR] Baidu err_no={rdata.get('err_no')} result={rdata.get('result')}")
+        if rdata.get("err_no") == 0 and rdata.get("result"):
+            return (0, rdata["result"][0])
+        return (rdata.get("err_no", -4), rdata.get("err_msg", "asr error"))
+    except Exception as e:
+        print(f"[ASR] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return (-5, str(e))
+
 # ==================== Streaming TTS Manager ====================
 class StreamingTTSManager:
     def __init__(self):
@@ -190,6 +220,9 @@ class MQTTAudioSender:
         self.max_retries = 99999
         # 【修复】客户端ID加随机后缀，避免与其他实例冲突被踢下线
         self.client_id = "proxy_server_tts_" + str(int(time.time() * 1000))[-8:]
+        # 【ASR over MQTT】分片缓冲状态（绕开热点对443的封锁，ASR音频改走MQTT上传）
+        self.asr_upload_buf = bytearray()
+        self.asr_upload_active = False
 
     def on_message(self, client, userdata, msg):
         """处理接收到的MQTT消息 - 使用线程池异步处理避免阻塞"""
@@ -217,8 +250,125 @@ class MQTTAudioSender:
                     )
                     t.start()
 
+            elif topic == "blindstick/asr/upload":
+                # ESP32通过MQTT分片上传的ASR音频
+                self._handle_asr_upload(payload)
+
+            elif topic == "blindstick/places/request":
+                # ESP32地点搜索请求（走MQTT绕开443，异步调百度地图）
+                threading.Thread(target=self._handle_places_request, args=(payload,), daemon=True).start()
+
+            elif topic == "blindstick/directions/request":
+                # ESP32步行路线规划请求
+                threading.Thread(target=self._handle_directions_request, args=(payload,), daemon=True).start()
+
         except Exception as e:
             print(f"[MQTT] Message handling error: {e}")
+
+    def _handle_asr_upload(self, payload):
+        """处理ESP32 MQTT分片上传的ASR音频（绕开热点对443的封锁）
+        协议: {"type":"start","len":<PCM字节数>} → raw base64分片 → {"type":"end"} → 触发百度 → 发布 blindstick/asr/result
+        """
+        try:
+            if payload.startswith("{"):
+                data = json.loads(payload)
+                t = data.get("type")
+                if t == "start":
+                    self.asr_upload_buf = bytearray()
+                    self.asr_upload_active = True
+                    print(f"[ASR-MQTT] 开始接收音频，PCM len={data.get('len')}")
+                elif t == "end":
+                    self.asr_upload_active = False
+                    if len(self.asr_upload_buf) == 0:
+                        print("[ASR-MQTT] 空音频，忽略")
+                        return
+                    try:
+                        base64_data = bytes(self.asr_upload_buf).decode('ascii')
+                        import base64 as _b64
+                        pcm = _b64.b64decode(base64_data)
+                        print(f"[ASR-MQTT] 收齐 base64={len(base64_data)} 解码PCM={len(pcm)} 字节")
+                        err, text = _baidu_asr(base64_data, len(pcm))
+                        if err == 0:
+                            res = json.dumps({"err_no": 0, "text": text})
+                        else:
+                            res = json.dumps({"err_no": err, "msg": str(text)})
+                    except Exception as e:
+                        print(f"[ASR-MQTT] 解码/识别错误: {e}")
+                        res = json.dumps({"err_no": -5, "msg": str(e)})
+                    self.client.publish("blindstick/asr/result", res)
+                    print(f"[ASR-MQTT] 已回传结果: {res[:60]}")
+                    self.asr_upload_buf = bytearray()
+            else:
+                # 原始base64分片（MQTT有序到达，顺序追加）
+                if self.asr_upload_active:
+                    self.asr_upload_buf += payload.encode('ascii')
+        except Exception as e:
+            print(f"[ASR-MQTT] 处理错误: {e}")
+
+    def _handle_places_request(self, payload):
+        """ESP32地点搜索：调百度地图，压缩成固件解析需要的字段后回发
+        响应只保留 status + results[].{name, location.lat/lng}，保证MQTT消息<8192
+        """
+        try:
+            data = json.loads(payload)
+            keyword = data.get("query", "")
+            region = data.get("region", "黄石市")
+            params = {
+                "query": keyword,
+                "region": region,
+                "output": "json",
+                "ak": "e9R2xrzLSwLzjMH5fdqHz4dLB0gXwIZW",
+                "page_size": 5,
+            }
+            resp = requests.get("https://api.map.baidu.com/place/v2/search", params=params, timeout=15, verify=False)
+            data = resp.json()
+            slim = {"status": data.get("status", 2), "results": []}
+            if slim["status"] == 0:
+                slim["results"] = [
+                    {"name": r.get("name", ""),
+                     "location": {"lat": r["location"]["lat"], "lng": r["location"]["lng"]}}
+                    for r in data.get("results", []) if r.get("location")
+                ]
+            print(f"[Places-MQTT] '{keyword}' status={slim['status']} results={len(slim['results'])}")
+            self.client.publish("blindstick/places/result", json.dumps(slim))
+        except Exception as e:
+            print(f"[Places-MQTT] Error: {e}")
+            try:
+                self.client.publish("blindstick/places/result", json.dumps({"status": 2, "results": []}))
+            except Exception:
+                pass
+
+    def _handle_directions_request(self, payload):
+        """ESP32步行路线：调百度地图，压缩成固件解析需要的字段后回发
+        响应只保留 result.routes[0].{distance, duration, steps[].instruction}
+        """
+        try:
+            data = json.loads(payload)
+            origin = data.get("origin", "")
+            destination = data.get("destination", "")
+            params = {
+                "origin": origin,
+                "destination": destination,
+                "ak": "e9R2xrzLSwLzjMH5fdqHz4dLB0gXwIZW",
+            }
+            resp = requests.get("https://api.map.baidu.com/directionlite/v1/walking", params=params, timeout=15, verify=False)
+            data = resp.json()
+            slim = {"status": data.get("status", 2), "result": {"routes": []}}
+            if slim["status"] == 0 and data.get("result") and data["result"].get("routes"):
+                route = data["result"]["routes"][0]
+                slim["result"]["routes"] = [{
+                    "distance": route.get("distance", 0),
+                    "duration": route.get("duration", 0),
+                    "steps": [{"instruction": s.get("instruction", "")} for s in route.get("steps", [])],
+                }]
+            print(f"[Directions-MQTT] status={slim['status']} steps={len(slim['result']['routes'][0]['steps']) if slim['result']['routes'] else 0}")
+            self.client.publish("blindstick/directions/result", json.dumps(slim))
+        except Exception as e:
+            print(f"[Directions-MQTT] Error: {e}")
+            try:
+                self.client.publish("blindstick/directions/result", json.dumps({"status": 2, "result": {"routes": []}}))
+            except Exception:
+                pass
 
     def handle_tts_request(self, text, priority=0):
         """处理TTS请求：调用百度TTS并推送URL到ESP32"""
@@ -407,10 +557,13 @@ class MQTTAudioSender:
                     self.connected = True
                     self.connect_retry_count = 0
                     print(f"[MQTT] Connected to {self.broker}")
-                    # 订阅TTS请求主题
+                    # 订阅TTS请求 + ASR上传 + 地点/路线请求（全部走MQTT绕开443）
                     try:
                         client.subscribe("blindstick/tts/request")
-                        print("[MQTT] Subscribed to blindstick/tts/request")
+                        client.subscribe("blindstick/asr/upload")
+                        client.subscribe("blindstick/places/request")
+                        client.subscribe("blindstick/directions/request")
+                        print("[MQTT] Subscribed: tts/request, asr/upload, places/request, directions/request")
                     except Exception as e:
                         print(f"[MQTT] 订阅失败: {e}")
                 else:
@@ -521,26 +674,10 @@ def asr_proxy():
         if not speech or not length:
             return jsonify({"err_no": -2, "msg": "missing speech/len"}), 400
 
-        token = get_baidu_token()
-        if not token:
-            return jsonify({"err_no": -3, "msg": "cannot get baidu token"}), 500
-
-        payload = {
-            "format": "pcm",
-            "rate": 16000,
-            "channel": 1,
-            "cuid": "blindstick_proxy",
-            "token": token,
-            "dev_pid": 1537,
-            "speech": speech,
-            "len": int(length),
-        }
-        resp = requests.post("https://vop.baidu.com/server_api", json=payload, timeout=15, verify=False)
-        rdata = resp.json()
-        print(f"[ASR] Baidu err_no={rdata.get('err_no')} result={rdata.get('result')}")
-        if rdata.get("err_no") == 0 and rdata.get("result"):
-            return jsonify({"err_no": 0, "text": rdata["result"][0]})
-        return jsonify({"err_no": rdata.get("err_no", -4), "msg": rdata.get("err_msg", "asr error")})
+        err, text = _baidu_asr(speech, length)
+        if err == 0:
+            return jsonify({"err_no": 0, "text": text})
+        return jsonify({"err_no": err, "msg": str(text)}), (500 if err == -3 or err == -5 else 200)
     except Exception as e:
         print(f"[ASR] Error: {e}")
         import traceback
