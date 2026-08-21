@@ -397,12 +397,23 @@ class MQTTAudioSender:
                 "lan": "zh",
                 "spd": 5,
                 "pit": 5,
-                "vol": 9,
+                "vol": 12,
                 "per": 1,
                 "aue": 6
             }
 
-            resp = requests.post(url, data=payload, timeout=8, verify=False)  # 减少超时时间以提高响应速度
+            # 【修复】超时从8s加到15s并失败重试一次：ESP32还在等这个结果，
+            # 宁可慢一点也不要一次超时就让整条语音链路断掉
+            resp = None
+            for _attempt in range(2):
+                try:
+                    resp = requests.post(url, data=payload, timeout=15, verify=False)
+                    break
+                except Exception:
+                    print(f"[TTS] 合成请求第{_attempt+1}次失败，重试..." if _attempt == 0 else "[TTS] 合成请求重试仍失败")
+            if resp is None:
+                print("[TTS] 合成请求失败（两次均异常）")
+                return
 
             if 'audio' in resp.headers.get('Content-Type', ''):
                 audio_data = resp.content

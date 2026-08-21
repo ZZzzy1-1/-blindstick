@@ -32,7 +32,18 @@ K230_UART_TX_PIN = 5      # GPIO5 -> ESP32 RX
 K230_UART_RX_PIN = 6      # GPIO6 -> ESP32 TX（可选）
 uart = UART(K230_UART_ID, K230_UART_BAUD, tx=K230_UART_TX_PIN, rx=K230_UART_RX_PIN)
 print(f"[串口] UART{K230_UART_ID} 初始化 TX=GPIO{K230_UART_TX_PIN} RX=GPIO{K230_UART_RX_PIN} 波特={K230_UART_BAUD}")
+# 【诊断】UART初始化成功立即发一行固定标记，ESP32端"未知帧"日志会打印它，
+# 用来区分三种情况：看到标记=接线+UART都通、后续问题在模型/摄像头；看不到=main.py没跑或引脚不对
+uart.write("[K230-BOOT] main.py started\n")
 # ==========================================================================
+
+# 【电机噪声防护】8位累加校验和：每帧末尾追加 #XX（如 DETS:...;#A1）。
+# ESP32端收到后校验，电机转动时打乱的帧会被丢弃而不是解析成错误障碍物位置。
+def frame_crc(s):
+    c = 0
+    for b in s.encode('utf-8'):
+        c = (c + b) & 0xFF
+    return f"{c:02X}"
 
 # 自定义YOLOv8检测类
 class ObjectDetectionApp(AIBase):
@@ -218,10 +229,11 @@ if __name__=="__main__":
                     x2 = max(0, min(x2, 319)); y2 = max(0, min(y2, 319))
                     w = max(1, x2 - x1); h = max(1, y2 - y1)
                     parts.append(f"{label_name},{conf},{x1},{y1},{w},{h}")
-                send_data = "DETS:" + ";".join(parts) + "\n"
+                send_data = "DETS:" + ";".join(parts)
+                send_data += "#" + frame_crc(send_data) + "\n"
                 uart.write(send_data)
             else:
-                uart.write("NONE\n")
+                uart.write("NONE#" + frame_crc("NONE") + "\n")
             # ==========================================================================
 
             # 【诊断】控制台只每10帧打印一次发送结果，避免刷屏淹没关键日志
