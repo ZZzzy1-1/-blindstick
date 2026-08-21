@@ -9,6 +9,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_heap_caps.h>
+#include <Preferences.h>  // 【修复】NVS持久化：常住地设置重启/烧录后仍保留
 // ==================== 网络参数 ====================
 const char* WIFI_SSID     = "ZYT";
 const char* WIFI_PASSWORD = "zyt123456";
@@ -349,7 +350,9 @@ bool  gps_baud_locked = false;   // 是否已锁定正确的波特率
 bool  gps_got_nmea = false;      // 是否收到过有效NMEA（$开头）
 unsigned long gps_baud_try_start = 0;  // 当前波特率尝试开始时间
 // 常住地设置（默认黄石市，可通过MQTT更新）
+// 【修复】默认值从NVS读取（启动时覆盖），收到MQTT设置时写入NVS，重启/烧录后仍保留
 String home_city = "黄石市";
+Preferences homeCityPrefs;
 // 开机语音播报标志（只播报一次）- 使用RTC内存保持，深度睡眠后也能记住
 RTC_DATA_ATTR static bool startup_announced_rtc = false;
 volatile bool startup_announced = false;  // 运行时标志，用于防止同一运行周期内重复
@@ -852,12 +855,12 @@ last_retry = now;
 // 确保WiFi连接状态正常
 if (WiFi.status() != WL_CONNECTED) return false;
 // 配置MQTT客户端参数
-mqtt.setSocketTimeout(10);
+mqtt.setSocketTimeout(5);   // 【修复】10→5秒：RadarTask跑在CPU0，socket读超时太长会饿死IDLE0触发task_wdt
 mqtt.setKeepAlive(60);
 // 【修复】MQTT Buffer=8KB：既要容纳TTS音频分片(每片4KB)，又不会像128KB那样吃光内存
 mqtt.setBufferSize(8192);
 espClient.setInsecure();
-espClient.setHandshakeTimeout(12);
+espClient.setHandshakeTimeout(3);  // 【修复】12→3秒：TLS握手是CPU0忙循环，必须<task_wdt的5秒，否则握手时IDLE0饿死、系统Abort
 if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
 Serial.println("[MQTT] 连接成功");
 mqtt.subscribe(MQTT_TOPIC_TTS_AUDIO);
@@ -971,6 +974,8 @@ DeserializationError err = deserializeJson(doc, payload, length);
 if (!err && doc.containsKey("city")) {
 const char* new_city = doc["city"];
 home_city = String(new_city);
+// 【修复】写入NVS持久化，重启/烧录后仍保留
+homeCityPrefs.putString("city", home_city);
 // 播报确认
 StaticJsonDocument<256> ttsDoc;
 char confirmText[64];
@@ -1026,7 +1031,8 @@ vTaskResume(VoiceTaskHandle);
 }
 }
 } else if (strcmp(topic, MQTT_TOPIC_NAV_STEPS) == 0) {
-StaticJsonDocument<4096> doc;
+// 【修复】4096→static：mqtt_callback 在 RadarTask 栈上执行（经 mqttLoop），4KB文档是栈溢出元凶之一
+static StaticJsonDocument<4096> doc;
 DeserializationError err = deserializeJson(doc, payload, length);
 if (!err && doc["status"] == "ok") {
 JsonArray steps = doc["steps"];
@@ -1322,7 +1328,8 @@ if (!mqtt.connected()) return;
 // 更新里程统计
 updateMileage();
 // 使用更大的JSON缓冲区容纳视觉检测数据
-StaticJsonDocument<2048> doc;  // 【修复】1024→2048：K230多目标时k230_dets数组会占满1024池，ArduinoJson静默丢框
+// 【修复】2048→static：publishSensorData 在 RadarTask 栈上，2KB文档腾出栈空间防溢出（仅RadarTask调用，static安全）
+static StaticJsonDocument<2048> doc;  // 【修复】1024→2048：K230多目标时k230_dets数组会占满1024池，ArduinoJson静默丢框
 doc["device_id"] = "blind_stick_001";
 JsonObject radar = doc.createNestedObject("radar");
 // 三向雷达: [0]=前方, [1]=左方, [2]=右方
@@ -1478,7 +1485,7 @@ Serial.printf("[GPS] 波特率已锁定: %d (累计收到%d字节)\n", gps_baud_
 // 每3秒打印一次状态
 if (now2 - lastStatusPrint > 3000) {
 lastStatusPrint = now2;
-Serial.printf("[状态] WiFi:%s MQTT:%s 雷达字节:%d 雷达F:%.0f GPS可用:%d GPS字节:%lu 卫星:%d 波特率:%d\n",
+Serial.printf("[状态] WiFi:%s MQTT:%s 雷达字节:%d 雷达F:%.0f GPS可用:%d GPS字节:%lu 卫星:%d 波特率:%d 栈余:%u\n",
 WiFi.status() == WL_CONNECTED ? "连接" : "断开",
 mqtt.connected() ? "连接" : "断开",
 radarByteCount,
@@ -1486,7 +1493,8 @@ dir_smt[0],
 gpsSerial.available(),
 gps_byte_count,
 gps_satellites,
-gps_baud_table[gps_baud_index]);
+gps_baud_table[gps_baud_index],
+uxTaskGetStackHighWaterMark(NULL));  // 【诊断】RadarTask栈余量(字节)，确认32768够不够
 radarByteCount = 0;  // 重置计数
 }
 if (WiFi.status() == WL_CONNECTED) {
@@ -2090,6 +2098,13 @@ tts_rx_buf = (uint8_t*)malloc(smaller_size);
 Serial.printf("Using smaller TTS buffer in HEAP: %d KB\n", smaller_size / 1024);
 }
 }
+// ===== 从NVS恢复常住地设置（重启/烧录后仍保留用户设置的城市）=====
+homeCityPrefs.begin("home_city", false);
+String savedCity = homeCityPrefs.getString("city", "");
+if (savedCity.length() > 0) {
+home_city = savedCity;
+Serial.printf("[常住地] 从NVS恢复: %s\n", home_city.c_str());
+}
 // ===== 从RTC内存恢复今日出行统计数据 =====
 total_mileage = rtc_total_mileage;
 nav_count = rtc_nav_count;
@@ -2139,11 +2154,11 @@ mqtt.setCallback(mqtt_callback);
 // 连接MQTT（非阻塞重试）
 mqttReconnect();
 }
-xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 16384, NULL, 3, &RadarTaskHandle, 0);  // 【修复】8192→16384：K230解析+MQTT发布深栈，防栈溢出
+xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 32768, NULL, 3, &RadarTaskHandle, 0);  // 【修复】8192→16384→32768：实测16384仍栈溢出(Stack canary watchpoint)，MQTT握手+mqtt_callback导航doc需要更大栈
 // 【安全】看门狗：RadarTask 卡死时强制停机，防轮子失控
 xTaskCreatePinnedToCore(SafetyWatchdogTask, "Watchdog", 2048, NULL, 1, NULL, 1);
 xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
-xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 16384, NULL, 2, &VoiceTaskHandle, 1);  // 【修复】增大栈空间防止ASR请求时栈溢出
+xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 24576, NULL, 2, &VoiceTaskHandle, 1);  // 【修复】16384→24576：doVoiceRecognition含4KB+2KB StaticJsonDocument深栈，防同类溢出
 xTaskCreatePinnedToCore(RenderKeepAliveTask, "RenderKA", 16384, NULL, 1, NULL, 1);  // 每45秒ping /health防休眠
     // 【修复】创建TTS URL异步播放队列和任务（独立播放，不阻塞MQTT主循环和传感器上传）
     ttsUrlQueue = xQueueCreate(4, sizeof(TTSUrlMsg));
