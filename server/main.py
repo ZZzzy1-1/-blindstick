@@ -32,18 +32,7 @@ K230_UART_TX_PIN = 5      # GPIO5 -> ESP32 RX
 K230_UART_RX_PIN = 6      # GPIO6 -> ESP32 TX（可选）
 uart = UART(K230_UART_ID, K230_UART_BAUD, tx=K230_UART_TX_PIN, rx=K230_UART_RX_PIN)
 print(f"[串口] UART{K230_UART_ID} 初始化 TX=GPIO{K230_UART_TX_PIN} RX=GPIO{K230_UART_RX_PIN} 波特={K230_UART_BAUD}")
-# 【诊断】UART初始化成功立即发一行固定标记，ESP32端"未知帧"日志会打印它，
-# 用来区分三种情况：看到标记=接线+UART都通、后续问题在模型/摄像头；看不到=main.py没跑或引脚不对
-uart.write("[K230-BOOT] main.py started\n")
 # ==========================================================================
-
-# 【电机噪声防护】8位累加校验和：每帧末尾追加 #XX（如 DETS:...;#A1）。
-# ESP32端收到后校验，电机转动时打乱的帧会被丢弃而不是解析成错误障碍物位置。
-def frame_crc(s):
-    c = 0
-    for b in s.encode('utf-8'):
-        c = (c + b) & 0xFF
-    return f"{c:02X}"
 
 # 自定义YOLOv8检测类
 class ObjectDetectionApp(AIBase):
@@ -177,30 +166,13 @@ if __name__=="__main__":
     max_boxes_num = 50
     rgb888p_size=[320,320]
 
-    # 【诊断】先确认模型文件存在：之前模型缺失会在下面初始化里静默退出，串口一条都不发
-    # （MicroPython 的 os 没有 .path，用 os.stat + try/except 判断文件存在）
-    try:
-        os.stat(kmodel_path)
-    except OSError:
-        print(f"[K230] 错误：找不到模型文件 {kmodel_path}")
-        print("[K230] 请把 best.kmodel 放到SD卡 /sdcard/examples/kmodel/ 目录")
-        raise SystemExit(1)
-
     # 初始化PipeLine（无屏型号：显式指定Sensor分辨率）
-    try:
-        pl=PipeLine(rgb888p_size=rgb888p_size,display_size=display_size,display_mode=display_mode)
-        pl.create(Sensor(width=1920, height=1080))
-        ob_det=ObjectDetectionApp(kmodel_path,labels=labels,model_input_size=[320,320],max_boxes_num=max_boxes_num,confidence_threshold=confidence_threshold,nms_threshold=nms_threshold,rgb888p_size=rgb888p_size,display_size=display_size,debug_mode=0)
-        ob_det.config_preprocess()
-    except Exception as e:
-        sys.print_exception(e)
-        print("[K230] 初始化失败：摄像头或模型加载出错，检查SD卡与摄像头接线")
-        raise SystemExit(1)
+    pl=PipeLine(rgb888p_size=rgb888p_size,display_size=display_size,display_mode=display_mode)
+    pl.create(Sensor(width=1920, height=1080))
+    ob_det=ObjectDetectionApp(kmodel_path,labels=labels,model_input_size=[320,320],max_boxes_num=max_boxes_num,confidence_threshold=confidence_threshold,nms_threshold=nms_threshold,rgb888p_size=rgb888p_size,display_size=display_size,debug_mode=0)
+    ob_det.config_preprocess()
 
     clock = time.clock()
-
-    frame_no = 0                      # 【诊断】控制台打印计数器（每10帧打印一次发送）
-    last_heartbeat = utime.ticks_ms() # 【诊断】心跳时间戳（每秒打印FPS）
 
     try:
         while True:
@@ -229,26 +201,13 @@ if __name__=="__main__":
                     x2 = max(0, min(x2, 319)); y2 = max(0, min(y2, 319))
                     w = max(1, x2 - x1); h = max(1, y2 - y1)
                     parts.append(f"{label_name},{conf},{x1},{y1},{w},{h}")
-                send_data = "DETS:" + ";".join(parts)
-                send_data += "#" + frame_crc(send_data) + "\n"
+                send_data = "DETS:" + ";".join(parts) + "\n"
                 uart.write(send_data)
+                print("发送给ESP32：" + send_data)
             else:
-                uart.write("NONE#" + frame_crc("NONE") + "\n")
+                uart.write("NONE\n")
+                print("发送给ESP32：NONE\n")
             # ==========================================================================
-
-            # 【诊断】控制台只每10帧打印一次发送结果，避免刷屏淹没关键日志
-            # （串口 uart.write 仍是每帧都发，打印只是给调试看）
-            frame_no += 1
-            if frame_no % 10 == 1:
-                if len(res) > 0:
-                    print("发送给ESP32：" + send_data)
-                else:
-                    print("发送给ESP32：NONE")
-            # 【诊断】心跳：每秒打印一次FPS，确认脚本在跑、没被卡死
-            now_ms = utime.ticks_ms()
-            if now_ms - last_heartbeat > 1000:
-                last_heartbeat = now_ms
-                print(f"[K230心跳] 运行中 FPS={clock.fps():.1f}")
 
     except Exception as e:
         sys.print_exception(e)

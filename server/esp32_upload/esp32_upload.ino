@@ -9,8 +9,6 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_heap_caps.h>
-#include <esp_system.h>  // 【诊断】esp_reset_reason：区分重启原因是掉电/panic/看门狗
-#include <Preferences.h>  // 【修复】NVS持久化：常住地设置重启/烧录后仍保留
 // ==================== 网络参数 ====================
 const char* WIFI_SSID     = "ZYT";
 const char* WIFI_PASSWORD = "zyt123456";
@@ -42,7 +40,7 @@ volatile unsigned long stream_session_id = 0;   // 当前会话ID
 //        固件重装成完整PCM后入队，由独立任务播放。
 //        绕开被热点/运营商挡住的Render 443下载（URL路径getSize=-1无声）。
 #define TTS_MQTT_CHUNK_MAX  4000          // 每分片字节，须小于 mqtt.setBufferSize(8192)
-#define TTS_MQTT_BUF_MAX    (210 * 1024)  // 整句PCM上限210KB（约6.5秒@16kHz；高于代理200KB放行上限，防整句超限丢弃）
+#define TTS_MQTT_BUF_MAX    (180 * 1024)  // 整句PCM上限180KB（约5.6秒@16kHz）
 uint8_t* tts_pcm_buf = NULL;              // 分片重装缓冲（PSRAM优先）
 volatile size_t tts_pcm_len = 0;
 volatile bool tts_pcm_assembling = false; // stream_start 后为 true，接收分片
@@ -53,6 +51,11 @@ typedef struct {
 QueueHandle_t ttsPcmQueue = NULL;
 // TTS音频缓冲区（使用PSRAM动态分配，不占用主内存）
 #define TTS_AUDIO_BUF_SIZE  (80 * 1024)  // 减小到80KB，足够播放
+uint8_t* tts_rx_buf = NULL;  // 改为指针，动态分配
+volatile int     tts_rx_len = 0;
+volatile bool    tts_rx_ready = false;
+volatile unsigned long tts_rx_start = 0;
+#define TTS_RX_TIMEOUT_MS  5000
 // ==================== 百度语音 API 配置（仅用于语音识别）====================
 const String BAIDU_API_KEY        = "Xbxnhkwb2sxtB6HbH5BUTlUG";
 const String BAIDU_SECRET_KEY     = "Tw485P2BFGpPu8WeOVP6hy4S1BHqG4ON";
@@ -62,14 +65,13 @@ const String BAIDU_SECRET_KEY     = "Tw485P2BFGpPu8WeOVP6hy4S1BHqG4ON";
 const char* NAV_TRIGGERS[] = {"带我去", "我要去", "我想去", "导航到", "我去", "去", "到"};
 const int NAV_TRIGGER_COUNT = 7;
 // 需要过滤的非目的地词汇
-// 【修复】删掉单字过滤项(在/是/我/有/和/就/不/人/都/一/请/把/给/跟/对/向/从/让/被/比)：
-// 它们常是地名的一部分，replace()会拆坏真实地名：人民医院→民医院、成都→成、人民广场→民广场。
-// 触发词提取(带我去/我要去/...)已吃掉"请带我去"这类前缀，这里只需清"附近/那个"等尾巴。
 const char* FILTER_WORDS[] = {
-"的", "了", "一个", "一下", "那个", "这个", "那里", "这里", "吧", "啊", "呢", "吗", "哦", "嗯",
+"的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个",
+"一下", "那个", "这个", "那里", "这里", "吧", "啊", "呢", "吗", "哦", "嗯",
+"请", "把", "给", "跟", "对", "向", "从", "让", "被", "比",
 "附近", "周围", "旁边", "对面"
 };
-const int FILTER_WORD_COUNT = 18;
+const int FILTER_WORD_COUNT = 34;
 // ==================== 雷达与电机引脚 ====================
 #define RADAR_RX_PIN    18    // YDLIDAR X2 TX → ESP32 GPIO18 (UART RX)
 #define RADAR_M_CTR_PIN 8     // YDLIDAR X2 电机控制 → ESP32 GPIO8（启动雷达电机）
@@ -112,74 +114,7 @@ HardwareSerial k230Serial(2);      // K230硬件串口使用UART2
 #define I2S_WS_OUT_PIN  5  // SPK_LRCK
 #define I2S_DATA_PIN    6  // SPK_OUT
 #define I2S_PORT_OUT    I2S_NUM_1
-#define VOLUME_GAIN     1.0  // 音量增益 (0.0-1.0)，增大音量（播报更响，1.0=满增益，有削波保护）
-// ==================== MQTT 并发保护（防挂死根因修复） ====================
-// 【修复】RadarTask(mqtt.loop+发布)、NavTask(发布)、VoiceTask(ASR分片发布) 三个任务在双核上
-// 并发操作同一个 PubSubClient/mbedTLS TLS 会话，会踩坏内部状态，最终 mqtt.loop() 永久卡死。
-// 现象：轮子停在最后方向一直转、K230 数据不再处理、串口不再更新，只能断电重启。
-// 解法：用【递归】互斥锁把所有 mqtt.* 访问串行化。为什么递归：mqtt_callback 在 mqtt.loop()
-// 内部执行，回调里再 publish 属于重入，普通互斥锁会自己锁死自己。
-bool mqtt_reconnect_nonblocking();  // 前向声明
-SemaphoreHandle_t mqttMutex = NULL;
-// 【修复】发布锁超时分级：
-//  - 普通发布 500ms：VoiceTask ASR分片/NavTask 播报等非避障关键路径，短握手中断可接受
-//  - RadarTask 内 K230 播报走 mqttPublishShort：50ms，绝不让避障循环等网络锁
-// 统一原则：任何发布都不永久等锁——MQTTTask 握手可能持锁≤3秒，永久等待会让
-// 调用方任务被网络锁卡住（此前 RadarTask 因此避障停顿/心跳停滞→看门狗误触发）。
-#define MQTT_PUB_LOCK_TIMEOUT_MS  500
-bool mqttPublish(const char* topic, const char* payload) {
-    if (mqttMutex == NULL) return false;
-    if (xSemaphoreTakeRecursive(mqttMutex, MQTT_PUB_LOCK_TIMEOUT_MS / portTICK_PERIOD_MS) != pdTRUE) return false;
-    bool ok = mqtt.publish(topic, payload);
-    xSemaphoreGiveRecursive(mqttMutex);
-    return ok;
-}
-bool mqttPublish(const char* topic, const char* payload, size_t len) {
-    if (mqttMutex == NULL) return false;
-    if (xSemaphoreTakeRecursive(mqttMutex, MQTT_PUB_LOCK_TIMEOUT_MS / portTICK_PERIOD_MS) != pdTRUE) return false;
-    // 显式转 uint8_t*：PubSubClient 3参重载是 (topic,uint8_t*,plength)，
-    // 若传 const char* 会误绑到 (topic,const char*,bool retained)，把长度当 retained 标志
-    bool ok = mqtt.publish(topic, (const uint8_t*)payload, len);
-    xSemaphoreGiveRecursive(mqttMutex);
-    return ok;
-}
-bool mqttPublish(const char* topic, const uint8_t* payload, size_t len) {
-    if (mqttMutex == NULL) return false;
-    if (xSemaphoreTakeRecursive(mqttMutex, MQTT_PUB_LOCK_TIMEOUT_MS / portTICK_PERIOD_MS) != pdTRUE) return false;
-    bool ok = mqtt.publish(topic, payload, len);
-    xSemaphoreGiveRecursive(mqttMutex);
-    return ok;
-}
-bool mqttPublish(const char* topic, const uint8_t* payload, size_t len, bool retained) {
-    if (mqttMutex == NULL) return false;
-    if (xSemaphoreTakeRecursive(mqttMutex, MQTT_PUB_LOCK_TIMEOUT_MS / portTICK_PERIOD_MS) != pdTRUE) return false;
-    bool ok = mqtt.publish(topic, payload, len, retained);
-    xSemaphoreGiveRecursive(mqttMutex);
-    return ok;
-}
-// 【避障安全】RadarTask 内专用短超时发布：K230播报/传感器不因网络锁卡避障
-bool mqttPublishShort(const char* topic, const char* payload, size_t len) {
-    if (mqttMutex == NULL) return false;
-    if (xSemaphoreTakeRecursive(mqttMutex, 50 / portTICK_PERIOD_MS) != pdTRUE) return false;
-    bool ok = mqtt.publish(topic, (const uint8_t*)payload, len);
-    xSemaphoreGiveRecursive(mqttMutex);
-    return ok;
-}
-void mqttLoop() {
-    if (mqttMutex == NULL) return;
-    xSemaphoreTakeRecursive(mqttMutex, portMAX_DELAY);
-    mqtt.loop();
-    xSemaphoreGiveRecursive(mqttMutex);
-}
-void mqttReconnect() {
-    if (mqttMutex == NULL) return;
-    xSemaphoreTakeRecursive(mqttMutex, portMAX_DELAY);
-    mqtt_reconnect_nonblocking();
-    xSemaphoreGiveRecursive(mqttMutex);
-}
-// =====================================================================
-// 【安全】RadarTask 每轮循环喂一次心跳；SafetyWatchdogTask 据此检测避障主任务是否卡死
-volatile unsigned long radarHeartbeat = 0;
+#define VOLUME_GAIN     0.85  // 音量增益 (0.0-1.0)，增大音量
 // 播放开机语音（云端TTS）
 void playStartupVoice() {
 Serial.println("[开机语音] 请求云端TTS播报...");
@@ -189,7 +124,7 @@ char buf[256];
 ttsDoc["text"] = "系统启动成功，欢迎使用智能导盲杖";
 ttsDoc["priority"] = PRIO_NORMAL;
 size_t len = serializeJson(ttsDoc, buf, sizeof(buf));
-mqttPublish(MQTT_TOPIC_TTS_REQ, buf, len);
+mqtt.publish(MQTT_TOPIC_TTS_REQ, buf, len);
 Serial.println("[开机TTS] 系统启动成功，欢迎使用智能导盲杖");
 }
 }
@@ -204,14 +139,27 @@ void handleStreamControl(const char* payload, int length);
 void appendStreamChunk(byte* payload, unsigned int length);
 void TTSPcmPlayerTask(void* pvParameters);
 void purgeTTSQueue();
-// ==================== 流式TTS（MQTT分片 → PCM重装 → 独立任务播放）====================
+// ==================== TTS URL 异步播放（独立任务，不阻塞MQTT主循环）====================
+// 【修复】之前handleTTSUrl在mqtt回调中同步下载+播放(约10秒)，阻塞了传感器数据上传，
+//        导致网页数据长时间不更新。改为独立任务异步播放。
+#define TTS_URL_MSG_URL_LEN  220
+#define TTS_URL_MSG_TEXT_LEN 60
+struct TTSUrlMsg {
+    char url[TTS_URL_MSG_URL_LEN];
+    char text[TTS_URL_MSG_TEXT_LEN];
+    int priority;
+};
+QueueHandle_t ttsUrlQueue = NULL;
+void TTSUrlPlayerTask(void* pvParameters);
+void handleTTSUrlDownload(const TTSUrlMsg* msg);
+void probeRenderConnectivity();
+
 void playPcmData(uint8_t* data, int len);
 void stopCurrentPlayback();
 const char* getPrioName(int p);
 // 流式语音识别相关
 void VoiceRecognitionTask(void* pvParameters);
 String doVoiceRecognition();
-String getBaiduToken();  // 百度access_token获取（带缓存）
 void handleVoiceCommand(const char* text);
 String base64Encode(const uint8_t* data, size_t len);  // Base64编码
 size_t base64ToBuffer(const uint8_t* data, size_t len, char* out);  // Base64写缓冲区（省内部堆）
@@ -296,8 +244,6 @@ volatile unsigned long ai_talking_start_time = 0;  // 【新增】记录开始�
 const unsigned long AI_TALKING_TIMEOUT_MS = 15000;  // 【新增】15秒超时
 volatile unsigned long ttsPlayEndTime = 0;  // 【新增】TTS播放结束时间
 const unsigned long TTS_PLAY_SILENT_MS = 5000;  // 【新增】播放后5秒静默期，给语音识别完整录音窗口
-const unsigned long TTS_TAIL_GUARD_MS = 1500;  // 【新增】TTS播完后喇叭余音保护期，期间麦克风跳过录音
-                                             //        喇叭就在手杖上贴着麦克风，播完的余音+残留DMA音频会被VAD当成说话
 volatile bool  is_tts_requesting = false;  // TTS请求状态标志，防止重复发送
 unsigned long  tts_request_start_time = 0;
 // TTS请求标志互斥锁（防止竞态条件）
@@ -349,9 +295,7 @@ bool  gps_baud_locked = false;   // 是否已锁定正确的波特率
 bool  gps_got_nmea = false;      // 是否收到过有效NMEA（$开头）
 unsigned long gps_baud_try_start = 0;  // 当前波特率尝试开始时间
 // 常住地设置（默认黄石市，可通过MQTT更新）
-// 【修复】默认值从NVS读取（启动时覆盖），收到MQTT设置时写入NVS，重启/烧录后仍保留
 String home_city = "黄石市";
-Preferences homeCityPrefs;
 // 开机语音播报标志（只播报一次）- 使用RTC内存保持，深度睡眠后也能记住
 RTC_DATA_ATTR static bool startup_announced_rtc = false;
 volatile bool startup_announced = false;  // 运行时标志，用于防止同一运行周期内重复
@@ -429,25 +373,21 @@ volatile float dir_smt[NUM_DIR] = {400.0f, 400.0f, 400.0f};
 float frontDist = 400.0;  // 【修复】初始值改为最大值
 float leftDist  = 400.0;
 float rightDist = 400.0;
-// 【修复】电机当前功率（避障/雷达任务写入，VAD录音读取：电机运行噪声巨大，跳过触发）
-volatile int motorPowerNow = 0;
 // ==================== 电机控制 ====================
 // ==================== 电机控制（正数右转，负数左转）====================
 void motorControl(int steerPower) {
     int safePower = constrain(steerPower, -STEER_MAX_PWM, STEER_MAX_PWM);
-    // 【修复】电机方向反了：实物转向与代码意图相反，把 IN1/IN2 电平对调。
-    // 若对调后仍反（比如还伴随别的症状），说明不是极性问题，改回并把现象说清楚。
     if (safePower > 15) {
         // 👉 产生向右的动力
-        digitalWrite(MOTOR_IN1, HIGH);
-        digitalWrite(MOTOR_IN2, LOW);
+        digitalWrite(MOTOR_IN1, LOW);
+        digitalWrite(MOTOR_IN2, HIGH);
         analogWrite(MOTOR_PWM, safePower);
         last_motor_dir = "right";
     }
     else if (safePower < -15) {
         // 👈 产生向左的动力
-        digitalWrite(MOTOR_IN1, LOW);
-        digitalWrite(MOTOR_IN2, HIGH);
+        digitalWrite(MOTOR_IN1, HIGH);
+        digitalWrite(MOTOR_IN2, LOW);
         analogWrite(MOTOR_PWM, abs(safePower));
         last_motor_dir = "left";
     }
@@ -468,8 +408,6 @@ void motorControl(int steerPower) {
                           last_motor_dir.c_str(), abs(safePower), frontDist, leftDist, rightDist);
         }
     }
-    // 【修复】记录当前电机功率，VAD录音据此跳过（电机噪声能量1000+远超语音，不能识别）
-    motorPowerNow = safePower;
 }
 // ==================== 避障决策（修复版 - 智能左右权重避障算法）====================
 void smartAvoid() {
@@ -486,25 +424,13 @@ void smartAvoid() {
     bool leftTight = (L < 40.0f);
     bool rightTight = (R < 40.0f);
 
-    // 【修复】被包围日志只在进入/脱离状态变化时打印一次，避免每雷达周期刷屏淹没K230/TTS/ASR诊断日志
-    static bool wasSurrounded = false;
-    bool surrounded = (f < FRONT_CRITICAL) && leftTight && rightTight;
-    if (surrounded != wasSurrounded) {
-        wasSurrounded = surrounded;
-        Serial.printf(surrounded ? "[避障] 进入被包围(F:%.0f L:%.0f R:%.0f)，停止\n"
-                                 : "[避障] 脱离包围(F:%.0f L:%.0f R:%.0f)\n", f, L, R);
-    }
-
-    // 【修复】"前方XXcm，左转/右转"只在转向方向变化时打印一次（此前每雷达周期刷屏，识别/导航日志全被冲走）
-    static int lastAvoidPrintDir = 0;   // -1=打印过左转 1=打印过右转 0=未打印/已停止
-
     // ===== 前方有障碍物 =====
     if (f < FRONT_CRITICAL) {
         // 两侧都非常堵(<40cm)才停止
         if (leftTight && rightTight) {
             motorControl(0);
             lastSteerDir = 0;
-            lastAvoidPrintDir = 0;
+            Serial.printf("[避障] 被包围(F:%.0f L:%.0f R:%.0f)，停止\n", f, L, R);
             return;
         }
         // 决定转向方向（带迟滞）
@@ -522,16 +448,10 @@ void smartAvoid() {
         int power = (f < 50.0f) ? STEER_MAX_PWM : STEER_SLOW_PWM;
         if (desiredDir == -1) {
             motorControl(-power);
-            if (lastAvoidPrintDir != -1) {
-                lastAvoidPrintDir = -1;
-                Serial.printf("[避障] 前方%.0fcm，左转(左%.0f vs 右%.0f)\n", f, L, R);
-            }
+            Serial.printf("[避障] 前方%.0fcm，左转(左%.0f vs 右%.0f)\n", f, L, R);
         } else {
             motorControl(power);
-            if (lastAvoidPrintDir != 1) {
-                lastAvoidPrintDir = 1;
-                Serial.printf("[避障] 前方%.0fcm，右转(左%.0f vs 右%.0f)\n", f, L, R);
-            }
+            Serial.printf("[避障] 前方%.0fcm，右转(左%.0f vs 右%.0f)\n", f, L, R);
         }
         return;
     }
@@ -540,7 +460,6 @@ void smartAvoid() {
     if (leftBlocked && rightBlocked) {
         motorControl(0);
         lastSteerDir = 0;
-        lastAvoidPrintDir = 0;
         return;
     }
     if (leftBlocked && !rightBlocked) {
@@ -555,7 +474,6 @@ void smartAvoid() {
     }
     // 无障碍物 → 停机
     lastSteerDir = 0;
-    lastAvoidPrintDir = 0;
     motorControl(0);
 }
 // ==================== 雷达处理 ====================
@@ -647,8 +565,7 @@ snprintf(alertText, sizeof(alertText), "前方有%s", chineseName);
 ttsDoc["text"] = alertText;
 ttsDoc["priority"] = PRIO_NORMAL;
 size_t len = serializeJson(ttsDoc, buf, sizeof(buf));
-// 【修复】短超时发布：本函数在 RadarTask 避障循环内调用，绝不让网络锁卡避障
-mqttPublishShort(MQTT_TOPIC_TTS_REQ, buf, len);
+mqtt.publish(MQTT_TOPIC_TTS_REQ, buf, len);
 }
 /**
 * 处理从K230接收的数据（仅检测数据）- 限制每次处理的最大字符数避免阻塞
@@ -707,13 +624,6 @@ k230_lastAlertTime[targetIndex] = now;
 }
 } else if (noneIdx >= 0) {
 k230_detection_count = 0;
-} else {
-// 【新增】既不是DETS/DET也不是NONE：打印原始帧便于诊断K230格式异常（节流防刷屏）
-static unsigned long lastUnknownK230 = 0;
-if (millis() - lastUnknownK230 > 5000) {
-lastUnknownK230 = millis();
-Serial.printf("[K230] 未知帧(前80字符): %.80s\n", k230_receiveBuffer.c_str());
-}
 }
 k230_receiveBuffer = "";
 }
@@ -855,22 +765,22 @@ last_retry = now;
 // 确保WiFi连接状态正常
 if (WiFi.status() != WL_CONNECTED) return false;
 // 配置MQTT客户端参数
-mqtt.setSocketTimeout(5);   // 【修复】10→5秒：RadarTask跑在CPU0，socket读超时太长会饿死IDLE0触发task_wdt
+mqtt.setSocketTimeout(10);
 mqtt.setKeepAlive(60);
 // 【修复】MQTT Buffer=8KB：既要容纳TTS音频分片(每片4KB)，又不会像128KB那样吃光内存
 mqtt.setBufferSize(8192);
 espClient.setInsecure();
-espClient.setHandshakeTimeout(3);  // 【修复】12→3秒：TLS握手是CPU0忙循环，必须<task_wdt的5秒，否则握手时IDLE0饿死、系统Abort
+espClient.setHandshakeTimeout(12);
 if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
 Serial.println("[MQTT] 连接成功");
 mqtt.subscribe(MQTT_TOPIC_TTS_AUDIO);
 mqtt.subscribe("blindstick/tts/control");
 mqtt.subscribe("blindstick/tts/stream/+");
+mqtt.subscribe("blindstick/tts/url");
 mqtt.subscribe(MQTT_TOPIC_NAV_STEPS);
 mqtt.subscribe(MQTT_TOPIC_TTS_REQ);
 mqtt.subscribe("blindstick/config/home_city");
 mqtt.subscribe("blindstick/stats/detour");
-mqtt.subscribe("blindstick/asr/result");
 retry_count = 0;
 // 【开机语音】只在系统启动后的首次MQTT连接时播放一次
 if (!startup_announced && !startup_announced_rtc) {
@@ -891,15 +801,6 @@ return false;
 void mqtt_reconnect() {
 mqtt_reconnect_nonblocking();
 }
-// 【ASR over MQTT】识别结果缓冲（由blindstick/asr/result消息填充，VoiceTask等待读取）
-char asr_result_text[512] = "";
-volatile bool asr_result_ready = false;
-// 【地图 over MQTT】地点/路线结果缓冲（proxy压缩后的JSON，两个请求串行共用）
-// 【修复】地点/路线结果分缓冲，避免超时后迟到的旧结果交叉污染（两者JSON格式不同）
-char places_result_buf[4096] = "";
-volatile bool places_result_ready = false;
-char directions_result_buf[4096] = "";
-volatile bool directions_result_ready = false;
 // ==================== MQTT 消息回调（支持流式TTS）====================
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
 // ===== 流式TTS控制消息处理（最高优先级）=====
@@ -907,45 +808,29 @@ if (strcmp(topic, "blindstick/tts/control") == 0) {
 handleStreamControl((const char*)payload, length);
 return;
 }
-// ===== ASR识别结果（Render MQTT回传，VoiceTask等待读取）=====
-if (strcmp(topic, "blindstick/asr/result") == 0) {
-StaticJsonDocument<768> doc;
-DeserializationError err = deserializeJson(doc, payload, length);
-if (!err) {
-int errNo = doc["err_no"] | -1;
-if (errNo == 0) {
-const char* text = doc["text"] | "";
-strncpy(asr_result_text, text, sizeof(asr_result_text) - 1);
-asr_result_text[sizeof(asr_result_text) - 1] = '\0';
-asr_result_ready = true;
-Serial.printf("[语音诊断] ASR结果: %s\n", asr_result_text);
-} else {
-const char* msg = doc["msg"] | "";
-Serial.printf("[语音诊断] ASR错误 err_no=%d msg=%s\n", errNo, msg);
-}
-}
-return;
-}
-// ===== 地点搜索结果（proxy压缩后JSON，VoiceTask等待读取）=====
-if (strcmp(topic, "blindstick/places/result") == 0) {
-strncpy(places_result_buf, (const char*)payload, sizeof(places_result_buf) - 1);
-places_result_buf[sizeof(places_result_buf) - 1] = '\0';
-places_result_ready = true;
-Serial.printf("[导航] 地点搜索结果: %d字节\n", length);
-return;
-}
-// ===== 步行路线结果（proxy压缩后JSON，VoiceTask等待读取）=====
-if (strcmp(topic, "blindstick/directions/result") == 0) {
-strncpy(directions_result_buf, (const char*)payload, sizeof(directions_result_buf) - 1);
-directions_result_buf[sizeof(directions_result_buf) - 1] = '\0';
-directions_result_ready = true;
-Serial.printf("[导航] 路线规划结果: %d字节\n", length);
-return;
-}
 // ===== 流式TTS音频分片（Render MQTT推送，重装后由独立任务播放）=====
 if (strncmp(topic, "blindstick/tts/stream/", 22) == 0) {
 appendStreamChunk(payload, length);
 return;
+}
+// ===== TTS URL处理（新方案：接收URL并入队，由独立任务下载播放）=====
+if (strcmp(topic, "blindstick/tts/url") == 0) {
+    StaticJsonDocument<512> doc;
+    DeserializationError err = deserializeJson(doc, payload, length);
+    if (err) { Serial.println("[TTS-URL] JSON解析失败"); return; }
+    const char* url = doc["url"];
+    if (!url || strlen(url) == 0) { Serial.println("[TTS-URL] URL为空"); return; }
+    TTSUrlMsg msg;
+    strncpy(msg.url, url, sizeof(msg.url) - 1);
+    msg.url[sizeof(msg.url) - 1] = '\0';
+    const char* text = doc["text"];
+    strncpy(msg.text, text ? text : "", sizeof(msg.text) - 1);
+    msg.text[sizeof(msg.text) - 1] = '\0';
+    msg.priority = doc["priority"] | PRIO_NORMAL;
+    if (ttsUrlQueue != NULL && xQueueSend(ttsUrlQueue, &msg, 0) != pdTRUE) {
+        Serial.println("[TTS-URL] 播放队列已满，丢弃本次播报");
+    }
+    return;
 }
 // ===== 常住地设置处理 =====
 if (strcmp(topic, "blindstick/config/home_city") == 0) {
@@ -954,8 +839,6 @@ DeserializationError err = deserializeJson(doc, payload, length);
 if (!err && doc.containsKey("city")) {
 const char* new_city = doc["city"];
 home_city = String(new_city);
-// 【修复】写入NVS持久化，重启/烧录后仍保留
-homeCityPrefs.putString("city", home_city);
 // 播报确认
 StaticJsonDocument<256> ttsDoc;
 char confirmText[64];
@@ -964,7 +847,7 @@ ttsDoc["text"] = confirmText;
 ttsDoc["priority"] = PRIO_NORMAL;
 char buf[256];
 size_t len = serializeJson(ttsDoc, buf, sizeof(buf));
-mqttPublish("blindstick/tts/request", buf, len);
+mqtt.publish("blindstick/tts/request", buf, len);
 }
 return;
 }
@@ -1011,8 +894,7 @@ vTaskResume(VoiceTaskHandle);
 }
 }
 } else if (strcmp(topic, MQTT_TOPIC_NAV_STEPS) == 0) {
-// 【修复】4096→static：mqtt_callback 在 RadarTask 栈上执行（经 mqttLoop），4KB文档是栈溢出元凶之一
-static StaticJsonDocument<4096> doc;
+StaticJsonDocument<4096> doc;
 DeserializationError err = deserializeJson(doc, payload, length);
 if (!err && doc["status"] == "ok") {
 JsonArray steps = doc["steps"];
@@ -1143,7 +1025,7 @@ void checkObstacleAndAlert() {
             doc["priority"] = PRIO_HIGH;
             char buf[256];
             size_t len = serializeJson(doc, buf, sizeof(buf));
-            mqttPublish("blindstick/tts/control", buf, len);
+            mqtt.publish("blindstick/tts/control", buf, len);
             delay(50);
         }
     }
@@ -1227,7 +1109,7 @@ void checkObstacleAndAlert() {
         ttsDoc["priority"] = PRIO_HIGH;  // 避障使用高优先级
         size_t len = serializeJson(ttsDoc, buf, sizeof(buf));
 
-        if (mqttPublish(MQTT_TOPIC_TTS_REQ, buf, len)) {
+        if (mqtt.publish(MQTT_TOPIC_TTS_REQ, buf, len)) {
             // 更新记录
             lastAlertText = alert_text;
             lastAlertTime = now;
@@ -1308,8 +1190,7 @@ if (!mqtt.connected()) return;
 // 更新里程统计
 updateMileage();
 // 使用更大的JSON缓冲区容纳视觉检测数据
-// 【修复】2048→static：publishSensorData 在 RadarTask 栈上，2KB文档腾出栈空间防溢出（仅RadarTask调用，static安全）
-static StaticJsonDocument<2048> doc;  // 【修复】1024→2048：K230多目标时k230_dets数组会占满1024池，ArduinoJson静默丢框
+StaticJsonDocument<2048> doc;  // 【修复】1024→2048：K230多目标时k230_dets数组会占满1024池，ArduinoJson静默丢框
 doc["device_id"] = "blind_stick_001";
 JsonObject radar = doc.createNestedObject("radar");
 // 三向雷达: [0]=前方, [1]=左方, [2]=右方
@@ -1384,7 +1265,7 @@ if (millis() - lastJsonDebug > 10000) {
 lastJsonDebug = millis();
 Serial.printf("[MQTT] 发布JSON %d字节\n", n);
 }
-bool published = mqttPublish(MQTT_TOPIC_SENSORS, (const uint8_t*)json_buffer, n, false);
+bool published = mqtt.publish(MQTT_TOPIC_SENSORS, (const uint8_t*)json_buffer, n, false);
 if (!published) {
 Serial.println("[MQTT] 发布失败");
 }
@@ -1410,6 +1291,7 @@ k230Serial.setRxBufferSize(4096);  // 必须在begin()之前调用
 k230Serial.begin(K230_UART_BAUD, SERIAL_8N1, K230_RX_PIN, K230_TX_PIN);
 Serial.printf("[K230] UART%d初始化 RX=GPIO%d TX=GPIO%d\n",
 K230_UART_ID, K230_RX_PIN, K230_TX_PIN);
+unsigned long lastUpload = 0;
 unsigned long lastStatusPrint = 0;
 int radarByteCount = 0;
 // 【新增】雷达数据定时重置周期
@@ -1417,7 +1299,6 @@ unsigned long lastRadarReset = 0;
 const unsigned long RADAR_RESET_INTERVAL_MS = 500;  // 每500ms重置一次数据
 
 while (true) {
-radarHeartbeat = millis();  // 【安全】喂心跳，看门狗据此判断本任务是否活着
 // 【新增】定时重置距离数据，确保数据新鲜度
 unsigned long now = millis();
 if (now - lastRadarReset >= RADAR_RESET_INTERVAL_MS) {
@@ -1464,7 +1345,7 @@ Serial.printf("[GPS] 波特率已锁定: %d (累计收到%d字节)\n", gps_baud_
 // 每3秒打印一次状态
 if (now2 - lastStatusPrint > 3000) {
 lastStatusPrint = now2;
-Serial.printf("[状态] WiFi:%s MQTT:%s 雷达字节:%d 雷达F:%.0f GPS可用:%d GPS字节:%lu 卫星:%d 波特率:%d 栈余:%u 内存:%luK\n",
+Serial.printf("[状态] WiFi:%s MQTT:%s 雷达字节:%d 雷达F:%.0f GPS可用:%d GPS字节:%lu 卫星:%d 波特率:%d\n",
 WiFi.status() == WL_CONNECTED ? "连接" : "断开",
 mqtt.connected() ? "连接" : "断开",
 radarByteCount,
@@ -1472,45 +1353,12 @@ dir_smt[0],
 gpsSerial.available(),
 gps_byte_count,
 gps_satellites,
-gps_baud_table[gps_baud_index],
-uxTaskGetStackHighWaterMark(NULL),  // 【诊断】RadarTask栈余量(字节)，确认24576够不够
-ESP.getFreeHeap() / 1024);  // 【诊断】剩余内存(KB)，排查TLS反复连接是否泄漏内存导致耗尽重启
+gps_baud_table[gps_baud_index]);
 radarByteCount = 0;  // 重置计数
 }
-// 【修复】MQTT维护整体移出本循环 → 独立 MQTTTask。
-// 本任务只做本地感知(雷达/GPS/K230/避障)，永不因网络阻塞：
-// 断网时 TLS 握手(≤3s)不再卡避障、不再卡心跳，避障始终正常。
-vTaskDelay(10 / portTICK_PERIOD_MS);
-}
-}
-// ==================== 安全看门狗（防轮子失控） ====================
-// 【修复】RadarTask 若因任何原因卡死（MQTT并发、栈溢出、阻塞IO），电机PWM会一直保持
-// 最后一个方向，导盲杖会带着轮子一直转撞向障碍物。本任务盯 RadarTask 的心跳，
-// 超时3秒立即强制停机。motorControl(0) 幂等，RadarTask 健康时本任务从不触发。
-#define SAFETY_STOP_MS  3000
-void SafetyWatchdogTask(void* pvParameters) {
-    unsigned long lastPrint = 0;
-    while (true) {
-        if (radarHeartbeat != 0 && (millis() - radarHeartbeat > SAFETY_STOP_MS)) {
-            motorControl(0);
-            if (millis() - lastPrint > 5000) {
-                lastPrint = millis();
-                Serial.println("[安全] RadarTask 无心跳，已强制停机！请检查电源/网络/MQTT");
-            }
-        }
-        vTaskDelay(300 / portTICK_PERIOD_MS);
-    }
-}
-// ==================== MQTT 维护任务（网络与避障彻底分离）====================
-// 【修复】网络/MQTT 曾嵌在 RadarTask 避障循环里：断网时 mqttReconnect 的 TLS
-// 握手每3秒忙循环阻塞3秒，避障停顿+心跳不喂 → 看门狗误触发"重启/轮子失控"。
-// 现在网络单独一个低优先级任务维护，RadarTask 只做本地感知，避障永不因网络卡。
-void MQTTTask(void* pvParameters) {
-unsigned long lastUpload = 0;
-bool mqttPrevState = false;
-while (true) {
 if (WiFi.status() == WL_CONNECTED) {
 // 【诊断】MQTT连接状态变化检测（定位掉线时机）
+static bool mqttPrevState = false;
 bool mqttCurState = mqtt.connected();
 if (mqttPrevState && !mqttCurState) {
 Serial.printf("[MQTT] 掉线! state=%d\n", mqtt.state());
@@ -1519,22 +1367,39 @@ Serial.println("[MQTT] 重连成功");
 }
 mqttPrevState = mqttCurState;
 if (!mqtt.connected()) {
-mqttReconnect();
+mqtt_reconnect();
 }
 if (mqtt.connected()) {
-mqttLoop();
+mqtt.loop();
 if (getTTSRequesting() && (millis() - tts_request_start_time > TTS_REQUEST_TIMEOUT_MS)) {
 setTTSRequesting(false);
 }
 checkObstacleAndAlert();
-unsigned long now2 = millis();
 if (now2 - lastUpload >= UPLOAD_INTERVAL_MS) {
 lastUpload = now2;
 publishSensorData();
 }
 }
 }
-vTaskDelay(50 / portTICK_PERIOD_MS);
+vTaskDelay(10 / portTICK_PERIOD_MS);
+}
+}
+// ==================== Render保活任务（防免费版休眠，避免ASR/TTS冷启动）====================
+void RenderKeepAliveTask(void* pvParameters) {
+while (true) {
+if (WiFi.status() == WL_CONNECTED) {
+WiFiClientSecure kaClient;
+kaClient.setInsecure();
+kaClient.setTimeout(3);
+HTTPClient httpKA;
+if (httpKA.begin(kaClient, "https://blindstick-4.onrender.com/health")) {
+httpKA.setTimeout(3000);
+int code = httpKA.GET();
+httpKA.end();
+Serial.printf("[保活] /health code=%d\n", code);
+}
+}
+vTaskDelay(45000 / portTICK_PERIOD_MS);
 }
 }
 // ==================== Core 1 导航任务（带路口播报）====================
@@ -1566,7 +1431,7 @@ doc["text"] = announcement;
 doc["priority"] = PRIO_NORMAL;
 char buf[512];
 size_t len = serializeJson(doc, buf, sizeof(buf));
-mqttPublish("blindstick/tts/request", buf, len);
+mqtt.publish("blindstick/tts/request", buf, len);
 }
 }
 if (current_progress < 100) {
@@ -1594,7 +1459,7 @@ doc["text"] = "导航完成，已到达目的地";
 doc["priority"] = PRIO_NORMAL;
 char buf[256];
 size_t len = serializeJson(doc, buf, sizeof(buf));
-mqttPublish("blindstick/tts/request", buf, len);
+mqtt.publish("blindstick/tts/request", buf, len);
 }
 }
 vTaskDelay(1000 / portTICK_PERIOD_MS);
@@ -1695,12 +1560,6 @@ bool isTtsEcho(const char* result) {
     if (result == NULL || result[0] == '\0' || lastPlayedTtsText[0] == '\0') return false;
     String r = String(result);
     String t = String(lastPlayedTtsText);
-    // 【修复】ASR结果在doVoiceRecognition里已删标点，而lastPlayedTtsText存的是带标点原文，
-    // 直接indexOf永远匹配不上→导航播报("开始导航到X，全程...")回声漏过滤、自我触发。
-    // 两边都去标点/空格后再互相包含匹配。
-    r.replace("。", ""); r.replace("，", ""); r.replace("？", ""); r.replace("！", ""); r.replace(" ", "");
-    t.replace("。", ""); t.replace("，", ""); t.replace("？", ""); t.replace("！", ""); t.replace(" ", "");
-    if (r.length() == 0 || t.length() == 0) return false;
     if (r.indexOf(t) >= 0 || t.indexOf(r) >= 0) return true;  // 双方互相包含视为回声
     return false;
 }
@@ -1753,24 +1612,14 @@ vTaskDelay(500 / portTICK_PERIOD_MS);
 }
 }
 /**
-* 语音识别主函数（固定录音1秒，直接HTTPS到百度server_api）
+* 语音识别主函数（录音3秒，REST API）
 * 返回值：识别到的文本，空字符串表示未识别
 */
 String doVoiceRecognition() {
-    // 【准确版移植】固定录音1秒 + 直接HTTPS上传百度（不再VAD动态门控/MQTT分片）
-    // 注：INMP441为32bit I2S，录音后需转16bit PCM再base64
-    const int RECORD_SECONDS = 1;
-    const int RAW_RECORD_BYTES = 16000 * 4 * RECORD_SECONDS;  // 32bit原始数据 64KB
-    const int PCM_RECORD_BYTES = 16000 * 2 * RECORD_SECONDS;   // 转换后的16bit PCM 32KB
-
-    // 【保留】电机运行时噪声巨大，跳过录音（防电机声被当人声误触发）
-    if (motorPowerNow != 0) {
-        return "";
-    }
-    // 【保留】TTS播完后的喇叭余音期跳过录音（防喇叭余音被识别成胡话）
-    if (millis() - ttsPlayEndTime < TTS_TAIL_GUARD_MS) {
-        return "";
-    }
+    // 【修复】INMP441输出32bit I2S，录音3秒原始数据 = 16000*4*3 = 192KB
+    const int RECORD_SECONDS = 3;
+    const int RAW_RECORD_BYTES = 16000 * 4 * RECORD_SECONDS;  // 32bit原始数据
+    const int PCM_RECORD_BYTES = 16000 * 2 * RECORD_SECONDS;   // 转换后的16bit PCM
 
     uint8_t* rawBuffer = NULL;
     size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -1785,16 +1634,100 @@ String doVoiceRecognition() {
         return "";
     }
 
-    // 固定录音1秒（非阻塞i2s_read循环，最多1秒或读满即停）
-    size_t totalRead = 0;
-    unsigned long startTime = millis();
-    while (millis() - startTime < RECORD_SECONDS * 1000 && totalRead < RAW_RECORD_BYTES) {
-        size_t bytesRead = 0;
-        i2s_read(I2S_PORT, rawBuffer + totalRead, RAW_RECORD_BYTES - totalRead, &bytesRead, 50);
-        totalRead += bytesRead;
-    }
+    // 【VAD录音】不再固定录3秒，检测到说话才开始捕获、停嘴约0.5秒即结束发送
+    // 阈值与分块参数（串口会打印静音能量，便于调节阈值）
+    const int VOICE_AVG_THRESHOLD = 120;              // 块内|样本|均值超过该值判定为有声
+    const size_t VAD_BLOCK_BYTES = 640 * 4;           // 40ms @16kHz 32bit = 2560字节
+    const int START_BLOCKS = 2;                       // 连续2块有声才确认说话（抗突发噪声）
+    const int END_SILENT_BLOCKS = 12;                 // 连续12块(480ms)静音视为说完
+    const int MIN_SPEECH_MS = 300;                    // 最短语音300ms，更短视为噪声
+    const unsigned long NO_SPEECH_TIMEOUT_MS = 10000; // 10秒无人说话则退出本轮继续监听
 
-    // 32bit I2S → 16bit PCM 转换（右移14位，与测试代码一致）
+    uint8_t* blockBuf = (uint8_t*)malloc(VAD_BLOCK_BYTES);
+    if (!blockBuf) {
+        free(rawBuffer);
+        Serial.println("[语音诊断] VAD块缓冲分配失败");
+        return "";
+    }
+    size_t capturedBytes = 0;   // 已捕获的32bit字节数
+    int speechMs = 0;           // 语音时长（仅计有声块）
+    int totalMs = 0;            // 本段总时长（含末尾静音，用于3秒上限）
+    int silentBlocks = 0;
+    int state = 0;              // 0=静音 1=疑似开始 2=语音中
+    bool speechStarted = false;
+    unsigned long vadStart = millis();
+
+    while (true) {
+        // 超时保护：麦克风无声/异常时避免卡死
+        if (!speechStarted && (millis() - vadStart > NO_SPEECH_TIMEOUT_MS)) break;
+        size_t got = 0;
+        esp_err_t e = i2s_read(I2S_PORT, blockBuf, VAD_BLOCK_BYTES, &got, 100);
+        if (e != ESP_OK || got < VAD_BLOCK_BYTES / 2) continue;   // 数据不足，等下一块
+        int n = got / 4;
+        int32_t* s32 = (int32_t*)blockBuf;
+        long long sum = 0;
+        for (int i = 0; i < n; i++) {
+            int32_t v = s32[i] >> 14;
+            if (v < 0) v = -v;
+            sum += v;
+        }
+        int avg = (int)(sum / n);
+        int blockMs = n * 1000 / SAMPLE_RATE;
+        bool voiced = (avg > VOICE_AVG_THRESHOLD);
+
+        if (state == 0) {
+            // 静音中：每2秒打印一次能量，便于调试麦克风增益/阈值
+            static unsigned long lastE = 0;
+            if (millis() - lastE > 2000) {
+                lastE = millis();
+                Serial.printf("[语音诊断] VAD静音 能量=%d 阈值=%d\n", avg, VOICE_AVG_THRESHOLD);
+            }
+            if (voiced) { state = 1; silentBlocks = 0; }
+            continue;
+        }
+        if (state == 1) {
+            if (voiced) {
+                // 确认开口，开始捕获
+                state = 2; speechStarted = true;
+                speechMs = blockMs; totalMs = blockMs;
+                memcpy(rawBuffer, blockBuf, got);
+                capturedBytes = got;
+            } else if (++silentBlocks >= START_BLOCKS) {
+                state = 0;   // 突发噪声，误触发
+            }
+            continue;
+        }
+        // state==2 语音中
+        if (voiced) {
+            if (capturedBytes + got <= RAW_RECORD_BYTES) {
+                memcpy(rawBuffer + capturedBytes, blockBuf, got);
+                capturedBytes += got;
+            }
+            speechMs += blockMs;
+            totalMs += blockMs;
+            silentBlocks = 0;
+        } else {
+            totalMs += blockMs;
+            if (++silentBlocks >= END_SILENT_BLOCKS) {
+                if (speechMs >= MIN_SPEECH_MS) break;       // 说完，末尾静音未记录
+                // 过短视为噪声，丢弃并回到静音监听
+                state = 0; speechStarted = false;
+                capturedBytes = 0; speechMs = 0; totalMs = 0;
+                Serial.println("[语音诊断] VAD捕获过短(噪声)，丢弃");
+            }
+        }
+        if (totalMs >= RECORD_SECONDS * 1000) break;   // 3秒上限
+    }
+    free(blockBuf);
+    size_t rawRead = capturedBytes;
+    if (rawRead < VAD_BLOCK_BYTES / 2) {
+        Serial.println("[语音诊断] VAD未捕获到语音，继续监听...");
+        free(rawBuffer);
+        return "";
+    }
+    Serial.printf("[语音诊断] VAD捕获语音 %dms %d字节\n", speechMs, (int)rawRead);
+
+    // 分配16bit PCM缓冲区（优先PSRAM，减少内部堆压力）
     uint8_t* pcmBuffer = (uint8_t*)heap_caps_malloc(PCM_RECORD_BYTES, MALLOC_CAP_SPIRAM);
     if (!pcmBuffer) {
         pcmBuffer = (uint8_t*)malloc(PCM_RECORD_BYTES);
@@ -1804,9 +1737,11 @@ String doVoiceRecognition() {
         Serial.println("[语音诊断] PCM缓冲区分配失败");
         return "";
     }
+
+    // 32bit I2S → 16bit PCM 转换（右移14位，与测试代码一致）
     int32_t* rawSamples = (int32_t*)rawBuffer;
     int16_t* pcmSamples = (int16_t*)pcmBuffer;
-    int rawSampleCount = totalRead / 4;
+    int rawSampleCount = rawRead / 4;
     int pcmSampleCount = (rawSampleCount < RECORD_SECONDS * 16000) ? rawSampleCount : RECORD_SECONDS * 16000;
     for (int i = 0; i < pcmSampleCount; i++) {
         int32_t sample = rawSamples[i] >> 14;
@@ -1814,13 +1749,19 @@ String doVoiceRecognition() {
         if (sample < -32768) sample = -32768;
         pcmSamples[i] = (int16_t)sample;
     }
-    size_t totalPCM = pcmSampleCount * 2;  // 16bit字节数
+    size_t totalRead = pcmSampleCount * 2;  // 16bit字节数
     free(rawBuffer);
 
-    // 静音门控：非静音样本<100视为无效录音
+    // 检查录音数据是否有效（避免静音）
     int nonZeroCount = 0;
     for (int i = 0; i < pcmSampleCount; i++) {
         if (pcmSamples[i] > 100 || pcmSamples[i] < -100) nonZeroCount++;
+    }
+    // 【诊断】每5秒打印一次录音统计
+    static unsigned long lastDiagTime = 0;
+    if (millis() - lastDiagTime > 5000) {
+        lastDiagTime = millis();
+        Serial.printf("[语音诊断] 录音:%d字节 非静音样本:%d\n", totalRead, nonZeroCount);
     }
     if (nonZeroCount < 100) {
         Serial.printf("[语音诊断] 录音静音(nonZero=%d)，跳过识别\n", nonZeroCount);
@@ -1828,8 +1769,8 @@ String doVoiceRecognition() {
         return "";
     }
 
-    // base64编码（写入PSRAM/堆缓冲，避免大String占内部堆）
-    size_t b64Cap = ((totalPCM + 2) / 3) * 4 + 1;
+    // 【内存修复】base64+JSON改用PSRAM/堆缓冲，避免大String占内部堆挤掉MQTT的TLS连接
+    size_t b64Cap = ((totalRead + 2) / 3) * 4 + 1;
     char* b64Buf = (char*)heap_caps_malloc(b64Cap, MALLOC_CAP_SPIRAM);
     if (!b64Buf) {
         b64Buf = (char*)malloc(b64Cap);
@@ -1839,20 +1780,22 @@ String doVoiceRecognition() {
         Serial.println("[语音诊断] Base64缓冲分配失败");
         return "";
     }
-    size_t b64Len = base64ToBuffer(pcmBuffer, totalPCM, b64Buf);
+    base64ToBuffer(pcmBuffer, totalRead, b64Buf);
     free(pcmBuffer);
-    Serial.printf("[语音诊断] 上传ASR: PCM=%d字节 base64=%d字节\n", (int)totalPCM, (int)b64Len);
-
-    // 获取百度token（带缓存，提前5分钟过期）
-    String token = getBaiduToken();
-    if (token.length() == 0) {
+    // 【代理ASR】改走Render后端 /api/asr 转发百度识别（热点拦ESP32直连百度，后端可达）
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(20000);
+    HTTPClient http;
+    if (!http.begin(client, "https://blindstick-4.onrender.com/api/asr")) {
         free(b64Buf);
-        Serial.println("[语音诊断] 百度token获取失败");
+        Serial.println("[语音诊断] 代理ASR HTTP初始化失败（连不上 Render 后端）");
         return "";
     }
-
-    // 组装JSON请求体（PSRAM优先）
-    size_t jsonCap = b64Len + 256;
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(20000);
+    // 构造JSON body到PSRAM/堆缓冲（不再用大String）
+    size_t jsonCap = b64Cap + 64;
     char* jsonBuf = (char*)heap_caps_malloc(jsonCap, MALLOC_CAP_SPIRAM);
     if (!jsonBuf) {
         jsonBuf = (char*)malloc(jsonCap);
@@ -1862,93 +1805,35 @@ String doVoiceRecognition() {
         Serial.println("[语音诊断] JSON缓冲分配失败");
         return "";
     }
-    int plen = snprintf(jsonBuf, jsonCap,
-        "{\"format\":\"pcm\",\"rate\":16000,\"channel\":1,\"cuid\":\"esp32_blindstick\",\"token\":\"%s\",\"dev_pid\":1537,\"speech\":\"%s\",\"len\":%u}",
-        token.c_str(), b64Buf, (unsigned)totalPCM);
-    free(b64Buf);
-
-    // 直接HTTPS POST 百度server_api
+    int jsonLen = snprintf(jsonBuf, jsonCap, "{\"speech\":\"%s\",\"len\":%u}", b64Buf, (unsigned)totalRead);
+    free(b64Buf);  // 释放base64，降低峰值
+    int httpCode = http.POST((uint8_t*)jsonBuf, jsonLen);
     String result = "";
-    WiFiClientSecure client;
-    client.setInsecure();
-    client.setHandshakeTimeout(3);  // 【修复】同MQTT：TLS握手是CPU0忙循环，必须<task_wdt的5秒
-    client.setTimeout(15000);
-    HTTPClient http;
-    if (!http.begin(client, "https://vop.baidu.com/server_api")) {
-        free(jsonBuf);
-        Serial.println("[语音诊断] ASR HTTPS连接失败");
-        return "";
-    }
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(15000);
-    int httpCode = http.POST((uint8_t*)jsonBuf, plen);
     if (httpCode == 200) {
         String response = http.getString();
         StaticJsonDocument<1024> respDoc;
         DeserializationError error = deserializeJson(respDoc, response);
         if (!error && respDoc["err_no"] == 0) {
-            JsonArray results = respDoc["result"];
-            if (results.size() > 0) {
-                result = results[0].as<String>();
-                // 去除标点符号
-                result.replace("。", "");
-                result.replace("，", "");
-                result.replace("？", "");
-                result.replace("！", "");
-                result.trim();
-            }
+            result = respDoc["text"].as<String>();
+            // 去除标点符号
+            result.replace("。", "");
+            result.replace("，", "");
+            result.replace("？", "");
+            result.replace("！", "");
+            result.trim();
         } else {
-            Serial.printf("[语音诊断] ASR失败 err_no=%d\n", respDoc["err_no"] | -1);
+            // 【诊断】代理ASR返回错误
+            int errNo = respDoc["err_no"] | -1;
+            const char* msg = respDoc["msg"] | "";
+            Serial.printf("[语音诊断] 代理ASR错误 err_no=%d msg=%s\n", errNo, msg);
         }
     } else {
-        Serial.printf("[语音诊断] ASR HTTP失败: %d\n", httpCode);
+        // 【诊断】代理ASR HTTP失败
+        Serial.printf("[语音诊断] 代理ASR HTTP失败 code=%d\n", httpCode);
     }
     http.end();
     free(jsonBuf);
     return result;
-}
-
-/**
-* 获取百度access_token（带缓存，提前5分钟过期）
-*/
-String getBaiduToken() {
-    // 检查缓存的token是否仍有效（提前5分钟过期）
-    static String cached_token = "";
-    static unsigned long expire_time = 0;
-    if (cached_token.length() > 0 && millis() < expire_time - 300000) {
-        return cached_token;
-    }
-
-    WiFiClientSecure client;
-    client.setInsecure();
-    client.setHandshakeTimeout(3);  // 【修复】同MQTT：TLS握手是CPU0忙循环，必须<task_wdt的5秒
-    client.setTimeout(10000);
-
-    HTTPClient http;
-    String url = "https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials";
-    url += "&client_id=" + BAIDU_API_KEY;
-    url += "&client_secret=" + BAIDU_SECRET_KEY;
-
-    if (!http.begin(client, url)) {
-        return "";
-    }
-    http.setTimeout(10000);
-    int httpCode = http.GET();
-
-    if (httpCode == 200) {
-        String response = http.getString();
-        StaticJsonDocument<512> doc;
-        DeserializationError error = deserializeJson(doc, response);
-        if (!error && doc.containsKey("access_token")) {
-            cached_token = doc["access_token"].as<String>();
-            int expiresIn = doc["expires_in"] | 2592000;
-            expire_time = millis() + (expiresIn * 1000);
-            http.end();
-            return cached_token;
-        }
-    }
-    http.end();
-    return "";
 }
 /**
 * Base64编码
@@ -2001,18 +1886,6 @@ return oi;
 void setup() {
 Serial.begin(115200);
 randomSeed(millis());
-// 【诊断】打印上次复位原因，区分反复重启是掉电(brownout)/panic/看门狗/上电
-switch (esp_reset_reason()) {
-case ESP_RST_BROWNOUT: Serial.println("[复位] 上次是掉电复位(brownout)：电源带不动，检查电池/供电！"); break;
-case ESP_RST_PANIC:   Serial.println("[复位] 上次是异常崩溃(panic)：请贴Guru Meditation日志"); break;
-case ESP_RST_TASK_WDT: Serial.println("[复位] 上次是任务看门狗(task_wdt)：某任务饿死系统"); break;
-case ESP_RST_INT_WDT:  Serial.println("[复位] 上次是中断看门狗(int_wdt)"); break;
-case ESP_RST_WDT:      Serial.println("[复位] 上次是看门狗(wdt)"); break;
-case ESP_RST_SW:       Serial.println("[复位] 上次是软件重启(esp_restart)"); break;
-case ESP_RST_DEEPSLEEP:Serial.println("[复位] 上次是深度睡眠唤醒"); break;
-case ESP_RST_POWERON:  Serial.println("[复位] 上次是正常上电(power-on)"); break;
-default:               Serial.printf("[复位] 上次原因代码=%d\n", esp_reset_reason()); break;
-}
 // ===== PSRAM 初始化（必须在内存分配前完成）=====
 bool psram_ok = psramInit();
 // 如果初始化失败，尝试再次初始化
@@ -2032,12 +1905,25 @@ psram_free = 8 * 1024 * 1024 - 500000;  // 8MB - 500KB预留
 }
 Serial.printf("PSRAM Free: %d bytes (%d KB)\n", psram_free, psram_free / 1024);
 Serial.printf("ESP.getPsramSize(): %d\n", ESP.getPsramSize());
-// ===== 从NVS恢复常住地设置（重启/烧录后仍保留用户设置的城市）=====
-homeCityPrefs.begin("home_city", false);
-String savedCity = homeCityPrefs.getString("city", "");
-if (savedCity.length() > 0) {
-home_city = savedCity;
-Serial.printf("[常住地] 从NVS恢复: %s\n", home_city.c_str());
+// 初始化TTS音频缓冲区（优先使用PSRAM）
+if (psram_ok && psram_free > TTS_AUDIO_BUF_SIZE + 10000) {
+tts_rx_buf = (uint8_t*)heap_caps_malloc(TTS_AUDIO_BUF_SIZE, MALLOC_CAP_SPIRAM);
+Serial.printf("TTS buffer allocated in PSRAM: %d KB\n", TTS_AUDIO_BUF_SIZE / 1024);
+} else {
+tts_rx_buf = (uint8_t*)malloc(TTS_AUDIO_BUF_SIZE);
+Serial.printf("TTS buffer allocated in HEAP: %d KB\n", TTS_AUDIO_BUF_SIZE / 1024);
+}
+// 如果分配失败，尝试更小的缓冲区
+if (tts_rx_buf == NULL) {
+int smaller_size = 40 * 1024;  // 40KB
+psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+if (psram_ok && psram_free > smaller_size + 5000) {
+tts_rx_buf = (uint8_t*)heap_caps_malloc(smaller_size, MALLOC_CAP_SPIRAM);
+Serial.printf("Using smaller TTS buffer in PSRAM: %d KB\n", smaller_size / 1024);
+} else {
+tts_rx_buf = (uint8_t*)malloc(smaller_size);
+Serial.printf("Using smaller TTS buffer in HEAP: %d KB\n", smaller_size / 1024);
+}
 }
 // ===== 从RTC内存恢复今日出行统计数据 =====
 total_mileage = rtc_total_mileage;
@@ -2059,7 +1945,6 @@ nav_total_steps = 1;
 nav_steps[0] = "请说出目的地";
 current_step_idx = 0; current_progress = 0; nav_active = false;
 audioMutex = xSemaphoreCreateMutex();
-mqttMutex = xSemaphoreCreateRecursiveMutex();  // 【修复】MQTT并发锁（递归：mqtt_callback在loop内重入publish）
 // 初始化TTS请求标志互斥锁
 ttsRequestMutex = xSemaphoreCreateMutex();
 // 初始化流式TTS
@@ -2077,33 +1962,66 @@ while (WiFi.status() != WL_CONNECTED) {
 if (millis() - wifi_start > 30000) break;
 delay(500);
 }
-// 配置MQTT（只初始化，连接交给MQTTTask，避免阻塞setup启动避障）
+if (WiFi.status() == WL_CONNECTED) {
+// 【新增】探测ESP32到Render的连通性（诊断TTS下载-1）
+probeRenderConnectivity();
+// 配置MQTT
 espClient.setInsecure();
 espClient.setHandshakeTimeout(8);
 mqtt.setServer(MQTT_BROKER, MQTT_PORT);
 mqtt.setCallback(mqtt_callback);
-// 【修复】RadarTask 栈 32768→24576：MQTT握手/mqtt_callback已移出本任务，纯避障不再需要大栈
-xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 24576, NULL, 3, &RadarTaskHandle, 0);
-// 【安全】看门狗：RadarTask 卡死时强制停机，防轮子失控
-xTaskCreatePinnedToCore(SafetyWatchdogTask, "Watchdog", 2048, NULL, 1, NULL, 1);
-xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
-xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 24576, NULL, 2, &VoiceTaskHandle, 1);  // 【修复】16384→24576：doVoiceRecognition含4KB+2KB StaticJsonDocument深栈，防同类溢出
-// 【修复】网络维护独立任务：断网时避障(RadarTask)永不因TLS握手卡住
-xTaskCreatePinnedToCore(MQTTTask, "MQTTTask", 16384, NULL, 1, NULL, 1);
-// 【新增】MQTT音频播放队列和独立任务（Render分片推送 → 重装 → 本任务播放）
-ttsPcmQueue = xQueueCreate(4, sizeof(TTSPcmMsg));
-if (ttsPcmQueue != NULL) {
-xTaskCreatePinnedToCore(TTSPcmPlayerTask, "TTSPcmPlayer", 16384, NULL, 3, NULL, 0);
-Serial.println("[TTS-Pcm] MQTT音频播放任务已启动");
-} else {
-Serial.println("[TTS-Pcm] 播放队列创建失败");
+// 连接MQTT（非阻塞重试）
+mqtt_reconnect();
 }
+xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 8192, NULL, 3, &RadarTaskHandle, 0);
+xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
+xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 16384, NULL, 2, &VoiceTaskHandle, 1);  // 【修复】增大栈空间防止ASR请求时栈溢出
+xTaskCreatePinnedToCore(RenderKeepAliveTask, "RenderKA", 16384, NULL, 1, NULL, 1);  // 每45秒ping /health防休眠
+    // 【修复】创建TTS URL异步播放队列和任务（独立播放，不阻塞MQTT主循环和传感器上传）
+    ttsUrlQueue = xQueueCreate(4, sizeof(TTSUrlMsg));
+    if (ttsUrlQueue != NULL) {
+        xTaskCreatePinnedToCore(TTSUrlPlayerTask, "TTSPlayer", 16384, NULL, 3, NULL, 0);
+        Serial.println("[TTS-Player] 异步播放任务已启动");
+    } else {
+        Serial.println("[TTS-Player] 队列创建失败");
+    }
+
+    // 【新增】MQTT音频播放队列和独立任务（Render分片推送 → 重装 → 本任务播放）
+    ttsPcmQueue = xQueueCreate(4, sizeof(TTSPcmMsg));
+    if (ttsPcmQueue != NULL) {
+        xTaskCreatePinnedToCore(TTSPcmPlayerTask, "TTSPcmPlayer", 16384, NULL, 3, NULL, 0);
+        Serial.println("[TTS-Pcm] MQTT音频播放任务已启动");
+    } else {
+        Serial.println("[TTS-Pcm] 播放队列创建失败");
+    }
 
 }
 void loop() {
 vTaskDelete(NULL);
 }
 
+// ==================== Render连通性探测（诊断TTS下载-1用）====================
+void probeRenderConnectivity() {
+Serial.println("\n[NET-PROBE] 测试 blindstick-4.onrender.com:443 ...");
+IPAddress renderIP;
+int dnsRes = WiFi.hostByName("blindstick-4.onrender.com", renderIP);
+if (dnsRes != 1) {
+Serial.printf("[NET-PROBE] DNS解析失败(res=%d) → 热点/运营商DNS解析不到onrender.com\n", dnsRes);
+} else {
+Serial.printf("[NET-PROBE] DNS解析成功: %s\n", renderIP.toString().c_str());
+WiFiClientSecure probe;
+probe.setInsecure();
+probe.setTimeout(8000);
+bool ok = probe.connect("blindstick-4.onrender.com", 443);
+if (ok) {
+Serial.println("[NET-PROBE] TCP+TLS连接成功 → 网络层OK，下载-1是别的原因");
+probe.stop();
+} else {
+Serial.println("[NET-PROBE] TCP+TLS连接失败 → 热点/运营商挡了ESP32到Render的443");
+}
+}
+Serial.println("[NET-PROBE] 结束\n");
+}
 // ==================== 工具函数 ====================
 /**
 * 从文本中提取目的地
@@ -2151,11 +2069,37 @@ return destination;
 */
 bool searchNearestDestination(const char* keyword, float& outLat, float& outLng, String& outName, float& outDistance) {
 if (WiFi.status() != WL_CONNECTED) return false;
-// 【诊断】打印搜索起点，确认常住地/GPS状态（GPS=0,0 会走下面"GPS未定位"分支）
-Serial.printf("[导航] 搜索[%s] region=[%s] GPS=%.6f,%.6f\n", keyword, home_city.c_str(), gps_lat, gps_lng);
-// 【修复】先检查GPS是否有效（未定位就不浪费一次地图请求+20秒等待）
+WiFiClientSecure client;
+client.setInsecure();
+client.setTimeout(15000);
+HTTPClient http;
+// 【代理】地点搜索改走Render后端 /api/places（热点拦ESP32直连百度地图API）
+String url = "https://blindstick-4.onrender.com/api/places?query=" + urlEncode(keyword) +
+"&region=" + urlEncode(home_city.c_str());
+if (!http.begin(client, url)) return false;
+http.setTimeout(15000);
+http.setReuse(false);
+int httpCode = http.GET();
+if (httpCode != 200) {
+http.end();
+return false;
+}
+String response = http.getString();
+StaticJsonDocument<2048> doc;
+DeserializationError error = deserializeJson(doc, response);
+if (error || doc["status"] != 0) {
+http.end();
+return false;
+}
+JsonArray results = doc["results"];
+if (results.size() == 0) {
+http.end();
+return false;
+}
+// 计算当前位置 - 使用实时GPS数据，不再硬编码
 float currentLat = gps_lat;
 float currentLng = gps_lng;
+// 检查GPS是否有效
 if (currentLat < 1.0 || currentLng < 1.0) {
 Serial.println("[导航] GPS未定位，无法搜索目的地");
 // 播报GPS未定位提示
@@ -2164,40 +2108,7 @@ doc["text"] = "GPS未定位，请等待卫星信号";
 doc["priority"] = PRIO_NORMAL;
 char buf[256];
 size_t len = serializeJson(doc, buf, sizeof(buf));
-mqttPublish("blindstick/tts/request", buf, len);
-return false;
-}
-// 【代理·MQTT】地点搜索改走MQTT（热点挡ESP32→Render 443，MQTT走8883没被挡）
-if (!mqtt.connected()) {
-Serial.println("[导航] MQTT未连接，无法搜索地点");
-return false;
-}
-StaticJsonDocument<256> reqDoc;
-reqDoc["query"] = keyword;
-reqDoc["region"] = home_city;
-char reqBuf[384];
-size_t reqLen = serializeJson(reqDoc, reqBuf, sizeof(reqBuf));
-mqttPublish("blindstick/places/request", reqBuf, reqLen);
-// 等待结果（最长20秒，MQTT回调在主线任务填 places_result_ready）
-places_result_ready = false;
-places_result_buf[0] = '\0';
-unsigned long waitStart = millis();
-while (millis() - waitStart < 20000) {
-if (places_result_ready) break;
-vTaskDelay(200 / portTICK_PERIOD_MS);
-}
-if (!places_result_ready) {
-Serial.println("[导航] 地点搜索等待超时");
-return false;
-}
-String response = String(places_result_buf);
-StaticJsonDocument<2048> doc;
-DeserializationError error = deserializeJson(doc, response);
-if (error || doc["status"] != 0) {
-return false;
-}
-JsonArray results = doc["results"];
-if (results.size() == 0) {
+mqtt.publish("blindstick/tts/request", buf, len);
 return false;
 }
 Serial.printf("[导航] 当前位置: %.6f, %.6f\n", currentLat, currentLng);
@@ -2220,6 +2131,7 @@ outLat = nearest["location"]["lat"];
 outLng = nearest["location"]["lng"];
 outName = nearest["name"].as<String>();
 outDistance = minDistance;
+http.end();
 return true;
 }
 /**
@@ -2235,33 +2147,27 @@ if (originLat < 1.0 || originLng < 1.0) {
 Serial.println("[导航] GPS未定位，无法规划路线");
 return false;
 }
-// 【代理·MQTT】路线规划改走MQTT（热点挡ESP32→Render 443，MQTT走8883没被挡）
-if (!mqtt.connected()) {
-Serial.println("[导航] MQTT未连接，无法规划路线");
+WiFiClientSecure client;
+client.setInsecure();
+client.setTimeout(15000);
+HTTPClient http;
+// 【代理】路线规划改走Render后端 /api/directions（热点拦ESP32直连百度地图API）
+String url = "https://blindstick-4.onrender.com/api/directions?origin=" +
+String(originLat, 6) + "," + String(originLng, 6) +
+"&destination=" + String(destLat, 6) + "," + String(destLng, 6);
+if (!http.begin(client, url)) return false;
+http.setTimeout(15000);
+http.setReuse(false);
+int httpCode = http.GET();
+if (httpCode != 200) {
+http.end();
 return false;
 }
-StaticJsonDocument<256> reqDoc;
-reqDoc["origin"] = String(originLat, 6) + "," + String(originLng, 6);
-reqDoc["destination"] = String(destLat, 6) + "," + String(destLng, 6);
-char reqBuf[384];
-size_t reqLen = serializeJson(reqDoc, reqBuf, sizeof(reqBuf));
-mqttPublish("blindstick/directions/request", reqBuf, reqLen);
-// 等待结果（最长20秒，MQTT回调在主线任务填 directions_result_ready）
-directions_result_ready = false;
-directions_result_buf[0] = '\0';
-unsigned long waitStart = millis();
-while (millis() - waitStart < 20000) {
-if (directions_result_ready) break;
-vTaskDelay(200 / portTICK_PERIOD_MS);
-}
-if (!directions_result_ready) {
-Serial.println("[导航] 路线规划等待超时");
-return false;
-}
-String response = String(directions_result_buf);
+String response = http.getString();
 StaticJsonDocument<4096> doc;
 DeserializationError error = deserializeJson(doc, response);
 if (error || doc["status"] != 0) {
+http.end();
 return false;
 }
 JsonObject route = doc["result"]["routes"][0];
@@ -2284,16 +2190,17 @@ current_destination = destName;  // 【新增】保存当前目的地用于MQTT�
 current_step_idx = 0;
 current_progress = 0;
 // 播报导航开始 - 使用流式TTS
-char navText[512];
+char navText[256];
 snprintf(navText, sizeof(navText), "开始导航到%s，全程%d米，预计%d分钟，%s",
 destName.c_str(), distance, duration / 60, nav_steps[0].c_str());
 // 通过MQTT发送给代理服务器进行流式TTS
-StaticJsonDocument<768> ttsDoc;
+StaticJsonDocument<512> ttsDoc;
 ttsDoc["text"] = navText;
 ttsDoc["priority"] = PRIO_NORMAL;
-char buf[768];
+char buf[512];
 size_t len = serializeJson(ttsDoc, buf, sizeof(buf));
-mqttPublish("blindstick/tts/request", buf, len);
+mqtt.publish("blindstick/tts/request", buf, len);
+http.end();
 return true;
 }
 /**
@@ -2314,28 +2221,7 @@ if (mqtt.connected()) {
     resDoc["ts"] = millis();
     char resBuf[256];
     size_t resLen = serializeJson(resDoc, resBuf, sizeof(resBuf));
-    mqttPublish("blindstick/voice/result", resBuf, resLen);
-}
-// 【新增】取消导航：用户随时可中止当前导航（此前只能等"导航完成"或重启）
-{
-String cmd = String(text);
-if (cmd.indexOf("取消") >= 0 || cmd.indexOf("停止") >= 0 || cmd.indexOf("结束导航") >= 0) {
-if (nav_active) {
-nav_active = false;
-current_destination = "";
-nav_total_steps = 0;
-Serial.println("[导航] 已取消导航");
-StaticJsonDocument<256> doc;
-doc["text"] = "好的，已取消导航";
-doc["priority"] = PRIO_NORMAL;
-char buf[256];
-size_t len = serializeJson(doc, buf, sizeof(buf));
-mqttPublish("blindstick/tts/request", buf, len);
-} else {
-Serial.println("[语音识别] 当前没有进行中的导航");
-}
-return;
-}
+    mqtt.publish("blindstick/voice/result", resBuf, resLen);
 }
 // 提取目的地
 String destination = extractDestination(text);
@@ -2344,6 +2230,10 @@ if (destination.length() < 2) {
 Serial.println("[语音识别] 无触发词，忽略");
 // 【新增】提示音：没听懂就"嘀"一声让用户重说（TTS播放中不响，避免抢扬声器）
 if (!is_ai_talking) playLocalStartupTone();
+return;
+}
+if (destination.length() < 2) {
+Serial.println("[语音识别] 未提取到有效目的地");
 return;
 }
 Serial.printf("[语音识别] 目的地: %s\n", destination.c_str());
@@ -2357,8 +2247,7 @@ doc["text"] = "抱歉，没有找到该地点，请重新说出目的地";
 doc["priority"] = PRIO_NORMAL;
 char buf[256];
 size_t len = serializeJson(doc, buf, sizeof(buf));
-mqttPublish("blindstick/tts/request", buf, len);
-Serial.println("[导航] 播报：没有找到该地点");  // 【诊断】确认已发出提示
+mqtt.publish("blindstick/tts/request", buf, len);
 return;
 }
 // 检查距离是否太远（超过10公里）
@@ -2370,7 +2259,7 @@ doc["text"] = msg;
 doc["priority"] = PRIO_NORMAL;
 char buf[256];
 size_t len = serializeJson(doc, buf, sizeof(buf));
-mqttPublish("blindstick/tts/request", buf, len);
+mqtt.publish("blindstick/tts/request", buf, len);
 // 不设置nav_active，继续监听新的语音输入
 Serial.println("[导航] 目的地超过10公里，继续监听...");
 return;
@@ -2386,9 +2275,195 @@ doc["text"] = "路线规划失败，请重试";
 doc["priority"] = PRIO_NORMAL;
 char buf[256];
 size_t len = serializeJson(doc, buf, sizeof(buf));
-mqttPublish("blindstick/tts/request", buf, len);
-Serial.println("[导航] 播报：路线规划失败");  // 【诊断】确认已发出提示
+mqtt.publish("blindstick/tts/request", buf, len);
 }
+}
+// ==================== TTS URL处理（下载并播放）====================
+// ==================== TTS URL 异步播放任务 ====================
+void TTSUrlPlayerTask(void* pvParameters) {
+    TTSUrlMsg msg;
+    while (true) {
+        if (xQueueReceive(ttsUrlQueue, &msg, portMAX_DELAY) == pdTRUE) {
+            handleTTSUrlDownload(&msg);
+        }
+    }
+}
+
+// ==================== TTS URL下载并播放（由独立任务调用）====================
+void handleTTSUrlDownload(const TTSUrlMsg* msg) {
+    const char* url = msg->url;
+    const char* text = msg->text;
+    int ttsPriority = msg->priority;
+    // 去重：基于文本内容 + 3秒时间窗口
+    static String lastText = "";
+    static unsigned long lastPlayTime = 0;
+    String currentText = text ? String(text) : "";
+unsigned long now = millis();
+if (currentText == lastText && (now - lastPlayTime) < 3000) {
+Serial.println("[TTS-URL] 3秒内重复文本，跳过播放");
+return;
+}
+lastText = currentText;
+lastPlayTime = now;
+Serial.printf("[TTS-URL] 收到URL，开始下载...\n");
+// HTTP下载音频 - 优化超时设置
+WiFiClientSecure client;
+client.setInsecure();
+client.setTimeout(20000);  // 增加到20秒，给大文件足够时间
+HTTPClient http;
+if (!http.begin(client, url)) {
+Serial.println("[TTS-URL] HTTP初始化失败");
+setTTSRequesting(false);  // 重置标志return;
+}
+http.setTimeout(25000);  // 增加到25秒
+int httpCode = http.GET();
+if (httpCode != 200) {
+Serial.printf("[TTS-URL] 下载失败: %d\n", httpCode);
+http.end();
+setTTSRequesting(false);  // 【修复】重置TTS状态return;
+}
+int len = http.getSize();
+if (len <= 0 || len > 200000) {  // 【修复】限制最大200KB（120KB太短，开机语音约128KB被拒）
+Serial.printf("[TTS-URL] 音频大小无效或太大: %d\n", len);
+http.end();setTTSRequesting(false);  // 【修复】重置TTS状态
+return;
+}
+// 检查可用内存（使用ESP-IDF风格API）
+size_t freeHeap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+size_t freePsram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+// 分配内存（优先使用PSRAM）
+uint8_t* audioBuffer = NULL;
+if (freePsram > len + 10000) {
+audioBuffer = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+} else if (freeHeap > len + 50000) {
+audioBuffer = (uint8_t*)malloc(len);
+} else {
+http.end();
+setTTSRequesting(false);  // 【修复】重置TTS状态return;
+}
+if (!audioBuffer) {
+Serial.println("[TTS-URL] 内存分配失败");
+http.end();
+setTTSRequesting(false);  // 【修复】重置TTS状态return;
+}
+// 读取数据 - 使用更大的缓冲区
+WiFiClient* stream = http.getStreamPtr();
+int totalRead = 0;
+int bufferSize = 8192;  // 增大到8KB缓冲区，提高下载效率
+unsigned long downloadStart = millis();
+unsigned long lastDataTime = millis();  // 上次收到数据的时间
+const unsigned long DOWNLOAD_TIMEOUT_MS = 30000;  // 增加到30秒总超时
+const unsigned long DATA_TIMEOUT_MS = 10000;      // 10秒无数据超时
+Serial.printf("[TTS-URL] 开始下载，大小:%d字节\n", len);
+while (totalRead < len) {
+// 检查连接状态
+if (!stream->connected()) {
+Serial.println("[TTS-URL] 连接断开");
+break;
+}
+int available = stream->available();
+if (available > 0) {
+int toRead = min(available, min(bufferSize, len - totalRead));
+int r = stream->readBytes(audioBuffer + totalRead, toRead);
+if (r > 0) {
+totalRead += r;
+lastDataTime = millis();  // 更新最后数据时间
+// 每下载10KB打印进度
+if (totalRead % 10240 == 0 || totalRead == len) {
+Serial.printf("[TTS-URL] 下载进度: %d/%d (%.1f%%)\n",
+totalRead, len, (float)totalRead / len * 100);
+}
+}
+} else {
+// 没有数据可用，短暂等待
+delay(5);
+}
+// 总超时检查
+if (millis() - downloadStart > DOWNLOAD_TIMEOUT_MS) {
+Serial.printf("[TTS-URL] 下载总超时(>%ds)，已下载:%d/%d\n",
+DOWNLOAD_TIMEOUT_MS/1000, totalRead, len);
+break;
+}
+// 无数据超时检查（防止卡在半途中）
+if (millis() - lastDataTime > DATA_TIMEOUT_MS) {
+Serial.printf("[TTS-URL] 数据接收超时(>%ds无数据)，已下载:%d/%d\n",
+DATA_TIMEOUT_MS/1000, totalRead, len);
+break;
+}
+if (totalRead >= len) break;
+// 喂狗，防止看门狗复位
+yield();
+}
+http.end();
+if (totalRead != len) {
+float percent = (float)totalRead / len * 100;
+Serial.printf("[TTS-URL] 下载不完整: %d/%d (%.1f%%)\n", totalRead, len, percent);
+// 如果下载了超过80%，尝试播放已下载的部分
+if (totalRead > len * 0.8 && totalRead > 10240) {
+Serial.println("[TTS-URL] 下载超过80%，尝试播放...");
+// 跳过WAV头并播放
+int offset = 0;
+if (totalRead > 44 && audioBuffer[0] == 'R' && audioBuffer[1] == 'I') {
+offset = 44;
+}
+
+// 【新增】播放前障碍物状态检查（与完整下载分支一致）
+if (ttsPriority >= PRIO_HIGH) {
+    float curF = dir_smt[0];
+    float curL = dir_smt[1];
+    float curR = dir_smt[2];
+    bool obstacleGone = (curF > 180.0f) && (curL > 150.0f) && (curR > 150.0f);
+    if (obstacleGone) {
+        Serial.printf("[TTS-URL] 障碍物已消失(F:%.0f L:%.0f R:%.0f)，跳过播放\n", curF, curL, curR);
+        free(audioBuffer);
+        setTTSRequesting(false);        return;
+    }
+}
+
+snprintf(lastPlayedTtsText, sizeof(lastPlayedTtsText), "%s", text ? text : "");
+playPcmData(audioBuffer + offset, totalRead - offset);
+free(audioBuffer);
+Serial.println("[TTS-URL] 播放完成(部分下载)");
+// 重置TTS请求标志
+setTTSRequesting(false);
+ttsPlayEndTime = millis();  // 【新增】记录播放结束时间，进入静默期
+return;
+}
+// 下载太少，放弃并释放内存
+free(audioBuffer);
+// 重置TTS请求标志
+setTTSRequesting(false);return;
+}
+Serial.printf("[TTS-URL] 下载完成，播放中...\n");
+// 跳过WAV头并播放
+int offset = 0;
+if (len > 44 && audioBuffer[0] == 'R' && audioBuffer[1] == 'I') {
+offset = 44;
+}
+
+// 【新增】播放前障碍物状态检查
+// 由于TTS合成+下载有延迟(约10秒)，播放时障碍物可能已经消失
+// 如果是避障告警(高优先级)且当前三个方向都安全，则跳过播放
+if (ttsPriority >= PRIO_HIGH) {
+    float curF = dir_smt[0];
+    float curL = dir_smt[1];
+    float curR = dir_smt[2];
+    // 使用比告警阈值更宽松的安全判定（避免边缘抖动误判）
+    bool obstacleGone = (curF > 180.0f) && (curL > 150.0f) && (curR > 150.0f);
+    if (obstacleGone) {
+        Serial.printf("[TTS-URL] 障碍物已消失(F:%.0f L:%.0f R:%.0f)，跳过播放\n", curF, curL, curR);
+        free(audioBuffer);
+        setTTSRequesting(false);        return;
+    }
+}
+
+snprintf(lastPlayedTtsText, sizeof(lastPlayedTtsText), "%s", text ? text : "");
+playPcmData(audioBuffer + offset, len - offset);
+free(audioBuffer);
+Serial.println("[TTS-URL] 播放完成");
+// 重置TTS请求标志（播放完成，可以发送下一个请求）
+setTTSRequesting(false);
+ttsPlayEndTime = millis();  // 【新增】记录播放结束时间，进入静默期
 }
 // ==================== 流式TTS实现（MQTT分片重装 + 独立播放任务）====================
 void initStreamingTTS() {
@@ -2459,7 +2534,7 @@ memcpy(tts_pcm_buf + tts_pcm_len, payload, length);
 tts_pcm_len += length;
 }
 void handleStreamControl(const char* payload, int length) {
-StaticJsonDocument<512> doc;   // 【修复】256→512：stream_start 现在携带 text 字段（中文UTF-8每字3字节），256会池溢出导致解析失败、TTS会话起不来
+StaticJsonDocument<256> doc;
 DeserializationError err = deserializeJson(doc, payload, length);
 if (err) {
 Serial.println("[流式TTS] 控制消息解析失败");
@@ -2473,20 +2548,14 @@ Serial.printf("[流式TTS] 开始新会话 priority=%s session=%lu\n",
 getPrioName(new_priority), session_id);
 // 新会话一律清空待播队列，避免旧音频串台
 purgeTTSQueue();
-// 正在播放时：同/高优先级打断；低优先级不丢弃，播完当前的再播
-// 【修复】此前低优先级直接 return 丢弃——导航回复/GPS提示在避障播报期间被吞，用户听不到任何反馈
+// 正在播放时：同/高优先级打断，低优先级忽略
 if (is_ai_talking) {
 if (new_priority < stream_priority) {
-// 当前会话还在收分片（tts_pcm_buf 被占用）时拒绝低优先级，避免冲掉高优先级半成品
-if (tts_pcm_assembling) {
-Serial.printf("[流式TTS] 当前正在收音频，低优先级%s稍后再说\n", getPrioName(new_priority));
+Serial.printf("[流式TTS] 忽略低优先级%s\n", getPrioName(new_priority));
 return;
 }
-Serial.printf("[流式TTS] 低优先级%s排队等播\n", getPrioName(new_priority));
-} else {
 i2s_zero_dma_buffer(I2S_PORT_OUT);
 Serial.printf("[流式TTS] 打断当前%s播放\n", getPrioName(stream_priority));
-}
 }
 stream_playing = true;
 stream_priority = new_priority;
@@ -2495,9 +2564,6 @@ tts_pcm_assembling = true;
 tts_pcm_len = 0;
 is_ai_talking = true;  // 抑制避障重复播报
 ai_talking_start_time = millis();
-// 【修复】记录本次TTS文本供 isTtsEcho 回声过滤：此前MQTT流式路径漏记，
-// 喇叭声被麦克风收回后会被当成语音命令执行，是"语音识别不准确"的一大来源
-snprintf(lastPlayedTtsText, sizeof(lastPlayedTtsText), "%s", doc["text"] | "");
 if (VoiceTaskHandle != NULL) {
 vTaskSuspend(VoiceTaskHandle);
 }

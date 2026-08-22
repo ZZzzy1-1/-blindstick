@@ -374,9 +374,6 @@ function connectMQTT() {
                 }
             });
         });
-
-        // 【修复】MQTT重连后补发常住地设置（retain:true），防止网页掉线期间保存的设置丢失
-        publishHomeCity();
     });
 
     mqttClient.on('message', async (topic, payload) => {
@@ -1356,9 +1353,14 @@ function saveSettings() {
     API_CONFIG.homeCity = newCity;
     AppState.config.homeCity = newCity;
 
-    // 【修复】统一走 publishHomeCity()：retain:true 让 broker 记住最新设置，
-    // ESP32 离线/重启后重新订阅时能收到，不会丢；重连时也会自动补发
-    publishHomeCity();
+    if (mqttClient && AppState.mqttConnected) {
+        const msg = JSON.stringify({
+            type: 'home_city_update',
+            city: newCity,
+            ts: Date.now()
+        });
+        mqttClient.publish('blindstick/config/home_city', msg);
+    }
 
     const currentCityDiv = document.getElementById('currentHomeCity');
     if (currentCityDiv) {
@@ -1375,23 +1377,6 @@ function loadHomeCitySettings() {
         API_CONFIG.homeCity = savedCity;
         AppState.config.homeCity = savedCity;
     }
-}
-
-// 【修复】发布常住地设置到MQTT。retain:true —— broker 保存最新值，ESP32 每次连接/重连
-// 订阅 blindstick/config/home_city 时都会收到，彻底解决"网页设置了但ESP32仍是默认城市"。
-function publishHomeCity() {
-    if (!mqttClient || !AppState.mqttConnected) {
-        console.log('[MQTT] 未连接，跳过常住地补发');
-        return;
-    }
-    const city = API_CONFIG.homeCity || '黄石市';
-    const msg = JSON.stringify({
-        type: 'home_city_update',
-        city: city,
-        ts: Date.now()
-    });
-    mqttClient.publish('blindstick/config/home_city', msg, { retain: true });
-    console.log('[MQTT] 已发布常住地设置:', city);
 }
 
 // ================= 手动重连 MQTT =================
