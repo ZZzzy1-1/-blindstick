@@ -211,6 +211,7 @@ const char* getPrioName(int p);
 // 流式语音识别相关
 void VoiceRecognitionTask(void* pvParameters);
 String doVoiceRecognition();
+String getBaiduToken();  // 百度access_token获取（带缓存）
 void handleVoiceCommand(const char* text);
 String base64Encode(const uint8_t* data, size_t len);  // Base64编码
 size_t base64ToBuffer(const uint8_t* data, size_t len, char* out);  // Base64写缓冲区（省内部堆）
@@ -1752,14 +1753,24 @@ vTaskDelay(500 / portTICK_PERIOD_MS);
 }
 }
 /**
-* 语音识别主函数（录音3秒，REST API）
+* 语音识别主函数（固定录音1秒，直接HTTPS到百度server_api）
 * 返回值：识别到的文本，空字符串表示未识别
 */
 String doVoiceRecognition() {
-    // 【修复】INMP441输出32bit I2S，录音3秒原始数据 = 16000*4*3 = 192KB
-    const int RECORD_SECONDS = 3;
-    const int RAW_RECORD_BYTES = 16000 * 4 * RECORD_SECONDS;  // 32bit原始数据
-    const int PCM_RECORD_BYTES = 16000 * 2 * RECORD_SECONDS;   // 转换后的16bit PCM
+    // 【准确版移植】固定录音1秒 + 直接HTTPS上传百度（不再VAD动态门控/MQTT分片）
+    // 注：INMP441为32bit I2S，录音后需转16bit PCM再base64
+    const int RECORD_SECONDS = 1;
+    const int RAW_RECORD_BYTES = 16000 * 4 * RECORD_SECONDS;  // 32bit原始数据 64KB
+    const int PCM_RECORD_BYTES = 16000 * 2 * RECORD_SECONDS;   // 转换后的16bit PCM 32KB
+
+    // 【保留】电机运行时噪声巨大，跳过录音（防电机声被当人声误触发）
+    if (motorPowerNow != 0) {
+        return "";
+    }
+    // 【保留】TTS播完后的喇叭余音期跳过录音（防喇叭余音被识别成胡话）
+    if (millis() - ttsPlayEndTime < TTS_TAIL_GUARD_MS) {
+        return "";
+    }
 
     uint8_t* rawBuffer = NULL;
     size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
@@ -1774,124 +1785,16 @@ String doVoiceRecognition() {
         return "";
     }
 
-    // 【VAD录音】不再固定录3秒，检测到说话才开始捕获、停嘴约0.5秒即结束发送
-    // 阈值与分块参数（串口会打印静音能量，便于调节阈值）
-    const int VOICE_AVG_THRESHOLD = 120;              // 块内|样本|均值超过该值判定为有声
-    const size_t VAD_BLOCK_BYTES = 640 * 4;           // 40ms @16kHz 32bit = 2560字节
-    const int START_BLOCKS = 2;                       // 连续2块有声才确认说话（抗突发噪声）
-    const int END_SILENT_BLOCKS = 12;                 // 连续12块(480ms)静音视为说完
-    const int MIN_SPEECH_MS = 300;                    // 最短语音300ms，更短视为噪声
-    const unsigned long NO_SPEECH_TIMEOUT_MS = 10000; // 10秒无人说话则退出本轮继续监听
-
-    uint8_t* blockBuf = (uint8_t*)malloc(VAD_BLOCK_BYTES);
-    if (!blockBuf) {
-        free(rawBuffer);
-        Serial.println("[语音诊断] VAD块缓冲分配失败");
-        return "";
+    // 固定录音1秒（非阻塞i2s_read循环，最多1秒或读满即停）
+    size_t totalRead = 0;
+    unsigned long startTime = millis();
+    while (millis() - startTime < RECORD_SECONDS * 1000 && totalRead < RAW_RECORD_BYTES) {
+        size_t bytesRead = 0;
+        i2s_read(I2S_PORT, rawBuffer + totalRead, RAW_RECORD_BYTES - totalRead, &bytesRead, 50);
+        totalRead += bytesRead;
     }
-    size_t capturedBytes = 0;   // 已捕获的32bit字节数
-    int speechMs = 0;           // 语音时长（仅计有声块）
-    int totalMs = 0;            // 本段总时长（含末尾静音，用于3秒上限）
-    int silentBlocks = 0;
-    int state = 0;              // 0=静音 1=疑似开始 2=语音中
-    bool speechStarted = false;
-    unsigned long vadStart = millis();
 
-    while (true) {
-        // 超时保护：麦克风无声/异常时避免卡死
-        if (!speechStarted && (millis() - vadStart > NO_SPEECH_TIMEOUT_MS)) break;
-        size_t got = 0;
-        esp_err_t e = i2s_read(I2S_PORT, blockBuf, VAD_BLOCK_BYTES, &got, 100);
-        if (e != ESP_OK || got < VAD_BLOCK_BYTES / 2) continue;   // 数据不足，等下一块
-        int n = got / 4;
-        int32_t* s32 = (int32_t*)blockBuf;
-        long long sum = 0;
-        for (int i = 0; i < n; i++) {
-            int32_t v = s32[i] >> 14;
-            if (v < 0) v = -v;
-            sum += v;
-        }
-        int avg = (int)(sum / n);
-        int blockMs = n * 1000 / SAMPLE_RATE;
-        bool voiced = (avg > VOICE_AVG_THRESHOLD);
-
-        // 【修复】电机运行时噪声巨大（能量1000+远超语音），跳过本块不触发录音，
-        // 避免把电机声当人声。本块已被i2s_read消费，不会积压陈旧音频。
-        if (motorPowerNow != 0) {
-            static unsigned long lastMotorVad = 0;
-            if (millis() - lastMotorVad > 3000) {
-                lastMotorVad = millis();
-                Serial.printf("[语音诊断] 电机运行(功率%d)，跳过录音\n", motorPowerNow);
-            }
-            continue;
-        }
-
-        // 【修复】TTS播完后的喇叭余音/残留DMA音频会被当成语音，识别成胡话（如"我宁愿爱我运动"）。
-        //         播放期间VoiceTask被挂起不会录音，但恢复录音的瞬间喇叭还在响/缓冲里还有播放音频，
-        //         余音保护期内跳过录音，给喇叭静下来留时间。
-        if (millis() - ttsPlayEndTime < TTS_TAIL_GUARD_MS) {
-            static unsigned long lastTtsTailVad = 0;
-            if (millis() - lastTtsTailVad > 3000) {
-                lastTtsTailVad = millis();
-                Serial.printf("[语音诊断] TTS余音期跳过录音(剩%lu ms)\n",
-                              TTS_TAIL_GUARD_MS - (millis() - ttsPlayEndTime));
-            }
-            continue;
-        }
-
-        if (state == 0) {
-            // 静音中：每2秒打印一次能量，便于调试麦克风增益/阈值
-            static unsigned long lastE = 0;
-            if (millis() - lastE > 2000) {
-                lastE = millis();
-                Serial.printf("[语音诊断] VAD静音 能量=%d 阈值=%d\n", avg, VOICE_AVG_THRESHOLD);
-            }
-            if (voiced) { state = 1; silentBlocks = 0; }
-            continue;
-        }
-        if (state == 1) {
-            if (voiced) {
-                // 确认开口，开始捕获
-                state = 2; speechStarted = true;
-                speechMs = blockMs; totalMs = blockMs;
-                memcpy(rawBuffer, blockBuf, got);
-                capturedBytes = got;
-            } else if (++silentBlocks >= START_BLOCKS) {
-                state = 0;   // 突发噪声，误触发
-            }
-            continue;
-        }
-        // state==2 语音中
-        if (voiced) {
-            if (capturedBytes + got <= RAW_RECORD_BYTES) {
-                memcpy(rawBuffer + capturedBytes, blockBuf, got);
-                capturedBytes += got;
-            }
-            speechMs += blockMs;
-            totalMs += blockMs;
-            silentBlocks = 0;
-        } else {
-            totalMs += blockMs;
-            if (++silentBlocks >= END_SILENT_BLOCKS) {
-                if (speechMs >= MIN_SPEECH_MS) break;       // 说完，末尾静音未记录
-                // 过短视为噪声，丢弃并回到静音监听
-                state = 0; speechStarted = false;
-                capturedBytes = 0; speechMs = 0; totalMs = 0;
-                Serial.println("[语音诊断] VAD捕获过短(噪声)，丢弃");
-            }
-        }
-        if (totalMs >= RECORD_SECONDS * 1000) break;   // 3秒上限
-    }
-    free(blockBuf);
-    size_t rawRead = capturedBytes;
-    if (rawRead < VAD_BLOCK_BYTES / 2) {
-        Serial.println("[语音诊断] VAD未捕获到语音，继续监听...");
-        free(rawBuffer);
-        return "";
-    }
-    Serial.printf("[语音诊断] VAD捕获语音 %dms %d字节\n", speechMs, (int)rawRead);
-
-    // 分配16bit PCM缓冲区（优先PSRAM，减少内部堆压力）
+    // 32bit I2S → 16bit PCM 转换（右移14位，与测试代码一致）
     uint8_t* pcmBuffer = (uint8_t*)heap_caps_malloc(PCM_RECORD_BYTES, MALLOC_CAP_SPIRAM);
     if (!pcmBuffer) {
         pcmBuffer = (uint8_t*)malloc(PCM_RECORD_BYTES);
@@ -1901,11 +1804,9 @@ String doVoiceRecognition() {
         Serial.println("[语音诊断] PCM缓冲区分配失败");
         return "";
     }
-
-    // 32bit I2S → 16bit PCM 转换（右移14位，与测试代码一致）
     int32_t* rawSamples = (int32_t*)rawBuffer;
     int16_t* pcmSamples = (int16_t*)pcmBuffer;
-    int rawSampleCount = rawRead / 4;
+    int rawSampleCount = totalRead / 4;
     int pcmSampleCount = (rawSampleCount < RECORD_SECONDS * 16000) ? rawSampleCount : RECORD_SECONDS * 16000;
     for (int i = 0; i < pcmSampleCount; i++) {
         int32_t sample = rawSamples[i] >> 14;
@@ -1913,19 +1814,13 @@ String doVoiceRecognition() {
         if (sample < -32768) sample = -32768;
         pcmSamples[i] = (int16_t)sample;
     }
-    size_t totalRead = pcmSampleCount * 2;  // 16bit字节数
+    size_t totalPCM = pcmSampleCount * 2;  // 16bit字节数
     free(rawBuffer);
 
-    // 检查录音数据是否有效（避免静音）
+    // 静音门控：非静音样本<100视为无效录音
     int nonZeroCount = 0;
     for (int i = 0; i < pcmSampleCount; i++) {
         if (pcmSamples[i] > 100 || pcmSamples[i] < -100) nonZeroCount++;
-    }
-    // 【诊断】每5秒打印一次录音统计
-    static unsigned long lastDiagTime = 0;
-    if (millis() - lastDiagTime > 5000) {
-        lastDiagTime = millis();
-        Serial.printf("[语音诊断] 录音:%d字节 非静音样本:%d\n", totalRead, nonZeroCount);
     }
     if (nonZeroCount < 100) {
         Serial.printf("[语音诊断] 录音静音(nonZero=%d)，跳过识别\n", nonZeroCount);
@@ -1933,8 +1828,8 @@ String doVoiceRecognition() {
         return "";
     }
 
-    // 【内存修复】base64+JSON改用PSRAM/堆缓冲，避免大String占内部堆挤掉MQTT的TLS连接
-    size_t b64Cap = ((totalRead + 2) / 3) * 4 + 1;
+    // base64编码（写入PSRAM/堆缓冲，避免大String占内部堆）
+    size_t b64Cap = ((totalPCM + 2) / 3) * 4 + 1;
     char* b64Buf = (char*)heap_caps_malloc(b64Cap, MALLOC_CAP_SPIRAM);
     if (!b64Buf) {
         b64Buf = (char*)malloc(b64Cap);
@@ -1944,57 +1839,116 @@ String doVoiceRecognition() {
         Serial.println("[语音诊断] Base64缓冲分配失败");
         return "";
     }
-    // 【代理ASR·MQTT】改走MQTT分片上传到Render后端转发百度（热点挡了ESP32→Render 443，
-    //  HTTP ASR连不上；MQTT走8883没被挡）。协议: start信封→base64分片(≤6000字节)→end信封→等 blindstick/asr/result
-    if (!mqtt.connected()) {
+    size_t b64Len = base64ToBuffer(pcmBuffer, totalPCM, b64Buf);
+    free(pcmBuffer);
+    Serial.printf("[语音诊断] 上传ASR: PCM=%d字节 base64=%d字节\n", (int)totalPCM, (int)b64Len);
+
+    // 获取百度token（带缓存，提前5分钟过期）
+    String token = getBaiduToken();
+    if (token.length() == 0) {
         free(b64Buf);
-        free(pcmBuffer);
-        Serial.println("[语音诊断] MQTT未连接，无法上传ASR");
+        Serial.println("[语音诊断] 百度token获取失败");
         return "";
     }
-    size_t b64Len = base64ToBuffer(pcmBuffer, totalRead, b64Buf);
-    free(pcmBuffer);
-    Serial.printf("[语音诊断] 上传ASR: PCM=%d字节 base64=%d字节\n", (int)totalRead, (int)b64Len);
 
-    // 1) start信封（携带PCM字节数，代理据此与解码长度核对）
-    char metaBuf[96];
-    snprintf(metaBuf, sizeof(metaBuf), "{\"type\":\"start\",\"len\":%u}", (unsigned)totalRead);
-    mqttPublish("blindstick/asr/upload", metaBuf);
-
-    // 2) base64分片（每片<8192字节MQTT缓冲，QoS0按序投递由代理端追加）
-    const size_t ASR_CHUNK = 6000;
-    for (size_t off = 0; off < b64Len; off += ASR_CHUNK) {
-        size_t n = (b64Len - off > ASR_CHUNK) ? ASR_CHUNK : (b64Len - off);
-        if (!mqttPublish("blindstick/asr/upload", b64Buf + off, n)) {
-            Serial.println("[语音诊断] ASR分片发布失败");
-            break;
-        }
+    // 组装JSON请求体（PSRAM优先）
+    size_t jsonCap = b64Len + 256;
+    char* jsonBuf = (char*)heap_caps_malloc(jsonCap, MALLOC_CAP_SPIRAM);
+    if (!jsonBuf) {
+        jsonBuf = (char*)malloc(jsonCap);
     }
-    // 3) end信封：触发代理调百度识别
-    mqttPublish("blindstick/asr/upload", "{\"type\":\"end\"}");
+    if (!jsonBuf) {
+        free(b64Buf);
+        Serial.println("[语音诊断] JSON缓冲分配失败");
+        return "";
+    }
+    int plen = snprintf(jsonBuf, jsonCap,
+        "{\"format\":\"pcm\",\"rate\":16000,\"channel\":1,\"cuid\":\"esp32_blindstick\",\"token\":\"%s\",\"dev_pid\":1537,\"speech\":\"%s\",\"len\":%u}",
+        token.c_str(), b64Buf, (unsigned)totalPCM);
     free(b64Buf);
 
-    // 4) 等待识别结果（最长20秒，MQTT回调在主线任务填 asr_result_ready）
-    asr_result_ready = false;
-    unsigned long waitStart = millis();
-    while (millis() - waitStart < 20000) {
-        if (asr_result_ready) break;
-        vTaskDelay(200 / portTICK_PERIOD_MS);
-    }
+    // 直接HTTPS POST 百度server_api
     String result = "";
-    if (asr_result_ready) {
-        result = String(asr_result_text);
-        asr_result_ready = false;
-        // 去除标点符号
-        result.replace("。", "");
-        result.replace("，", "");
-        result.replace("？", "");
-        result.replace("！", "");
-        result.trim();
-    } else {
-        Serial.println("[语音诊断] ASR结果等待超时");
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setHandshakeTimeout(3);  // 【修复】同MQTT：TLS握手是CPU0忙循环，必须<task_wdt的5秒
+    client.setTimeout(15000);
+    HTTPClient http;
+    if (!http.begin(client, "https://vop.baidu.com/server_api")) {
+        free(jsonBuf);
+        Serial.println("[语音诊断] ASR HTTPS连接失败");
+        return "";
     }
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(15000);
+    int httpCode = http.POST((uint8_t*)jsonBuf, plen);
+    if (httpCode == 200) {
+        String response = http.getString();
+        StaticJsonDocument<1024> respDoc;
+        DeserializationError error = deserializeJson(respDoc, response);
+        if (!error && respDoc["err_no"] == 0) {
+            JsonArray results = respDoc["result"];
+            if (results.size() > 0) {
+                result = results[0].as<String>();
+                // 去除标点符号
+                result.replace("。", "");
+                result.replace("，", "");
+                result.replace("？", "");
+                result.replace("！", "");
+                result.trim();
+            }
+        } else {
+            Serial.printf("[语音诊断] ASR失败 err_no=%d\n", respDoc["err_no"] | -1);
+        }
+    } else {
+        Serial.printf("[语音诊断] ASR HTTP失败: %d\n", httpCode);
+    }
+    http.end();
+    free(jsonBuf);
     return result;
+}
+
+/**
+* 获取百度access_token（带缓存，提前5分钟过期）
+*/
+String getBaiduToken() {
+    // 检查缓存的token是否仍有效（提前5分钟过期）
+    static String cached_token = "";
+    static unsigned long expire_time = 0;
+    if (cached_token.length() > 0 && millis() < expire_time - 300000) {
+        return cached_token;
+    }
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setHandshakeTimeout(3);  // 【修复】同MQTT：TLS握手是CPU0忙循环，必须<task_wdt的5秒
+    client.setTimeout(10000);
+
+    HTTPClient http;
+    String url = "https://aip.baidubce.com/oauth/2.0/token?grant_type=client_credentials";
+    url += "&client_id=" + BAIDU_API_KEY;
+    url += "&client_secret=" + BAIDU_SECRET_KEY;
+
+    if (!http.begin(client, url)) {
+        return "";
+    }
+    http.setTimeout(10000);
+    int httpCode = http.GET();
+
+    if (httpCode == 200) {
+        String response = http.getString();
+        StaticJsonDocument<512> doc;
+        DeserializationError error = deserializeJson(doc, response);
+        if (!error && doc.containsKey("access_token")) {
+            cached_token = doc["access_token"].as<String>();
+            int expiresIn = doc["expires_in"] | 2592000;
+            expire_time = millis() + (expiresIn * 1000);
+            http.end();
+            return cached_token;
+        }
+    }
+    http.end();
+    return "";
 }
 /**
 * Base64编码
