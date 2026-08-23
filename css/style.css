@@ -689,6 +689,14 @@ body {
     align-self: flex-start;
 }
 
+/* 【修复】气泡内容包裹层：限制宽度防止长文本撑破，头像+内容两列布局 */
+.chat-content {
+    min-width: 0;
+    max-width: calc(100% - 34px); /* 26px头像 + 8px间距 */
+    display: flex;
+    flex-direction: column;
+}
+
 .chat-avatar {
     width: 26px;
     height: 26px;

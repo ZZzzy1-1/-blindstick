@@ -624,6 +624,13 @@ k230_lastAlertTime[targetIndex] = now;
 }
 } else if (noneIdx >= 0) {
 k230_detection_count = 0;
+} else {
+// 【新增】既不是DETS/DET也不是NONE：打印原始帧便于诊断K230格式异常（节流防刷屏）
+static unsigned long lastUnknownK230 = 0;
+if (millis() - lastUnknownK230 > 5000) {
+lastUnknownK230 = millis();
+Serial.printf("[K230] 未知帧(前80字符): %.80s\n", k230_receiveBuffer.c_str());
+}
 }
 k230_receiveBuffer = "";
 }
@@ -1190,7 +1197,7 @@ if (!mqtt.connected()) return;
 // 更新里程统计
 updateMileage();
 // 使用更大的JSON缓冲区容纳视觉检测数据
-StaticJsonDocument<2048> doc;  // 【修复】1024→2048：K230多目标时k230_dets数组会占满1024池，ArduinoJson静默丢框
+static StaticJsonDocument<2048> doc;  // 【修复】1024→2048：K230多目标时k230_dets数组会占满1024池，ArduinoJson静默丢框
 doc["device_id"] = "blind_stick_001";
 JsonObject radar = doc.createNestedObject("radar");
 // 三向雷达: [0]=前方, [1]=左方, [2]=右方

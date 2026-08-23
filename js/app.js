@@ -108,6 +108,8 @@ let audioContext = null;
 let mediaStream = null;
 let audioProcessor = null;
 let asrCallback = null;
+let lastVoiceReplyAt = 0;           // 【修复】最近一次语音识别时间，用于判断TTS是否是对话回复
+const TTS_REPLY_WINDOW_MS = 10000;  // 【修复】识别后10秒内的TTS视为对话回复，显示进"语音对话"
 
 // ================= 目的地关键词过滤配置 =================
 const DESTINATION_FILTER_WORDS = [
@@ -554,6 +556,9 @@ async function handleMqttMessage(topic, payload) {
                     console.log('[语音识别] 识别到:', text);
                     addEventLog('语音', `识别到: ${text}`);
                     updateModuleStatus({ voice: true });
+                    // 【修复】语音对话：识别文本显示为"用户"气泡，并开启TTS回复窗口
+                    lastVoiceReplyAt = Date.now();
+                    addChatMessage('user', text);
                 }
             } catch (e) {
                 console.error('[语音识别] 结果解析失败:', e);
@@ -609,6 +614,10 @@ async function handleMqttMessage(topic, payload) {
                 if (msg.text && msg.text.includes('系统启动成功') && !AppState.deviceStarted) {
                     AppState.deviceStarted = true;
                     addEventLog('系统', '设备启动成功');
+                }
+                // 【修复】语音对话：识别后10秒内的TTS播报视为对话回复，显示为"智能杖"气泡
+                if (msg.text && Date.now() - lastVoiceReplyAt < TTS_REPLY_WINDOW_MS) {
+                    addChatMessage('system', msg.text);
                 }
             } catch (e) {
                 console.error('[TTS-MQTT] 解析失败:', e);
@@ -1168,6 +1177,47 @@ function clearChatHistory() {
     if (chatContainer) {
         chatContainer.innerHTML = '<div class="chat-welcome">语音对话由ESP32硬件处理</div>';
     }
+}
+
+// 【修复】语音对话：在对话区追加一条气泡（role: 'user'=用户说的话, 'system'=智能杖的语音回复）
+function addChatMessage(role, text) {
+    const chatContainer = document.getElementById('chatContainer');
+    if (!chatContainer || !text) return;
+
+    // 去掉欢迎占位文案（第一条真实消息出现后）
+    const welcome = chatContainer.querySelector('.chat-welcome');
+    if (welcome) welcome.remove();
+
+    // 气泡结构：头像 + 文本 + 时间，全部用 textContent 防注入
+    const bubble = document.createElement('div');
+    bubble.className = 'chat-bubble ' + role;
+
+    const avatar = document.createElement('div');
+    avatar.className = 'chat-avatar';
+    avatar.textContent = role === 'user' ? '我' : '杖';
+
+    const content = document.createElement('div');
+    content.className = 'chat-content';
+
+    const textDiv = document.createElement('div');
+    textDiv.className = 'chat-text';
+    textDiv.textContent = text;
+
+    const timeDiv = document.createElement('div');
+    timeDiv.className = 'chat-time';
+    const d = new Date();
+    timeDiv.textContent = String(d.getHours()).padStart(2, '0') + ':' +
+        String(d.getMinutes()).padStart(2, '0') + ':' +
+        String(d.getSeconds()).padStart(2, '0');
+
+    content.appendChild(textDiv);
+    content.appendChild(timeDiv);
+    bubble.appendChild(avatar);
+    bubble.appendChild(content);
+    chatContainer.appendChild(bubble);
+
+    // 自动滚动到底部
+    chatContainer.scrollTop = chatContainer.scrollHeight;
 }
 
 function clearNavHistory() {
