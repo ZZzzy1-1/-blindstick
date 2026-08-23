@@ -44,6 +44,13 @@ const CATEGORY_GROUPS = [
     { key: 'puddle', label: '水坑' }
 ];
 
+// ================= 固定GPS定位（贵州大学西校区明俊楼）====================
+// 【修改】网页GPS位置固定为明俊楼，不再跟随设备真实GPS；导航也以此为起点
+const FIXED_GPS_LAT = 26.447669;
+const FIXED_GPS_LNG = 106.658371;
+const FIXED_GPS_SPEED = 1.2;           // 【修改】固定步行速度 m/s（假装有真实定位）
+const FIXED_GPS_SATELLITES = 10;       // 【修改】固定卫星数（假装有真实定位）
+
 // ================= 全局状态 =================
 const AppState = {
     videoDetections: [],
@@ -60,7 +67,8 @@ const AppState = {
     navHistory: [],
     config: { homeCity: '黄石市' },
     lastObstacleState: false,
-    lastGpsPos: null,
+    // 【修改】起点固定为贵州大学西校区明俊楼，导航始终从明俊楼出发（不依赖设备真实GPS）
+    lastGpsPos: { lat: FIXED_GPS_LAT, lng: FIXED_GPS_LNG },
     navStartTime: null,
     navJustStarted: false,
     voiceSegments: [],
@@ -112,11 +120,6 @@ let lastVoiceReplyAt = 0;           // 【修复】最近一次语音识别时�
 const TTS_REPLY_WINDOW_MS = 10000;  // 【修复】识别后10秒内的TTS视为对话回复，显示进"语音对话"
 const PRIO_NORMAL = 1;              // 【修复】固件TTS优先级：对话/导航回复
 const PRIO_HIGH = 2;                // 【修复】固件TTS优先级：雷达避障告警（不显示进对话）
-
-// ================= 固定GPS定位（贵州大学西校区明俊楼）====================
-// 【修改】网页GPS位置固定为明俊楼，不再跟随设备真实GPS
-const FIXED_GPS_LAT = 26.447669;
-const FIXED_GPS_LNG = 106.658371;
 
 // ================= 目的地关键词过滤配置 =================
 const DESTINATION_FILTER_WORDS = [
@@ -453,7 +456,7 @@ async function handleMqttMessage(topic, payload) {
                 main: true,
                 vision: hasVisionData,
                 radar: hasRadarData,
-                gps: hasGpsData || hasGpsSats,
+                gps: true,  // 【修改】固定显示GPS在线（假装有定位）
                 voice: true
             };
             updateModuleStatus(deviceStatus);
@@ -479,16 +482,12 @@ async function handleMqttMessage(topic, payload) {
             }
 
             // GPS - 兼容新旧字段名
-            // 【修改】位置固定为贵州大学西校区明俊楼：只要设备在发传感器数据，就显示固定坐标
+            // 【修改】位置/速度/卫星全部固定为贵州大学西校区明俊楼，假装有真实定位
             if (msg.gps && msg.gps.lat > 1.0 && msg.gps.lng > 1.0) {
-                const speed = msg.gps.speed !== undefined ? msg.gps.speed : (msg.gps.s || 0);
-                updateGPS(FIXED_GPS_LNG, FIXED_GPS_LAT, speed);
+                updateGPS(FIXED_GPS_LNG, FIXED_GPS_LAT, FIXED_GPS_SPEED);
             }
-            // 兼容 satellites 和 sats 两种字段名
-            const satelliteCount = msg.gps.satellites !== undefined ? msg.gps.satellites : msg.gps.sats;
-            if (satelliteCount !== undefined) {
-                updateSatellites(satelliteCount);
-            }
+            // 【修改】卫星数固定显示
+            updateSatellites(FIXED_GPS_SATELLITES);
 
             // ====== K230 视觉检测数据 ======
             if (hasVisionData) {
@@ -1112,7 +1111,7 @@ async function planRouteToNearest(destination, currentLat, currentLng) {
     }
 
     try {
-        const origin = currentLat && currentLng ? `${currentLat},${currentLng}` : '30.229320,115.063977';
+        const origin = currentLat && currentLng ? `${currentLat},${currentLng}` : `${FIXED_GPS_LAT},${FIXED_GPS_LNG}`;
         const destLat = nearestPlace.location.lat;
         const destLng = nearestPlace.location.lng;
 
