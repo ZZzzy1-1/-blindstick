@@ -783,6 +783,10 @@ function initMap() {
     }).addTo(map);
     pathPolyline = L.polyline([], { color: '#2563eb', weight: 4 }).addTo(map);
     marker = L.circleMarker(defaultCenter, { color: '#2563eb', radius: 6, fillColor: '#fff', fillOpacity: 1, weight: 3 }).addTo(map);
+    // 【修复】手机/平板旋转或窗口缩放时容器尺寸变化，让Leaflet重新计算铺满尺寸
+    window.addEventListener('resize', () => {
+        if (map) map.invalidateSize();
+    });
 }
 
 function updateGPS(lng, lat, speed) {

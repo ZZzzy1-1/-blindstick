@@ -1217,16 +1217,84 @@ body {
     background: #f0fdf4;
     border: 1px solid #bbf7d0;
 }
-/* @media (max-width: 1300px) {
+/* ================= 响应式适配（手机/平板） =================
+   【修复】原布局固定三栏(260px 1fr 260px) + min-width:800px + body禁止滚动，
+   手机打开被横向挤压只能横滚。现改为：
+   ≤1000px：双栏布局，中间"视觉识别+地图"整行，页面允许纵向滚动；
+   ≤640px ：单栏堆叠，header状态栏换行到第二行，视频/地图给显式尺寸防止塌成0。
+*/
+@media (max-width: 1000px) {
+    html, body {
+        height: auto;
+        overflow: auto;
+    }
     .dashboard {
-        grid-template-columns: 260px 1fr 260px;
+        grid-template-columns: 1fr 1fr;
+        min-width: 0;
+        height: auto;
+        overflow: visible;
+        padding: 10px;
+        gap: 10px;
+    }
+    .panel-center {
+        grid-column: 1 / -1;
+    }
+    .panel-left,
+    .panel-right {
+        max-height: none;
+        overflow: visible;
+    }
+    .panel-center .panel-section {
+        flex: none;
+    }
+    /* 视频/地图原来是 flex:1 撑满，改成按内容/固定高度，否则单栏流里高度为0 */
+    .video-container {
+        flex: none;
+        aspect-ratio: 5 / 2;  /* 画布 800x320 */
+        height: auto;
+    }
+    #map {
+        flex: none;
+        height: 260px;
     }
 }
 
-@media (max-width: 1000px) {
-    .dashboard {
-        grid-template-columns: 1fr 1fr;
-        overflow-y: auto;
+@media (max-width: 640px) {
+    /* header：状态栏换行到第二行居中，标题副标题隐藏 */
+    .header {
+        flex-wrap: wrap;
+        height: auto;
+        min-height: var(--header-height);
+        padding: 8px 12px;
+        gap: 4px 12px;
     }
-    .panel-center { grid-column: 1 / -1; }
-} */
+    .header-center {
+        order: 3;
+        width: 100%;
+        display: flex;
+        justify-content: center;
+    }
+    .status-bar {
+        gap: 14px;
+    }
+    .header-titles p {
+        display: none;
+    }
+
+    /* 单栏堆叠 */
+    .dashboard {
+        grid-template-columns: 1fr;
+    }
+    .panel {
+        padding: 14px;
+    }
+
+    /* 长列表压缩高度，减少页面长度 */
+    .event-list,
+    .nav-history-list {
+        max-height: 200px;
+    }
+    .chat-container {
+        max-height: 200px;
+    }
+}
