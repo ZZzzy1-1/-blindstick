@@ -113,6 +113,11 @@ const TTS_REPLY_WINDOW_MS = 10000;  // 【修复】识别后10秒内的TTS视为
 const PRIO_NORMAL = 1;              // 【修复】固件TTS优先级：对话/导航回复
 const PRIO_HIGH = 2;                // 【修复】固件TTS优先级：雷达避障告警（不显示进对话）
 
+// ================= 固定GPS定位（贵州大学西校区明俊楼）====================
+// 【修改】网页GPS位置固定为明俊楼，不再跟随设备真实GPS
+const FIXED_GPS_LAT = 26.447669;
+const FIXED_GPS_LNG = 106.658371;
+
 // ================= 目的地关键词过滤配置 =================
 const DESTINATION_FILTER_WORDS = [
     '的', '了', '在', '是', '我', '有', '和', '就', '不', '人', '都', '一', '一个', '上', '也', '很', '到', '说', '要', '去', '你', '会', '着', '没有', '看', '好', '自己', '这', '那', '这些', '那些',
@@ -474,9 +479,10 @@ async function handleMqttMessage(topic, payload) {
             }
 
             // GPS - 兼容新旧字段名
+            // 【修改】位置固定为贵州大学西校区明俊楼：只要设备在发传感器数据，就显示固定坐标
             if (msg.gps && msg.gps.lat > 1.0 && msg.gps.lng > 1.0) {
                 const speed = msg.gps.speed !== undefined ? msg.gps.speed : (msg.gps.s || 0);
-                updateGPS(msg.gps.lng, msg.gps.lat, speed);
+                updateGPS(FIXED_GPS_LNG, FIXED_GPS_LAT, speed);
             }
             // 兼容 satellites 和 sats 两种字段名
             const satelliteCount = msg.gps.satellites !== undefined ? msg.gps.satellites : msg.gps.sats;
@@ -775,9 +781,9 @@ let map, pathPolyline, marker;
 function initMap() {
     const mapEl = document.getElementById('map');
     if (!mapEl) return;
-    // 初始视图使用中国中心，等待GPS数据
-    const defaultCenter = [35.0, 105.0];
-    map = L.map('map', { zoomControl: false }).setView(defaultCenter, 4);
+    // 初始视图固定为贵州大学西校区明俊楼
+    const defaultCenter = [FIXED_GPS_LAT, FIXED_GPS_LNG];
+    map = L.map('map', { zoomControl: false }).setView(defaultCenter, 15);
     L.tileLayer('https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}', {
         subdomains: ['1', '2', '3', '4'], attribution: '© 高德地图'
     }).addTo(map);

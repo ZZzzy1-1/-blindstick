@@ -772,12 +772,12 @@ last_retry = now;
 // 确保WiFi连接状态正常
 if (WiFi.status() != WL_CONNECTED) return false;
 // 配置MQTT客户端参数
-mqtt.setSocketTimeout(10);
+mqtt.setSocketTimeout(5);  // 【修复】10->5秒：socket读超时太长会饿死IDLE0触发task_wdt（回退时被还原，重新改回）
 mqtt.setKeepAlive(60);
 // 【修复】MQTT Buffer=8KB：既要容纳TTS音频分片(每片4KB)，又不会像128KB那样吃光内存
 mqtt.setBufferSize(8192);
 espClient.setInsecure();
-espClient.setHandshakeTimeout(12);
+espClient.setHandshakeTimeout(3);  // 【修复】12->3秒：TLS握手是CPU0忙循环，必须<task_wdt的5秒，否则握手时IDLE0饿死、系统Abort
 if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD)) {
 Serial.println("[MQTT] 连接成功");
 mqtt.subscribe(MQTT_TOPIC_TTS_AUDIO);
@@ -1298,7 +1298,6 @@ k230Serial.setRxBufferSize(4096);  // 必须在begin()之前调用
 k230Serial.begin(K230_UART_BAUD, SERIAL_8N1, K230_RX_PIN, K230_TX_PIN);
 Serial.printf("[K230] UART%d初始化 RX=GPIO%d TX=GPIO%d\n",
 K230_UART_ID, K230_RX_PIN, K230_TX_PIN);
-unsigned long lastUpload = 0;
 unsigned long lastStatusPrint = 0;
 int radarByteCount = 0;
 // 【新增】雷达数据定时重置周期
@@ -1363,6 +1362,19 @@ gps_satellites,
 gps_baud_table[gps_baud_index]);
 radarByteCount = 0;  // 重置计数
 }
+vTaskDelay(10 / portTICK_PERIOD_MS);
+}
+}
+
+// ==================== MQTT 任务（独立任务，避免断网重连阻塞避障循环）====================
+// 【修复】原版 MQTT 重连/收发嵌在 RadarMotorUploadTask 里，mqtt.connect() 是阻塞调用
+// （socket超时10s + TLS握手超时12s），断网时每3秒一次的重连会把避障循环卡死十几秒，电机停摆。
+// 现移入独立任务：雷达读数据→smartAvoid()→电机 永不等待网络。
+void MqttTask(void* pvParameters) {
+Serial.println("[任务] MqttTask 启动");
+unsigned long lastUpload = 0;
+while (true) {
+unsigned long now2 = millis();
 if (WiFi.status() == WL_CONNECTED) {
 // 【诊断】MQTT连接状态变化检测（定位掉线时机）
 static bool mqttPrevState = false;
@@ -1374,7 +1386,7 @@ Serial.println("[MQTT] 重连成功");
 }
 mqttPrevState = mqttCurState;
 if (!mqtt.connected()) {
-mqtt_reconnect();
+mqtt_reconnect();  // 阻塞发生在本任务，不再卡雷达避障
 }
 if (mqtt.connected()) {
 mqtt.loop();
@@ -1974,13 +1986,13 @@ if (WiFi.status() == WL_CONNECTED) {
 probeRenderConnectivity();
 // 配置MQTT
 espClient.setInsecure();
-espClient.setHandshakeTimeout(8);
+espClient.setHandshakeTimeout(3);  // 与重连一致，防setup阻塞时loopTask被task_wdt重启
 mqtt.setServer(MQTT_BROKER, MQTT_PORT);
 mqtt.setCallback(mqtt_callback);
-// 连接MQTT（非阻塞重试）
-mqtt_reconnect();
+// 连接交给MqttTask：不在setup阻塞连接，否则loopTask被task_wdt重启（开机MQTT不可达时会启动重启循环）
 }
 xTaskCreatePinnedToCore(RadarMotorUploadTask, "RadarTask", 8192, NULL, 3, &RadarTaskHandle, 0);
+xTaskCreatePinnedToCore(MqttTask, "MqttTask", 16384, NULL, 2, NULL, 0);  // 【修复】MQTT独立任务，优先级低于雷达，断网重连不阻塞避障；栈16384容纳mqtt_callback(TTS音频4KB)
 xTaskCreatePinnedToCore(NavigationTask, "NavTask", 2048, NULL, 1, &NavTaskHandle, 1);
 xTaskCreatePinnedToCore(VoiceRecognitionTask, "VoiceRecTask", 16384, NULL, 2, &VoiceTaskHandle, 1);  // 【修复】增大栈空间防止ASR请求时栈溢出
 xTaskCreatePinnedToCore(RenderKeepAliveTask, "RenderKA", 16384, NULL, 1, NULL, 1);  // 每45秒ping /health防休眠
