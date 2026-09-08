@@ -52,6 +52,18 @@ const FIXED_GPS_LNG = 115.070175;
 const FIXED_GPS_SPEED = 1.2;           // 【修改】固定步行速度 m/s（假装有真实定位）
 const FIXED_GPS_SATELLITES = 10;       // 【修改】固定卫星数（假装有真实定位）
 
+// ================= 坐标转换：百度BD-09 → 高德GCJ-02 ====================
+// 【占位】固定坐标是从百度地图读的BD-09，而地图瓦片是高德(GCJ-02)，画图前必须转换，否则红点偏~500米
+// 后续改回真实GPS(WGS-84)数据时：把此函数换成 wgs2gcj(真实GPS放高德也要转GCJ)，文本照旧显示原始坐标
+function bd09ToGcj02(lat, lng) {
+    const x_pi = Math.PI * 3000.0 / 180.0;
+    const x = lng - 0.0065;
+    const y = lat - 0.006;
+    const z = Math.sqrt(x * x + y * y) - 0.00002 * Math.sin(y * x_pi);
+    const theta = Math.atan2(y, x) - 0.000003 * Math.cos(x * x_pi);
+    return [z * Math.sin(theta), z * Math.cos(theta)];  // [lat, lng] 高德GCJ-02
+}
+
 // ================= 全局状态 =================
 const AppState = {
     videoDetections: [],
@@ -781,8 +793,9 @@ let map, pathPolyline, marker;
 function initMap() {
     const mapEl = document.getElementById('map');
     if (!mapEl) return;
-    // 初始视图固定为湖北师范大学教育大楼
-    const defaultCenter = [FIXED_GPS_LAT, FIXED_GPS_LNG];
+    // 初始视图固定为湖北师范大学教育大楼（BD-09 → GCJ-02 再画到高德图）
+    const fixedGcj = bd09ToGcj02(FIXED_GPS_LAT, FIXED_GPS_LNG);
+    const defaultCenter = fixedGcj;
     map = L.map('map', { zoomControl: false }).setView(defaultCenter, 15);
     L.tileLayer('https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}', {
         subdomains: ['1', '2', '3', '4'], attribution: '© 高德地图'
@@ -796,7 +809,9 @@ function initMap() {
 }
 
 function updateGPS(lng, lat, speed) {
-    const pos = [lat, lng];
+    // 【占位】坐标源是百度BD-09读数：画到高德图用GCJ-02，经纬度文本仍显示原始坐标
+    const gcj = bd09ToGcj02(lat, lng);
+    const pos = [gcj[0], gcj[1]];
 
     // 更新地图中心（仅在首次接收到有效GPS时）
     if (map && !AppState.gpsInitialized) {
