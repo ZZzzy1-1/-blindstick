@@ -44,10 +44,11 @@ const CATEGORY_GROUPS = [
     { key: 'puddle', label: '水坑' }
 ];
 
-// ================= 固定GPS定位（贵州大学西校区明俊楼）====================
-// 【修改】网页GPS位置固定为明俊楼，不再跟随设备真实GPS；导航也以此为起点
-const FIXED_GPS_LAT = 26.447669;
-const FIXED_GPS_LNG = 106.658371;
+// ================= 固定GPS定位（湖北省黄石市黄石港区·湖北师范大学教育大楼）====================
+// 【修改】网页GPS位置固定为教育大楼，不再跟随设备真实GPS；导航也以此为起点
+// 【占位】先这样定死，后续改回设备真实GPS数据
+const FIXED_GPS_LAT = 30.235550;
+const FIXED_GPS_LNG = 115.070175;
 const FIXED_GPS_SPEED = 1.2;           // 【修改】固定步行速度 m/s（假装有真实定位）
 const FIXED_GPS_SATELLITES = 10;       // 【修改】固定卫星数（假装有真实定位）
 
@@ -67,7 +68,7 @@ const AppState = {
     navHistory: [],
     config: { homeCity: '黄石市' },
     lastObstacleState: false,
-    // 【修改】起点固定为贵州大学西校区明俊楼，导航始终从明俊楼出发（不依赖设备真实GPS）
+    // 【修改】起点固定为湖北师范大学教育大楼，导航始终从教育大楼出发（不依赖设备真实GPS）
     lastGpsPos: { lat: FIXED_GPS_LAT, lng: FIXED_GPS_LNG },
     navStartTime: null,
     navJustStarted: false,
@@ -482,7 +483,7 @@ async function handleMqttMessage(topic, payload) {
             }
 
             // GPS - 兼容新旧字段名
-            // 【修改】位置/速度/卫星全部固定为贵州大学西校区明俊楼，假装有真实定位
+            // 【修改】位置/速度/卫星全部固定为湖北师范大学教育大楼，假装有真实定位
             if (msg.gps && msg.gps.lat > 1.0 && msg.gps.lng > 1.0) {
                 updateGPS(FIXED_GPS_LNG, FIXED_GPS_LAT, FIXED_GPS_SPEED);
             }
@@ -780,7 +781,7 @@ let map, pathPolyline, marker;
 function initMap() {
     const mapEl = document.getElementById('map');
     if (!mapEl) return;
-    // 初始视图固定为贵州大学西校区明俊楼
+    // 初始视图固定为湖北师范大学教育大楼
     const defaultCenter = [FIXED_GPS_LAT, FIXED_GPS_LNG];
     map = L.map('map', { zoomControl: false }).setView(defaultCenter, 15);
     L.tileLayer('https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}', {
