@@ -1722,6 +1722,8 @@ String doVoiceRecognition() {
     }
     int jsonLen = snprintf(jsonBuf, jsonCap, "{\"speech\":\"%s\",\"len\":%u}", b64Buf, (unsigned)totalRead);
     free(b64Buf);  // 释放base64，降低峰值
+    Serial.printf("[语音诊断] 发送ASR请求 body=%d字节 heap=%u psram=%u\n", jsonLen,
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
     int httpCode = http.POST((uint8_t*)jsonBuf, jsonLen);
     String result = "";
     if (httpCode == 200) {
@@ -1736,6 +1738,8 @@ String doVoiceRecognition() {
             result.replace("？", "");
             result.replace("！", "");
             result.trim();
+            // 【诊断】成功也打印：识别为空时也能看到，不再"毫无输出"
+            Serial.printf("[语音诊断] 代理ASR成功 len=%d text='%s'\n", result.length(), result.c_str());
         } else {
             // 【诊断】代理ASR返回错误
             int errNo = respDoc["err_no"] | -1;
