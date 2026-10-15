@@ -28,7 +28,6 @@ PubSubClient mqtt(espClient);
 // 优先级定义
 #define PRIO_LOW     0   // 导航
 #define PRIO_NORMAL  1   // 对话
-#define PRIO_HIGH    2   // 雷达告警
 // 流式播放状态
 volatile bool stream_playing = false;           // 是否正在播放
 volatile int  stream_priority = 0;              // 当前播放优先级
@@ -203,17 +202,11 @@ return R * c;
 */
 const char* getPrioName(int p) {
 switch(p) {
-case PRIO_HIGH: return "高(雷达)";
 case PRIO_NORMAL: return "中(对话)";
 case PRIO_LOW: return "低(导航)";
 default: return "未知";
 }
 }
-// ==================== 避障阈值 ====================
-#define ALERT_DIST_CM       180.0
-#define FRONT_CRITICAL_CM   180.0
-#define SIDE_WARNING_CM     180.0
-#define AVOID_TURN_HOLD_MS 2000
 // ==================== 雷达角度扇区 ====================
 // 【修复】删除重复定义，只保留一组
 #define ANG_FRONT_MIN  330
@@ -245,8 +238,6 @@ volatile bool  is_ai_talking = false;
 char lastPlayedTtsText[128] = "";
 volatile unsigned long ai_talking_start_time = 0;  // 【新增】记录开始时间
 const unsigned long AI_TALKING_TIMEOUT_MS = 15000;  // 【新增】15秒超时
-volatile unsigned long ttsPlayEndTime = 0;  // 【新增】TTS播放结束时间
-const unsigned long TTS_PLAY_SILENT_MS = 5000;  // 【新增】播放后5秒静默期，给语音识别完整录音窗口
 volatile bool  is_tts_requesting = false;  // TTS请求状态标志，防止重复发送
 unsigned long  tts_request_start_time = 0;
 // TTS请求标志互斥锁（防止竞态条件）
@@ -926,35 +917,19 @@ saveStatsToRTC();
 // 如果需要本地处理TTS请求，可以在这里添加代码
 }
 }
-// 全局变量
-// 【删除】last_blocked未使用
-unsigned long last_alert_time = 0;
-// 【删除】last_alert_dist未使用
-// 【加快】障碍物告警间隔从8秒改为5秒
-#define ALERT_INTERVAL_MS 5000
-#define ALERT_DIST_CHANGE 30          // 距离变化超过30cm才重新播报
-// 避障语音去重：记录上次播报的文本和时间
-static String last_alert_text = "";
-static unsigned long last_alert_text_time = 0;
-// 【加快】去重时间从10秒改为5秒
-#define ALERT_TEXT_DUPLICATE_MS 5000
-// 【新增】避障播报固定间隙：无论文本/距离如何变化，8秒内最多播报一次
-// 【修复】极端危险(障碍物极近)也设独立间隙(3秒)，防止"<40cm一直触发"导致连续播报/打断TTS/队列满
-#define AVOID_ALERT_MIN_INTERVAL_MS 8000      // 普通告警：8秒一次
-#define AVOID_ALERT_CRITICAL_INTERVAL_MS 3000 // 极端危险：3秒一次（仍允许打断当前TTS，但不再每帧都播）
+// 【修改】去掉避障语音后，以下只做障碍物检测与统计
+// 统计间隙：普通8秒一次、极端危险3秒一次，避免刷计
+#define AVOID_ALERT_MIN_INTERVAL_MS 8000
+#define AVOID_ALERT_CRITICAL_INTERVAL_MS 3000
 static unsigned long lastAvoidAlertTime = 0;
-// 【修复】极端危险判定：前方<30cm 或 侧方<25cm 才算（原<40/35太宽，31~39cm一直触发绕过间隙）
+// 极端危险判定：前方<30cm 或 侧方<25cm
 #define CRITICAL_DANGER_F_CM 30.0f
 #define CRITICAL_DANGER_S_CM 25.0f
 static inline bool isCriticalDanger(float f, float L, float R) {
     return (f < CRITICAL_DANGER_F_CM) || (L < CRITICAL_DANGER_S_CM) || (R < CRITICAL_DANGER_S_CM);
 }
-// 【优化】TTS触发阈值
-#define TTS_TRIGGER_DISTANCE_CM 60     // 距离小于60cm触发紧急播报
-// 【加快】连续检测从2次改为1次，更快响应
-#define TTS_TRIGGER_COUNT 1
-// ==================== 障碍物检测和播报（三向雷达版 - 修复版）====================
-void checkObstacleAndAlert() {
+// ==================== 障碍物检测与统计（三向雷达；【修改】仅统计，不播报）====================
+void checkObstacleStat() {
     // 【新增】检查 is_ai_talking 是否超时卡住
     if (is_ai_talking && (millis() - ai_talking_start_time > AI_TALKING_TIMEOUT_MS)) {
         Serial.println("[TTS超时] is_ai_talking 超时，自动重置");
@@ -990,7 +965,7 @@ void checkObstacleAndAlert() {
     // 【修复】简化触发逻辑：只要有任意方向连续检测到2次就触发
     bool shouldAlert = (frontConsecutive >= 2) || (leftConsecutive >= 2) || (rightConsecutive >= 2);
 
-    // 【修复】强制播报：如果距离小于60cm，立即播报（不等待连续检测）
+    // 近距离：立即判定（不等待连续检测）
     bool urgentAlert = (f < 60.0f) || (L < 50.0f) || (R < 50.0f);
 
     // 调试输出（每2秒一次）
@@ -1005,145 +980,20 @@ void checkObstacleAndAlert() {
     }
 
     if (!shouldAlert && !urgentAlert) {
-        return;  // 没有需要播报的情况
+        return;  // 无障碍物
     }
 
-    // 【新增】播放后静默期检查：TTS刚播放完，给语音识别完整录音窗口（除非极端危险）
-    if (millis() - ttsPlayEndTime < TTS_PLAY_SILENT_MS) {
-        bool criticalDanger = isCriticalDanger(f, L, R);
-        if (!criticalDanger) {
-            return;  // 静默期内且非极端危险，跳过本次播报
-        }
-    }
-
-    // 【修复】检查是否正在播报其他内容
-    // 【修复】正在播放TTS时抑制新的避障播报，避免连续播报导致语音识别被一直挂起
-    // 仅当距离极度危险(<30cm)时才打断当前播放紧急播报
-    if (is_ai_talking || getTTSRequesting()) {
-        bool criticalDanger = isCriticalDanger(f, L, R);
-        if (!criticalDanger) {
-            return;  // 正在播报且非极端危险，跳过本次（下轮再试），给语音识别留时间
-        }
-        // 【修复】自环保护：当前播的已经是避障告警(PRIO_HIGH)时，不打断自己，
-        //         否则会陷入"播报→打断→重新播报"的死循环刷屏。
-        if (is_ai_talking && stream_priority >= PRIO_HIGH) {
-            return;  // 已在播极端告警，等它播完即可
-        }
-        // 极端危险且正在播低优先级内容（如语音回复）：发送打断信号，让避障播报优先
-        if (is_ai_talking) {
-            StaticJsonDocument<256> doc;
-            doc["type"] = "interrupt";
-            doc["priority"] = PRIO_HIGH;
-            char buf[256];
-            size_t len = serializeJson(doc, buf, sizeof(buf));
-            mqtt.publish("blindstick/tts/control", buf, len);
-            delay(50);
-        }
-    }
-
-    // 构建告警文本
-    String alert_text = "";
-
-    // 【修复】优先级1：前方障碍物（最紧急）
-    if (frontConsecutive >= 2 || f < 60.0f) {
-        if (L > R + 30.0f) {
-            alert_text = "前方有障碍物，请向左绕行";
-        } else if (R > L + 30.0f) {
-            alert_text = "前方有障碍物，请向右绕行";
-        } else if (L > SIDE_ALERT_CM && R > SIDE_ALERT_CM) {
-            // 两边都有空间，选择更空的一边
-            alert_text = (L > R) ? "前方有障碍物，建议向左绕行" : "前方有障碍物，建议向右绕行";
-        } else if (L > SIDE_ALERT_CM) {
-            alert_text = "前方有障碍物，请向左绕行";
-        } else if (R > SIDE_ALERT_CM) {
-            alert_text = "前方有障碍物，请向右绕行";
-        } else {
-            alert_text = "前方和两侧都有障碍物，请小心慢行";
-        }
-    }
-    // 优先级2：左方障碍物（仅当前方安全时）
-    else if (leftConsecutive >= 2 || L < 50.0f) {
-        if (R > SIDE_ALERT_CM) {
-            alert_text = "左方有障碍物，请向右绕行";
-        } else {
-            alert_text = "左方有障碍物，请注意避让";
-        }
-    }
-    // 优先级3：右方障碍物（仅当前方安全时）
-    else if (rightConsecutive >= 2 || R < 50.0f) {
-        if (L > SIDE_ALERT_CM) {
-            alert_text = "右方有障碍物，请向左绕行";
-        } else {
-            alert_text = "右方有障碍物，请注意避让";
-        }
-    }
-
-    if (alert_text.length() == 0) {
-        return;
-    }
-
-    // 【新增】固定播报间隙：普通告警8秒一次，极端危险(<30cm)3秒一次
-    // 【修复】原实现"极端危险完全绕过间隙"导致前方31~39cm持续触发、连续打断TTS、队列满
-    //        现在临界危险也保留3秒短间隙，既不丢紧急提醒，也不再每帧轰炸
+    // 统计间隙：普通8秒一次、极端危险3秒一次，避免刷计
     bool criticalDanger = isCriticalDanger(f, L, R);
     unsigned long minInterval = criticalDanger ? AVOID_ALERT_CRITICAL_INTERVAL_MS : AVOID_ALERT_MIN_INTERVAL_MS;
     if ((now - lastAvoidAlertTime) < minInterval) {
-        return;  // 间隙内，跳过本次播报
-    }
-
-    // 【修复】去重检查 - 基于告警文本内容
-    static String lastAlertText = "";
-    static unsigned long lastAlertTime = 0;
-    static float lastAlertFront = 0;
-    static float lastAlertLeft = 0;
-    static float lastAlertRight = 0;
-    const unsigned long ALERT_COOLDOWN_MS = 8000;  // 【修复】8秒内不重复相同告警，给语音识别留时间
-
-    if (alert_text == lastAlertText && (now - lastAlertTime) < ALERT_COOLDOWN_MS) {
-        return;  // 相同告警在冷却期内，跳过
-    }
-
-    // 【修复】检查距离变化，如果距离变化很小也跳过
-    float distChange = abs(f - lastAlertFront) + abs(L - lastAlertLeft) + abs(R - lastAlertRight);
-    if (distChange < 50.0f && (now - lastAlertTime) < ALERT_COOLDOWN_MS * 2) {
-        // 距离变化不大，延长冷却期
         return;
     }
+    lastAvoidAlertTime = now;
 
-    // 发送TTS请求
-    if (mqtt.connected()) {
-        Serial.printf("[避障播报] %s (F:%.0f L:%.0f R:%.0f)\n", alert_text.c_str(), f, L, R);
-
-        StaticJsonDocument<256> ttsDoc;
-        char buf[256];
-        ttsDoc["text"] = alert_text;
-        ttsDoc["priority"] = PRIO_HIGH;  // 避障使用高优先级
-        size_t len = serializeJson(ttsDoc, buf, sizeof(buf));
-
-        if (mqtt.publish(MQTT_TOPIC_TTS_REQ, buf, len)) {
-            // 更新记录
-            lastAlertText = alert_text;
-            lastAlertTime = now;
-            lastAlertFront = f;
-            lastAlertLeft = L;
-            lastAlertRight = R;
-            lastAvoidAlertTime = now;  // 【新增】记录本次播报时间，用于固定间隙
-
-            // 重置连续计数器
-            frontConsecutive = 0;
-            leftConsecutive = 0;
-            rightConsecutive = 0;
-
-            // 增加障碍物提醒次数统计
-            obstacle_count++;
-            saveStatsToRTC();
-
-            // 【修复】标记正在请求TTS，让"正在播报"抑制逻辑生效
-            // （之前is_tts_requesting从未被设为true，导致避障播报不受抑制，
-            //   VoiceTask被频繁挂起，语音识别无法工作）
-            setTTSRequesting(true);
-        }
-    }
+    // 障碍物提醒次数统计（不再播报）
+    obstacle_count++;
+    saveStatsToRTC();
 }
 // ==================== TTS请求超时时间 ====================
 #define TTS_REQUEST_TIMEOUT_MS 10000
@@ -1365,6 +1215,7 @@ parseGPSNMEA();
 processK230Data();
 unsigned long now2 = millis();
 smartAvoid();
+checkObstacleStat();  // 【修改】障碍物统计移到雷达任务：断网/离线也计数，不依赖MQTT
 // GPS 波特率自动检测：每4秒检查一次，如果没收到有效NMEA则切换波特率
 if (!gps_baud_locked && (now2 - gps_baud_try_start > 4000)) {
 if (!gps_got_nmea) {
@@ -1424,7 +1275,6 @@ mqtt.loop();
 if (getTTSRequesting() && (millis() - tts_request_start_time > TTS_REQUEST_TIMEOUT_MS)) {
 setTTSRequesting(false);
 }
-checkObstacleAndAlert();
 if (now2 - lastUpload >= UPLOAD_INTERVAL_MS) {
 lastUpload = now2;
 publishSensorData();
@@ -2459,26 +2309,12 @@ if (totalRead > 44 && audioBuffer[0] == 'R' && audioBuffer[1] == 'I') {
 offset = 44;
 }
 
-// 【新增】播放前障碍物状态检查（与完整下载分支一致）
-if (ttsPriority >= PRIO_HIGH) {
-    float curF = dir_smt[0];
-    float curL = dir_smt[1];
-    float curR = dir_smt[2];
-    bool obstacleGone = (curF > 180.0f) && (curL > 150.0f) && (curR > 150.0f);
-    if (obstacleGone) {
-        Serial.printf("[TTS-URL] 障碍物已消失(F:%.0f L:%.0f R:%.0f)，跳过播放\n", curF, curL, curR);
-        free(audioBuffer);
-        setTTSRequesting(false);        return;
-    }
-}
-
 snprintf(lastPlayedTtsText, sizeof(lastPlayedTtsText), "%s", text ? text : "");
 playPcmData(audioBuffer + offset, totalRead - offset);
 free(audioBuffer);
 Serial.println("[TTS-URL] 播放完成(部分下载)");
 // 重置TTS请求标志
 setTTSRequesting(false);
-ttsPlayEndTime = millis();  // 【新增】记录播放结束时间，进入静默期
 return;
 }
 // 下载太少，放弃并释放内存
@@ -2493,29 +2329,12 @@ if (len > 44 && audioBuffer[0] == 'R' && audioBuffer[1] == 'I') {
 offset = 44;
 }
 
-// 【新增】播放前障碍物状态检查
-// 由于TTS合成+下载有延迟(约10秒)，播放时障碍物可能已经消失
-// 如果是避障告警(高优先级)且当前三个方向都安全，则跳过播放
-if (ttsPriority >= PRIO_HIGH) {
-    float curF = dir_smt[0];
-    float curL = dir_smt[1];
-    float curR = dir_smt[2];
-    // 使用比告警阈值更宽松的安全判定（避免边缘抖动误判）
-    bool obstacleGone = (curF > 180.0f) && (curL > 150.0f) && (curR > 150.0f);
-    if (obstacleGone) {
-        Serial.printf("[TTS-URL] 障碍物已消失(F:%.0f L:%.0f R:%.0f)，跳过播放\n", curF, curL, curR);
-        free(audioBuffer);
-        setTTSRequesting(false);        return;
-    }
-}
-
 snprintf(lastPlayedTtsText, sizeof(lastPlayedTtsText), "%s", text ? text : "");
 playPcmData(audioBuffer + offset, len - offset);
 free(audioBuffer);
 Serial.println("[TTS-URL] 播放完成");
 // 重置TTS请求标志（播放完成，可以发送下一个请求）
 setTTSRequesting(false);
-ttsPlayEndTime = millis();  // 【新增】记录播放结束时间，进入静默期
 }
 // ==================== 流式TTS实现（MQTT分片重装 + 独立播放任务）====================
 void initStreamingTTS() {
@@ -2684,8 +2503,7 @@ int offset = 0;
 if (m.len > 44 && m.data[0] == 'R' && m.data[1] == 'I') offset = 44;
 Serial.printf("[流式TTS] 开始播放 %d 字节\n", (int)(m.len - offset));
 playPcmData(m.data + offset, m.len - offset);
-ttsPlayEndTime = millis();  // 进入静默期，给语音识别留录音窗口
-setTTSRequesting(false);    // 清除避障TTS请求标志
+setTTSRequesting(false);    // 清除TTS请求标志
 // 播放完成，恢复语音识别
 if (VoiceTaskHandle != NULL) {
 eTaskState s = eTaskGetState(VoiceTaskHandle);

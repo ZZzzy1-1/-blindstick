@@ -164,8 +164,7 @@ let audioProcessor = null;
 let asrCallback = null;
 let lastVoiceReplyAt = 0;           // 【修复】最近一次语音识别时间，用于判断TTS是否是对话回复
 const TTS_REPLY_WINDOW_MS = 10000;  // 【修复】识别后10秒内的TTS视为对话回复，显示进"语音对话"
-const PRIO_NORMAL = 1;              // 【修复】固件TTS优先级：对话/导航回复
-const PRIO_HIGH = 2;                // 【修复】固件TTS优先级：雷达避障告警（不显示进对话）
+const PRIO_NORMAL = 1;              // 固件TTS优先级：对话/导航回复
 
 // ================= 目的地关键词过滤配置 =================
 const DESTINATION_FILTER_WORDS = [
@@ -669,10 +668,9 @@ async function handleMqttMessage(topic, payload) {
                     AppState.deviceStarted = true;
                     addEventLog('系统', '设备启动成功');
                 }
-                // 【修复】语音对话：只记录导航/对话类回复。
+                // 语音对话：只记录导航/对话类回复。
                 // 判定条件：①优先级PRIO_NORMAL(对话/导航回复)；②识别后10秒内；
                 // ③不以"前方有"开头(这是K230视觉播报，每8秒循环，不属于对话)。
-                // 避障告警是PRIO_HIGH(雷达)，自动被①排除。
                 if (msg.text && Number(msg.priority) === PRIO_NORMAL &&
                     !msg.text.startsWith('前方有') &&
                     Date.now() - lastVoiceReplyAt < TTS_REPLY_WINDOW_MS) {

@@ -35,24 +35,38 @@ UDP_DISCOVER_PORT = 8898
 ESP32_IP = None   # None=用UDP自动发现ESP32；也可手动写死一个IP来跳过发现
 
 
-def wifi_connect():
-    """连接热点，返回是否成功"""
-    try:
-        wlan = network.WLAN(network.STA_IF)
-        wlan.active(True)
-        if not wlan.isconnected():
-            print("[WiFi] 连接 %s ..." % WIFI_SSID)
+def wifi_connect(retries=3):
+    """连接热点，返回是否成功。带重试+清残留状态（K230的WiFi模块偶发卡在旧状态）"""
+    wlan = network.WLAN(network.STA_IF)
+    for attempt in range(1, retries + 1):
+        try:
+            try:
+                wlan.active(True)
+            except Exception:
+                pass
+            if wlan.isconnected():
+                print("[WiFi] 已连接, IP:", wlan.ifconfig()[0])
+                return True
+            # 清掉上次残留的连接状态再重连（该模块会卡住旧连接）
+            try:
+                wlan.disconnect()
+            except Exception:
+                pass
+            time.sleep_ms(300)
+            print("[WiFi] 第%d次连接 %s ..." % (attempt, WIFI_SSID))
             wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-            for _ in range(60):   # 最多等约30秒
+            for _ in range(20):   # 单次最多等约10秒
                 if wlan.isconnected():
                     break
                 time.sleep_ms(500)
-        if wlan.isconnected():
-            print("[WiFi] 已连接, IP:", wlan.ifconfig()[0])
-            return True
-    except Exception as e:
-        print("[WiFi] 连接异常:", e)
-    print("[WiFi] 连接失败")
+            if wlan.isconnected():
+                print("[WiFi] 已连接, IP:", wlan.ifconfig()[0])
+                return True
+            print("[WiFi] 第%d次失败" % attempt)
+        except Exception as e:
+            print("[WiFi] 连接异常:", e)
+        time.sleep_ms(1000)
+    print("[WiFi] 连接失败（已重试%d次）" % retries)
     return False
 
 
@@ -291,6 +305,14 @@ class ObjectDetectionApp(AIBase):
 
 
 if __name__=="__main__":
+    # 【新增】先联网再初始化摄像头/AI：K230的WiFi在重负载(摄像头+模型)之后偶发连不上
+    if not wifi_connect():
+        print("[K230] WiFi连接失败，继续运行，发送时会自动重连")
+    try:
+        net_connect()
+    except Exception as e:
+        print("[K230] 首次TCP连接失败(将自动重连):", e)
+
     display_mode="st7701"   # 【无屏型号】改用 st7701 模式（无屏幕显示）
     display_size=[800,480]
 
@@ -320,14 +342,6 @@ if __name__=="__main__":
         sys.print_exception(e)
         print("[K230] 初始化失败：摄像头或模型加载出错，检查SD卡与摄像头接线")
         raise SystemExit(1)
-
-    # 【新增】连接WiFi并建立到ESP32的TCP连接（视觉结果走网络，不再占ESP32串口）
-    if not wifi_connect():
-        print("[K230] WiFi连接失败，继续运行，发送时会自动重连")
-    try:
-        net_connect()
-    except Exception as e:
-        print("[K230] 首次TCP连接失败(将自动重连):", e)
 
     clock = time.clock()
 
