@@ -163,8 +163,6 @@ const char* getPrioName(int p);
 void VoiceRecognitionTask(void* pvParameters);
 String doVoiceRecognition();
 void handleVoiceCommand(const char* text);
-String base64Encode(const uint8_t* data, size_t len);  // Base64编码
-size_t base64ToBuffer(const uint8_t* data, size_t len, char* out);  // Base64写缓冲区（省内部堆）
 // ==================== 工具函数实现 ====================
 /**
 * URL编码
@@ -242,6 +240,9 @@ volatile bool  is_tts_requesting = false;  // TTS请求状态标志，防止重�
 unsigned long  tts_request_start_time = 0;
 // TTS请求标志互斥锁（防止竞态条件）
 SemaphoreHandle_t ttsRequestMutex = NULL;
+// 【新增】ASR改走MQTT：后端识别结果回传缓冲 + 信号量（MQTT回调→语音任务 跨任务传递）
+String asrResultText = "";
+SemaphoreHandle_t asrResultSem = NULL;
 // TTS请求标志的安全访问函数
 inline void setTTSRequesting(bool value) {
 if (ttsRequestMutex != NULL) {
@@ -783,6 +784,7 @@ mqtt.subscribe(MQTT_TOPIC_NAV_STEPS);
 mqtt.subscribe(MQTT_TOPIC_TTS_REQ);
 mqtt.subscribe("blindstick/config/home_city");
 mqtt.subscribe("blindstick/stats/detour");
+mqtt.subscribe("blindstick/asr/result");  // 【新增】接收后端识别结果（ASR走MQTT）
 retry_count = 0;
 // 【开机语音】只在系统启动后的首次MQTT连接时播放一次
 if (!startup_announced && !startup_announced_rtc) {
@@ -805,6 +807,18 @@ mqtt_reconnect_nonblocking();
 }
 // ==================== MQTT 消息回调（支持流式TTS）====================
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+// ===== 【新增】ASR识别结果（后端经MQTT回传，唤醒语音任务）=====
+if (strcmp(topic, "blindstick/asr/result") == 0) {
+    StaticJsonDocument<512> doc;
+    DeserializationError err = deserializeJson(doc, payload, length);
+    if (!err) {
+        const char* t = doc["text"];
+        asrResultText = String(t ? t : "");
+        Serial.printf("[语音诊断] 收到ASR结果: '%s'\n", asrResultText.c_str());
+        if (asrResultSem) xSemaphoreGive(asrResultSem);
+    }
+    return;
+}
 // ===== 流式TTS控制消息处理（最高优先级）=====
 if (strcmp(topic, "blindstick/tts/control") == 0) {
 handleStreamControl((const char*)payload, length);
@@ -1684,122 +1698,63 @@ String doVoiceRecognition() {
         return "";
     }
 
-    // 【内存修复】base64+JSON改用PSRAM/堆缓冲，避免大String占内部堆挤掉MQTT的TLS连接
-    size_t b64Cap = ((totalRead + 2) / 3) * 4 + 1;
-    char* b64Buf = (char*)heap_caps_malloc(b64Cap, MALLOC_CAP_SPIRAM);
-    if (!b64Buf) {
-        b64Buf = (char*)malloc(b64Cap);
-    }
-    if (!b64Buf) {
+    // 【MQTT-ASR】改用MQTT把PCM分片发给后端识别：HTTP在本环境下被拒(connection refused)，
+    // 而MQTT(TTS正在用)稳定可用。后端拼回PCM→百度识别→把文本发到 blindstick/asr/result。
+    if (!mqtt.connected()) {
         free(pcmBuffer);
-        Serial.println("[语音诊断] Base64缓冲分配失败");
+        Serial.println("[语音诊断] MQTT未连接，跳过识别");
         return "";
     }
-    base64ToBuffer(pcmBuffer, totalRead, b64Buf);
+    // 清掉可能的残留结果，准备接收
+    if (asrResultSem) xSemaphoreTake(asrResultSem, 0);
+    asrResultText = "";
+
+    const int ASR_CHUNK = 4000;   // 须小于 mqtt.setBufferSize(8192)
+    int segments = (int)((totalRead + ASR_CHUNK - 1) / ASR_CHUNK);
+    int asrSession = (int)(millis() % 100000);
+
+    // 1) 会话开始
+    {
+        StaticJsonDocument<128> d;
+        d["type"] = "start"; d["session_id"] = asrSession; d["segments"] = segments;
+        char ctrlBuf[128]; size_t n = serializeJson(d, ctrlBuf, sizeof(ctrlBuf));
+        mqtt.publish("blindstick/asr/control", (const uint8_t*)ctrlBuf, n);
+    }
+    // 2) 逐片发送PCM（原始字节，不上base64，省流量）
+    for (int i = 0; i < segments; i++) {
+        int off = i * ASR_CHUNK;
+        int len = (int)totalRead - off;
+        if (len > ASR_CHUNK) len = ASR_CHUNK;
+        char topic[32];
+        snprintf(topic, sizeof(topic), "blindstick/asr/stream/%d", i);
+        mqtt.publish(topic, (const uint8_t*)(pcmBuffer + off), len);
+        vTaskDelay(5 / portTICK_PERIOD_MS);
+    }
+    // 3) 会话结束 → 通知后端开始识别
+    {
+        StaticJsonDocument<128> d;
+        d["type"] = "end"; d["session_id"] = asrSession; d["segments"] = segments;
+        char ctrlBuf[128]; size_t n = serializeJson(d, ctrlBuf, sizeof(ctrlBuf));
+        mqtt.publish("blindstick/asr/control", (const uint8_t*)ctrlBuf, n);
+    }
     free(pcmBuffer);
-    // 【代理ASR】改走Render后端 /api/asr 转发百度识别（热点拦ESP32直连百度，后端可达）
-    WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(20000);
-    HTTPClient http;
-    if (!http.begin(client, "https://blindstick-4.onrender.com/api/asr")) {
-        free(b64Buf);
-        Serial.println("[语音诊断] 代理ASR HTTP初始化失败（连不上 Render 后端）");
-        return "";
-    }
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(20000);
-    // 构造JSON body到PSRAM/堆缓冲（不再用大String）
-    size_t jsonCap = b64Cap + 64;
-    char* jsonBuf = (char*)heap_caps_malloc(jsonCap, MALLOC_CAP_SPIRAM);
-    if (!jsonBuf) {
-        jsonBuf = (char*)malloc(jsonCap);
-    }
-    if (!jsonBuf) {
-        free(b64Buf);
-        Serial.println("[语音诊断] JSON缓冲分配失败");
-        return "";
-    }
-    int jsonLen = snprintf(jsonBuf, jsonCap, "{\"speech\":\"%s\",\"len\":%u}", b64Buf, (unsigned)totalRead);
-    free(b64Buf);  // 释放base64，降低峰值
-    Serial.printf("[语音诊断] 发送ASR请求 body=%d字节 heap=%u psram=%u\n", jsonLen,
-                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
-    int httpCode = http.POST((uint8_t*)jsonBuf, jsonLen);
+    Serial.printf("[语音诊断] 已发ASR音频 %d字节/%d片，等待识别结果...\n", (int)totalRead, segments);
+
+    // 4) 等后端把文本发回（mqtt_callback 收到 blindstick/asr/result 会释放信号量）
     String result = "";
-    if (httpCode == 200) {
-        String response = http.getString();
-        StaticJsonDocument<1024> respDoc;
-        DeserializationError error = deserializeJson(respDoc, response);
-        if (!error && respDoc["err_no"] == 0) {
-            result = respDoc["text"].as<String>();
-            // 去除标点符号
-            result.replace("。", "");
-            result.replace("，", "");
-            result.replace("？", "");
-            result.replace("！", "");
-            result.trim();
-            // 【诊断】成功也打印：识别为空时也能看到，不再"毫无输出"
-            Serial.printf("[语音诊断] 代理ASR成功 len=%d text='%s'\n", result.length(), result.c_str());
-        } else {
-            // 【诊断】代理ASR返回错误
-            int errNo = respDoc["err_no"] | -1;
-            const char* msg = respDoc["msg"] | "";
-            Serial.printf("[语音诊断] 代理ASR错误 err_no=%d msg=%s\n", errNo, msg);
-        }
+    if (asrResultSem && xSemaphoreTake(asrResultSem, pdMS_TO_TICKS(10000)) == pdTRUE) {
+        result = asrResultText;
+        asrResultText = "";
+        result.replace("。", "");
+        result.replace("，", "");
+        result.replace("？", "");
+        result.replace("！", "");
+        result.trim();
     } else {
-        // 【诊断】代理ASR HTTP失败（附带原因字符串，定位-1到底是连接/超时/内存）
-        Serial.printf("[语音诊断] 代理ASR HTTP失败 code=%d err=%s\n", httpCode, http.errorToString(httpCode).c_str());
+        Serial.println("[语音诊断] 等待ASR结果超时");
     }
-    http.end();
-    free(jsonBuf);
+    Serial.printf("[语音诊断] ASR结果: '%s'\n", result.c_str());
     return result;
-}
-/**
-* Base64编码
-*/
-String base64Encode(const uint8_t* data, size_t len) {
-static const char base64Chars[] =
-"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-String encoded = "";
-uint8_t temp[3];
-size_t i = 0;
-while (i < len) {
-int remain = len - i;
-for (int j = 0; j < 3; j++) {
-temp[j] = (i + j < len) ? data[i + j] : 0;
-}
-encoded += base64Chars[(temp[0] >> 2) & 0x3F];
-encoded += base64Chars[((temp[0] << 4) | (temp[1] >> 4)) & 0x3F];
-encoded += (remain > 1) ? base64Chars[((temp[1] << 2) | (temp[2] >> 6)) & 0x3F] : '=';
-encoded += (remain > 2) ? base64Chars[temp[2] & 0x3F] : '=';
-i += 3;
-}
-return encoded;
-}
-/**
-* Base64写入缓冲区（不产生大String，用于PSRAM内存优化）
-*/
-size_t base64ToBuffer(const uint8_t* data, size_t len, char* out) {
-static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-size_t oi = 0;
-size_t i = 0;
-for (; i + 3 <= len; i += 3) {
-uint32_t v = ((uint32_t)data[i] << 16) | ((uint32_t)data[i+1] << 8) | data[i+2];
-out[oi++] = b64[(v >> 18) & 0x3F];
-out[oi++] = b64[(v >> 12) & 0x3F];
-out[oi++] = b64[(v >> 6) & 0x3F];
-out[oi++] = b64[v & 0x3F];
-}
-if (i < len) {
-uint32_t v = (uint32_t)data[i] << 16;
-if (i + 1 < len) v |= (uint32_t)data[i+1] << 8;
-out[oi++] = b64[(v >> 18) & 0x3F];
-out[oi++] = b64[(v >> 12) & 0x3F];
-out[oi++] = (i + 1 < len) ? b64[(v >> 6) & 0x3F] : '=';
-out[oi++] = '=';
-}
-out[oi] = '\0';
-return oi;
 }
 // ==================== setup / loop ====================
 void setup() {
@@ -1866,6 +1821,8 @@ current_step_idx = 0; current_progress = 0; nav_active = false;
 audioMutex = xSemaphoreCreateMutex();
 // 初始化TTS请求标志互斥锁
 ttsRequestMutex = xSemaphoreCreateMutex();
+// 【新增】ASR结果信号量（语音任务等待后端识别结果）
+asrResultSem = xSemaphoreCreateBinary();
 // 初始化流式TTS
 initStreamingTTS();
 i2s_out_init();

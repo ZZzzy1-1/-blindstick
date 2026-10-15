@@ -16,6 +16,7 @@ import asyncio
 import websockets
 import threading
 import queue
+import base64
 
 # ==================== Config ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -190,11 +191,22 @@ class MQTTAudioSender:
         self.max_retries = 99999
         # 【修复】客户端ID加随机后缀，避免与其他实例冲突被踢下线
         self.client_id = "proxy_server_tts_" + str(int(time.time() * 1000))[-8:]
+        # 【新增】ASR（语音识别改走MQTT）分片重装缓冲
+        self.asr_buf = bytearray()
+        self.asr_collecting = False
+        self.asr_session = 0
 
     def on_message(self, client, userdata, msg):
         """处理接收到的MQTT消息 - 使用线程池异步处理避免阻塞"""
         try:
             topic = msg.topic
+
+            # 【新增】ASR音频分片是二进制，不能按utf-8解码，直接追加到重装缓冲
+            if topic.startswith("blindstick/asr/stream/"):
+                if self.asr_collecting:
+                    self.asr_buf.extend(msg.payload)
+                return
+
             payload = msg.payload.decode('utf-8')
             print(f"[MQTT] Received on {topic}: {payload[:80]}...")
 
@@ -216,6 +228,24 @@ class MQTTAudioSender:
                         daemon=True
                     )
                     t.start()
+            elif topic == "blindstick/asr/control":
+                # 【新增】ASR分片会话控制：start清空缓冲，end触发识别
+                data = json.loads(payload)
+                ctype = data.get("type", "")
+                if ctype == "start":
+                    self.asr_buf = bytearray()
+                    self.asr_collecting = True
+                    self.asr_session = data.get("session_id", 0)
+                    print(f"[ASR] 开始接收语音 session={self.asr_session} 预期{data.get('segments')}片")
+                elif ctype == "end":
+                    self.asr_collecting = False
+                    pcm = bytes(self.asr_buf)
+                    self.asr_buf = bytearray()
+                    if pcm:
+                        print(f"[ASR] 语音接收完成 {len(pcm)}字节，开始识别")
+                        threading.Thread(target=self.handle_asr_audio, args=(pcm,), daemon=True).start()
+                    else:
+                        print("[ASR] 未收到音频，跳过")
 
         except Exception as e:
             print(f"[MQTT] Message handling error: {e}")
@@ -354,6 +384,45 @@ class MQTTAudioSender:
         }))
         print(f"[TTS] MQTT音频推送完成: {len(audio)}字节/{segments}片 session={session_id}")
 
+    def handle_asr_audio(self, pcm):
+        """【新增】ASR：把重装好的PCM经百度识别，文本发回 blindstick/asr/result。
+        走MQTT而非HTTP：ESP32在MQTT已占用TLS时再开第二条TLS会失败（实测connection refused）
+        """
+        try:
+            token = get_baidu_token()
+            if not token:
+                print("[ASR] 无法获取百度token")
+                self._publish_asr_result("")
+                return
+            payload = {
+                "format": "pcm",
+                "rate": 16000,
+                "channel": 1,
+                "cuid": "blindstick_proxy",
+                "token": token,
+                "dev_pid": 1537,
+                "speech": base64.b64encode(pcm).decode(),
+                "len": len(pcm),
+            }
+            resp = requests.post("https://vop.baidu.com/server_api", json=payload, timeout=15, verify=False)
+            rdata = resp.json()
+            print(f"[ASR] Baidu err_no={rdata.get('err_no')} result={rdata.get('result')}")
+            text = rdata["result"][0] if (rdata.get("err_no") == 0 and rdata.get("result")) else ""
+            self._publish_asr_result(text)
+        except Exception as e:
+            print(f"[ASR] Error: {e}")
+            import traceback
+            traceback.print_exc()
+            self._publish_asr_result("")
+
+    def _publish_asr_result(self, text):
+        """把识别文本发回给ESP32（ESP32订阅 blindstick/asr/result）"""
+        if self.client and self.connected:
+            self.client.publish("blindstick/asr/result", json.dumps({"text": text or ""}))
+            print(f"[ASR] 已回发识别结果: '{text}'")
+        else:
+            print("[ASR] MQTT未连接，无法回发结果")
+
     def connect(self):
         if not MQTT_AVAILABLE:
             print("[MQTT] paho-mqtt not available")
@@ -407,6 +476,10 @@ class MQTTAudioSender:
                     try:
                         client.subscribe("blindstick/tts/request")
                         print("[MQTT] Subscribed to blindstick/tts/request")
+                        # 【新增】订阅ASR音频（语音识别改走MQTT）
+                        client.subscribe("blindstick/asr/control")
+                        client.subscribe("blindstick/asr/stream/+")
+                        print("[MQTT] Subscribed to blindstick/asr/*")
                     except Exception as e:
                         print(f"[MQTT] 订阅失败: {e}")
                 else:
