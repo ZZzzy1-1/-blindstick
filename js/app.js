@@ -174,7 +174,7 @@ const DESTINATION_FILTER_WORDS = [
     '附近', '周围', '旁边', '对面', '这里', '那里', '哪儿', '哪里'
 ];
 
-const NAVIGATION_TRIGGERS = ['带我去', '我要去', '我想去', '导航到', '我去', '去', '到', '往', '走', '来'];
+const NAVIGATION_TRIGGERS = ['带我去', '我要去', '我想去', '导航到', '我去'];
 
 // ================= 最大导航距离（米）====================
 const MAX_NAVIGATION_DISTANCE = 10000;

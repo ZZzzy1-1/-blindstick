@@ -61,8 +61,8 @@ const String BAIDU_SECRET_KEY     = "Tw485P2BFGpPu8WeOVP6hy4S1BHqG4ON";
 // ==================== 语音识别和导航配置 ====================
 #define MAX_NAVIGATION_DISTANCE 10000  // 最大导航距离10公里（米）
 // 导航触发词
-const char* NAV_TRIGGERS[] = {"带我去", "我要去", "我想去", "导航到", "我去", "去", "到"};
-const int NAV_TRIGGER_COUNT = 7;
+const char* NAV_TRIGGERS[] = {"带我去", "我要去", "我想去", "导航到", "我去"};
+const int NAV_TRIGGER_COUNT = 5;
 // 需要过滤的非目的地词汇
 const char* FILTER_WORDS[] = {
 "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个",
@@ -840,8 +840,10 @@ StaticJsonDocument<256> doc;
 DeserializationError err = deserializeJson(doc, payload, length);
 if (!err && doc.containsKey("city")) {
 const char* new_city = doc["city"];
+// 【修复】只有城市真正变化时才播报确认，避免重复/保留消息导致反复播报
+bool cityChanged = (home_city != String(new_city));
 home_city = String(new_city);
-// 播报确认
+if (cityChanged) {
 StaticJsonDocument<256> ttsDoc;
 char confirmText[64];
 snprintf(confirmText, sizeof(confirmText), "常住地已设置为%s", home_city.c_str());
@@ -850,6 +852,7 @@ ttsDoc["priority"] = PRIO_NORMAL;
 char buf[256];
 size_t len = serializeJson(ttsDoc, buf, sizeof(buf));
 mqtt.publish("blindstick/tts/request", buf, len);
+}
 }
 return;
 }
@@ -874,6 +877,8 @@ if (xSemaphoreTake(audioMutex, portMAX_DELAY) == pdTRUE) {
 uint8_t* audio_buf = (uint8_t*)allocateBuffer(length);
 if (audio_buf == NULL) {
 xSemaphoreGive(audioMutex);
+// 【修复】分配失败也必须恢复语音识别，否则任务永久挂起、不再监听
+if (VoiceTaskHandle != NULL && eTaskGetState(VoiceTaskHandle) == eSuspended) vTaskResume(VoiceTaskHandle);
 return;
 }
 memcpy(audio_buf, payload, length);
@@ -934,6 +939,21 @@ void checkObstacleStat() {
     if (is_ai_talking && (millis() - ai_talking_start_time > AI_TALKING_TIMEOUT_MS)) {
         Serial.println("[TTS超时] is_ai_talking 超时，自动重置");
         is_ai_talking = false;
+    }
+
+    // 【新增】语音任务看门狗：被挂起(TTS异常未恢复)超过20秒就强制恢复，保证"一直识别"
+    if (VoiceTaskHandle != NULL) {
+        static unsigned long suspSince = 0;
+        if (eTaskGetState(VoiceTaskHandle) == eSuspended) {
+            if (suspSince == 0) suspSince = millis();
+            else if (millis() - suspSince > 20000) {
+                vTaskResume(VoiceTaskHandle);
+                suspSince = 0;
+                Serial.println("[语音识别] 挂起超时，强制恢复监听");
+            }
+        } else {
+            suspSince = 0;
+        }
     }
 
     // 三向雷达: [0]=前方, [1]=左方, [2]=右方
@@ -1465,15 +1485,10 @@ bool isTtsEcho(const char* result) {
 }
 
 void VoiceRecognitionTask(void* pvParameters) {
-// 等待WiFi连接（最多60秒）
-int waitCount = 0;
-while (WiFi.status() != WL_CONNECTED && waitCount < 60) {
+// 【修复】不再因WiFi未连上就自删任务（否则语音识别永久失效，表现为串口再无语音输出）
+// 改为一直等WiFi就绪再开始监听
+while (WiFi.status() != WL_CONNECTED) {
 vTaskDelay(1000 / portTICK_PERIOD_MS);
-waitCount++;
-}
-if (WiFi.status() != WL_CONNECTED) {
-vTaskDelete(NULL);
-return;
 }
 // 【修复】不再依赖 startup_announced（RTC变量在重启后为true，导致等待10秒才启动识别）
 // 开机语音播放时会由 handleTTSUrl 自动挂起/恢复本任务，无需主动等待
@@ -1728,8 +1743,8 @@ String doVoiceRecognition() {
             Serial.printf("[语音诊断] 代理ASR错误 err_no=%d msg=%s\n", errNo, msg);
         }
     } else {
-        // 【诊断】代理ASR HTTP失败
-        Serial.printf("[语音诊断] 代理ASR HTTP失败 code=%d\n", httpCode);
+        // 【诊断】代理ASR HTTP失败（附带原因字符串，定位-1到底是连接/超时/内存）
+        Serial.printf("[语音诊断] 代理ASR HTTP失败 code=%d err=%s\n", httpCode, http.errorToString(httpCode).c_str());
     }
     http.end();
     free(jsonBuf);
