@@ -1,9 +1,9 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <WiFiUdp.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <HardwareSerial.h>
-#include <SoftwareSerial.h>  // 软串口库
 #include <PubSubClient.h>
 #include <driver/i2s.h>
 #include <freertos/FreeRTOS.h>
@@ -83,19 +83,22 @@ const int FILTER_WORD_COUNT = 34;
 static const uint8_t YDLIDAR_CMD_START[] = { 0xA5, 0x60, 0x00, 0x60, 0x01, 0x00, 0x60, 0xE8 };
 static const uint8_t YDLIDAR_CMD_STOP[]  = { 0xA5, 0x65, 0x00, 0x65, 0x01, 0x00, 0x65, 0x1B };
 static const uint8_t YDLIDAR_CMD_RESET[] = { 0xA5, 0x40, 0x00, 0x40, 0x01, 0x00, 0x40, 0x97 };
-// ==================== GPS软串口配置 ====================
-// GPS改为软串口（原K230引脚）
-// 【修复】RX/TX接反：ATGM336H TX → GPIO17(软串口RX)，GPS RX → GPIO16(软串口TX)
-#define GPS_SOFT_RX_PIN     17   // GPS TX → ESP32 GPIO17 (软串口RX)
-#define GPS_SOFT_TX_PIN     16   // GPS RX → ESP32 GPIO16 (软串口TX)
-SoftwareSerial gpsSerial(GPS_SOFT_RX_PIN, GPS_SOFT_TX_PIN);  // GPS软串口
-// ==================== K230硬件串口配置 ====================
-// K230使用硬件串口UART2
-#define K230_UART_ID        2      // UART2
-#define K230_UART_BAUD      115200
-#define K230_RX_PIN         15      // K230 TX → ESP32 GPIO15 (UART2 RX)
-#define K230_TX_PIN         7       // K230 RX → ESP32 GPIO7 (UART2 TX)
-HardwareSerial k230Serial(2);      // K230硬件串口使用UART2
+// ==================== GPS硬件串口配置（UART2，原K230占用）====================
+// 【修复】GPS从软串口(SoftwareSerial)改用硬件串口UART2：软串口靠CPU逐位收发，
+// 被WiFi/雷达任务抢占时丢包，导致卫星数收不到；硬件串口由外设驱动不占CPU。
+// 接线：ATGM336H TX → GPIO17(ESP32 RX)，GPS RX → GPIO16(ESP32 TX)
+#define GPS_UART_ID         2      // UART2（从K230让出）
+#define GPS_RX_PIN          17     // GPS TX → ESP32 GPIO17 (UART2 RX)
+#define GPS_TX_PIN          16     // GPS RX → ESP32 GPIO16 (UART2 TX)
+HardwareSerial gpsSerial(2);       // GPS硬件串口
+// ==================== K230链路：TCP服务端 + UDP发现（原UART2让给GPS）====================
+// K230改为WiFi/TCP直连：本机开TCP服务器，K230作客户端发送DETS帧（帧格式不变）
+// 【新增】UDP发现：K230广播探测过来，本机单播回复自己的IP，热点网段/IP漂移也能连上
+#define K230_TCP_PORT       8899
+#define K230_UDP_PORT       8898
+WiFiServer k230Server(K230_TCP_PORT);
+WiFiClient k230Client;
+WiFiUDP    k230Udp;
 #define RECORD_BUTTON_PIN  0
 // ==================== I2S麦克风引脚 (INMP441) ====================
 // 实际硬件接线：
@@ -379,15 +382,16 @@ void motorControl(int steerPower) {
     int safePower = constrain(steerPower, -STEER_MAX_PWM, STEER_MAX_PWM);
     if (safePower > 15) {
         // 👉 产生向右的动力
-        digitalWrite(MOTOR_IN1, LOW);
-        digitalWrite(MOTOR_IN2, HIGH);
+        // 【修复】本车实际转向与代码约定相反（正数应右转），交换IN1/IN2电平纠正
+        digitalWrite(MOTOR_IN1, HIGH);
+        digitalWrite(MOTOR_IN2, LOW);
         analogWrite(MOTOR_PWM, safePower);
         last_motor_dir = "right";
     }
     else if (safePower < -15) {
         // 👈 产生向左的动力
-        digitalWrite(MOTOR_IN1, HIGH);
-        digitalWrite(MOTOR_IN2, LOW);
+        digitalWrite(MOTOR_IN1, LOW);
+        digitalWrite(MOTOR_IN2, HIGH);
         analogWrite(MOTOR_PWM, abs(safePower));
         last_motor_dir = "left";
     }
@@ -575,17 +579,17 @@ void processK230Data() {
     static unsigned long lastK230Diag = 0;
     if (millis() - lastK230Diag > 5000) {
         lastK230Diag = millis();
-        Serial.printf("[K230诊断] 串口可用:%d 缓冲:%d\n", k230Serial.available(), k230_receiveBuffer.length());
+        Serial.printf("[K230诊断] TCP可用:%d 缓冲:%d 连接:%d\n", k230Client.available(), k230_receiveBuffer.length(), k230Client.connected());
     }
     // 【修改】每次尽量读空K230缓冲（上限1024字符），避障忙时K230数据不再被覆盖丢弃
-    int maxChars = k230Serial.available();
+    int maxChars = k230Client.available();
     if (maxChars > 1024) maxChars = 1024;
     // 【修改】乱码可能让缓冲区堆积垃圾：超过512字符直接丢弃，防止无限增长
     if (k230_receiveBuffer.length() > 512) {
         k230_receiveBuffer = "";
     }
-while (k230Serial.available() > 0 && maxChars-- > 0) {
-char c = k230Serial.read();
+while (k230Client.available() > 0 && maxChars-- > 0) {
+char c = k230Client.read();
 if (c == '\n') {
 k230_receiveBuffer.trim();
 if (k230_receiveBuffer.length() > 0) {
@@ -1286,18 +1290,19 @@ Serial.printf("[雷达] Serial1初始化 RX=GPIO%d 波特率=115200\n", RADAR_RX
 delay(200);  // 等待串口就绪
 Serial1.write(YDLIDAR_CMD_START, sizeof(YDLIDAR_CMD_START));
 Serial.println("[雷达] 已发送YDLIDAR启动命令");
-// GPS改为软串口（波特率自动检测）
+// GPS用硬件串口UART2（波特率自动检测）
 gps_baud_index = 0;
-gpsSerial.begin(gps_baud_table[gps_baud_index]);
-gpsSerial.listen();  // 必须listen才会开始接收RX数据
+gpsSerial.setRxBufferSize(1024);  // 【修复】硬件串口接收缓冲，防NMEA被顶掉
+gpsSerial.begin(gps_baud_table[gps_baud_index], SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 gps_baud_try_start = millis();
-Serial.printf("[GPS] 软串口初始化，尝试波特率=%d\n", gps_baud_table[gps_baud_index]);
-// K230硬件串口UART2
-// 【修复】加大K230串口接收缓冲区：避障日志刷屏、主循环变慢时，K230数据不被顶掉
-k230Serial.setRxBufferSize(4096);  // 必须在begin()之前调用
-k230Serial.begin(K230_UART_BAUD, SERIAL_8N1, K230_RX_PIN, K230_TX_PIN);
-Serial.printf("[K230] UART%d初始化 RX=GPIO%d TX=GPIO%d\n",
-K230_UART_ID, K230_RX_PIN, K230_TX_PIN);
+Serial.printf("[GPS] 硬件串口UART%d初始化 RX=GPIO%d TX=GPIO%d，尝试波特率=%d\n",
+GPS_UART_ID, GPS_RX_PIN, GPS_TX_PIN, gps_baud_table[gps_baud_index]);
+// K230链路：启动TCP服务器 + UDP发现，等待K230连接（视觉结果走网络，不再占串口）
+k230Server.begin();
+k230Server.setNoDelay(true);
+k230Udp.begin(K230_UDP_PORT);
+Serial.printf("[K230] TCP服务端:%d UDP发现:%d 已启动\n", K230_TCP_PORT, K230_UDP_PORT);
+Serial.printf("[K230] 本机IP=%s （K230会自动发现，无需填IP）\n", WiFi.localIP().toString().c_str());
 unsigned long lastStatusPrint = 0;
 int radarByteCount = 0;
 // 【新增】雷达数据定时重置周期
@@ -1305,6 +1310,33 @@ unsigned long lastRadarReset = 0;
 const unsigned long RADAR_RESET_INTERVAL_MS = 500;  // 每500ms重置一次数据
 
 while (true) {
+// K230 TCP客户端接入/断线重连（非阻塞，不拖慢避障循环）
+if (!k230Client.connected()) {
+WiFiClient newClient = k230Server.available();
+if (newClient) {
+k230Client = newClient;
+k230Client.setNoDelay(true);
+Serial.printf("[K230] 客户端已连接: %s\n", k230Client.remoteIP().toString().c_str());
+}
+}
+// K230 UDP发现：收到探测就单播回复本机IP（热点网段/IP漂移也能找到）
+int udpLen = k230Udp.parsePacket();
+if (udpLen > 0) {
+char udpBuf[32];
+int uLen = k230Udp.read(udpBuf, sizeof(udpBuf) - 1);
+if (uLen > 0) {
+udpBuf[uLen] = '\0';
+if (strstr(udpBuf, "BLINDSTICK") != NULL) {
+char reply[64];
+snprintf(reply, sizeof(reply), "BLINDSTICK_IP %s %d",
+WiFi.localIP().toString().c_str(), K230_TCP_PORT);
+k230Udp.beginPacket(k230Udp.remoteIP(), k230Udp.remotePort());
+k230Udp.write((const uint8_t*)reply, strlen(reply));
+k230Udp.endPacket();
+Serial.printf("[K230] 回复发现请求 -> %s\n", k230Udp.remoteIP().toString().c_str());
+}
+}
+}
 // 【新增】定时重置距离数据，确保数据新鲜度
 unsigned long now = millis();
 if (now - lastRadarReset >= RADAR_RESET_INTERVAL_MS) {
@@ -1338,8 +1370,7 @@ if (!gps_baud_locked && (now2 - gps_baud_try_start > 4000)) {
 if (!gps_got_nmea) {
 // 当前波特率收不到有效NMEA，切换下一个（最多完整试2轮后停止，避免无限空转）
 gps_baud_index = (gps_baud_index + 1) % gps_baud_count;
-gpsSerial.begin(gps_baud_table[gps_baud_index]);
-gpsSerial.listen();  // 切换波特率后也要重新listen
+gpsSerial.begin(gps_baud_table[gps_baud_index], SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 gps_baud_try_start = now2;
 Serial.printf("[GPS] 当前波特率无有效NMEA，切换到:%d\n", gps_baud_table[gps_baud_index]);
 } else {
@@ -1972,7 +2003,9 @@ i2s_out_init();
 i2s_init();
 // 播放测试音确认扬声器工作
 playLocalStartupTone();
-// 【修复】覆盖热点下发的DNS，改用国内公共DNS（热点DNS常解析不到onrender.com导致下载-1）
+// 【修复】热点DNS常解析不到onrender.com，改用国内公共DNS
+// 【修改】改回DHCP：热点网段会漂移，写死IP反而连不上；K230端已改为UDP自动发现ESP32
+WiFi.mode(WIFI_STA);
 WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, IPAddress(223, 5, 5, 5), IPAddress(114, 114, 114, 114));
 // 连接WiFi
 WiFi.begin(WIFI_SSID, WIFI_PASSWORD);

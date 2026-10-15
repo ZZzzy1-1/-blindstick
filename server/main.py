@@ -1,5 +1,5 @@
 '''
-实验名称：物体检测（基于yolov8n）+ ESP32 串口通信
+实验名称：物体检测（基于yolov8n）+ ESP32 WiFi/TCP 通信
 实验平台：01Studio CanMV K230
 教程：wiki.01studio.cc
 '''
@@ -22,19 +22,143 @@ import gc
 import sys
 import aidemo
 
-# ======================= 新加：串口初始化（对接ESP32）=======================
-# 【无屏型号】UART2 用 GPIO5/6（TX=GPIO5 -> ESP32 RX，RX=GPIO6）
-from machine import UART
+# ======================= 网络初始化（K230 → ESP32 走 WiFi/TCP）=======================
+# 【改动】原K230占用的ESP32 UART2已让给GPS；K230视觉结果改走WiFi/TCP直连ESP32。
+# ESP32的IP由UDP自动发现（见 discover_esp32），热点网段漂移也不用改代码。
+import network
+import socket
 
-K230_UART_ID = 2          # UART2（不是UART1）
-K230_UART_BAUD = 115200
-K230_UART_TX_PIN = 5      # GPIO5 -> ESP32 RX
-K230_UART_RX_PIN = 6      # GPIO6 -> ESP32 TX（可选）
-uart = UART(K230_UART_ID, K230_UART_BAUD, tx=K230_UART_TX_PIN, rx=K230_UART_RX_PIN)
-print(f"[串口] UART{K230_UART_ID} 初始化 TX=GPIO{K230_UART_TX_PIN} RX=GPIO{K230_UART_RX_PIN} 波特={K230_UART_BAUD}")
-# 【诊断】UART初始化成功立即发一行固定标记，ESP32端"未知帧"日志会打印它，
-# 用来区分三种情况：看到标记=接线+UART都通、后续问题在模型/摄像头；看不到=main.py没跑或引脚不对
-uart.write("[K230-BOOT] main.py started\n")
+WIFI_SSID = "ZYT"
+WIFI_PASSWORD = "zyt123456"
+ESP32_PORT = 8899
+UDP_DISCOVER_PORT = 8898
+ESP32_IP = None   # None=用UDP自动发现ESP32；也可手动写死一个IP来跳过发现
+
+
+def wifi_connect():
+    """连接热点，返回是否成功"""
+    try:
+        wlan = network.WLAN(network.STA_IF)
+        wlan.active(True)
+        if not wlan.isconnected():
+            print("[WiFi] 连接 %s ..." % WIFI_SSID)
+            wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+            for _ in range(60):   # 最多等约30秒
+                if wlan.isconnected():
+                    break
+                time.sleep_ms(500)
+        if wlan.isconnected():
+            print("[WiFi] 已连接, IP:", wlan.ifconfig()[0])
+            return True
+    except Exception as e:
+        print("[WiFi] 连接异常:", e)
+    print("[WiFi] 连接失败")
+    return False
+
+
+sock = None
+
+
+def _subnet_broadcast():
+    """按当前IP/掩码算出子网广播地址，返回字符串或None"""
+    try:
+        ip, mask, _gw, _dns = network.WLAN(network.STA_IF).ifconfig()
+        i = [int(x) for x in ip.split('.')]
+        m = [int(x) for x in mask.split('.')]
+        return ".".join(str(i[k] | (255 - m[k])) for k in range(4))
+    except Exception:
+        return None
+
+
+def discover_esp32(rounds=3):
+    """UDP广播探测ESP32，返回其IP；失败返回None"""
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        u.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    except Exception:
+        pass
+    u.settimeout(1.0)
+    targets = ["255.255.255.255"]
+    sb = _subnet_broadcast()
+    if sb and sb not in targets:
+        targets.append(sb)
+    try:
+        for _ in range(rounds):
+            for t in targets:
+                try:
+                    u.sendto(b"BLINDSTICK_DISCOVER", (t, UDP_DISCOVER_PORT))
+                except Exception:
+                    pass
+            try:
+                data, addr = u.recvfrom(64)
+                text = data.decode()
+                print("[发现] 收到回复:", text, "from", addr)
+                parts = text.split()
+                if len(parts) >= 2 and parts[0] == "BLINDSTICK_IP":
+                    return parts[1]
+                return addr[0]
+            except Exception:
+                continue
+    finally:
+        u.close()
+    return None
+
+
+def net_connect():
+    """发现ESP32并建立TCP连接（失败抛异常由调用方处理）"""
+    global sock, ESP32_IP
+    try:
+        if sock:
+            sock.close()
+    except Exception:
+        pass
+    sock = None
+    ip = ESP32_IP or discover_esp32()
+    if not ip:
+        raise OSError("未发现ESP32（UDP探测无响应）")
+    ESP32_IP = ip
+    s = socket.socket()
+    s.settimeout(1.0)
+    try:
+        s.connect((ip, ESP32_PORT))
+    except Exception:
+        try:
+            s.close()
+        except Exception:
+            pass
+        ESP32_IP = None   # 可能ESP32换了IP，清缓存下次重新发现
+        raise
+    sock = s
+    print("[TCP] 已连接 ESP32", ip, ESP32_PORT)
+
+
+def _raw_send(s, data):
+    """把整帧发完（TCP send可能只发一部分）"""
+    mv = memoryview(data)
+    total = 0
+    n = len(data)
+    while total < n:
+        sent = s.send(mv[total:])
+        if sent == 0:
+            raise OSError("socket closed")
+        total += sent
+
+
+def net_send(data):
+    """发送一帧检测结果；失败则重连一次再试，仍失败就丢弃本帧、不中断检测循环"""
+    global sock
+    payload = data.encode('utf-8') if isinstance(data, str) else data
+    try:
+        if sock is None:
+            net_connect()
+        _raw_send(sock, payload)
+    except Exception as e:
+        print("[TCP] 发送失败，重连:", e)
+        try:
+            net_connect()
+            _raw_send(sock, payload)
+        except Exception as e2:
+            print("[TCP] 重连后仍失败:", e2)
 # ==========================================================================
 
 # 【电机噪声防护】8位累加校验和：每帧末尾追加 #XX（如 DETS:...;#A1）。
@@ -197,6 +321,14 @@ if __name__=="__main__":
         print("[K230] 初始化失败：摄像头或模型加载出错，检查SD卡与摄像头接线")
         raise SystemExit(1)
 
+    # 【新增】连接WiFi并建立到ESP32的TCP连接（视觉结果走网络，不再占ESP32串口）
+    if not wifi_connect():
+        print("[K230] WiFi连接失败，继续运行，发送时会自动重连")
+    try:
+        net_connect()
+    except Exception as e:
+        print("[K230] 首次TCP连接失败(将自动重连):", e)
+
     clock = time.clock()
 
     frame_no = 0                      # 【诊断】控制台打印计数器（每10帧打印一次发送）
@@ -231,13 +363,13 @@ if __name__=="__main__":
                     parts.append(f"{label_name},{conf},{x1},{y1},{w},{h}")
                 send_data = "DETS:" + ";".join(parts)
                 send_data += "#" + frame_crc(send_data) + "\n"
-                uart.write(send_data)
+                net_send(send_data)
             else:
-                uart.write("NONE#" + frame_crc("NONE") + "\n")
+                net_send("NONE#" + frame_crc("NONE") + "\n")
             # ==========================================================================
 
             # 【诊断】控制台只每10帧打印一次发送结果，避免刷屏淹没关键日志
-            # （串口 uart.write 仍是每帧都发，打印只是给调试看）
+            # （net_send 仍是每帧都发，打印只是给调试看）
             frame_no += 1
             if frame_no % 10 == 1:
                 if len(res) > 0:

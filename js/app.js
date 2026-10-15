@@ -44,24 +44,57 @@ const CATEGORY_GROUPS = [
     { key: 'puddle', label: '水坑' }
 ];
 
-// ================= 固定GPS定位（湖北省黄石市黄石港区·湖北师范大学教育大楼）====================
-// 【修改】网页GPS位置固定为教育大楼，不再跟随设备真实GPS；导航也以此为起点
-// 【占位】先这样定死，后续改回设备真实GPS数据
-const FIXED_GPS_LAT = 30.235550;
-const FIXED_GPS_LNG = 115.070175;
-const FIXED_GPS_SPEED = 1.2;           // 【修改】固定步行速度 m/s（假装有真实定位）
-const FIXED_GPS_SATELLITES = 10;       // 【修改】固定卫星数（假装有真实定位）
+// ================= 真实GPS（设备NMEA上报，WGS-84）====================
+// 【修改】不再写死位置，全部使用设备上报的真实GPS
+// 初始地图中心：真实GPS到位前的中性视图，定位后自动居中
+const DEFAULT_MAP_CENTER = [35.0, 105.0];  // 中国大陆概览
 
-// ================= 坐标转换：百度BD-09 → 高德GCJ-02 ====================
-// 【占位】固定坐标是从百度地图读的BD-09，而地图瓦片是高德(GCJ-02)，画图前必须转换，否则红点偏~500米
-// 后续改回真实GPS(WGS-84)数据时：把此函数换成 wgs2gcj(真实GPS放高德也要转GCJ)，文本照旧显示原始坐标
-function bd09ToGcj02(lat, lng) {
+// ================= 坐标转换：WGS-84 → GCJ-02 / BD-09 ====================
+// 设备GPS是WGS-84；高德地图瓦片用GCJ-02(不转则红点偏几百米)，百度地图API用BD-09
+const GCJ_A = 6378245.0;                  // 长半轴
+const GCJ_EE = 0.00669342162296594323;    // 偏心率平方
+
+function _outOfChina(lat, lng) {
+    return (lng < 72.004 || lng > 137.8347) || (lat < 0.8293 || lat > 55.8271);
+}
+function _transformLat(x, y) {
+    let ret = -100.0 + 2.0*x + 3.0*y + 0.2*y*y + 0.1*x*y + 0.2*Math.sqrt(Math.abs(x));
+    ret += (20.0*Math.sin(6.0*x*Math.PI) + 20.0*Math.sin(2.0*x*Math.PI)) * 2.0/3.0;
+    ret += (20.0*Math.sin(y*Math.PI) + 40.0*Math.sin(y/3.0*Math.PI)) * 2.0/3.0;
+    ret += (160.0*Math.sin(y/12.0*Math.PI) + 320.0*Math.sin(y*Math.PI/30.0)) * 2.0/3.0;
+    return ret;
+}
+function _transformLng(x, y) {
+    let ret = 300.0 + x + 2.0*y + 0.1*x*x + 0.1*x*y + 0.1*Math.sqrt(Math.abs(x));
+    ret += (20.0*Math.sin(6.0*x*Math.PI) + 20.0*Math.sin(2.0*x*Math.PI)) * 2.0/3.0;
+    ret += (20.0*Math.sin(x*Math.PI) + 40.0*Math.sin(x/3.0*Math.PI)) * 2.0/3.0;
+    ret += (150.0*Math.sin(x/12.0*Math.PI) + 300.0*Math.sin(x/30.0*Math.PI)) * 2.0/3.0;
+    return ret;
+}
+// WGS-84 → GCJ-02（画到高德图用）
+function wgs2gcj(lat, lng) {
+    if (_outOfChina(lat, lng)) return [lat, lng];
+    let dLat = _transformLat(lng - 105.0, lat - 35.0);
+    let dLng = _transformLng(lng - 105.0, lat - 35.0);
+    const radLat = lat / 180.0 * Math.PI;
+    let magic = Math.sin(radLat);
+    magic = 1 - GCJ_EE * magic * magic;
+    const sqrtMagic = Math.sqrt(magic);
+    dLat = (dLat * 180.0) / ((GCJ_A * (1 - GCJ_EE)) / (magic * sqrtMagic) * Math.PI);
+    dLng = (dLng * 180.0) / (GCJ_A / sqrtMagic * Math.cos(radLat) * Math.PI);
+    return [lat + dLat, lng + dLng];  // [lat, lng] GCJ-02
+}
+// GCJ-02 → BD-09
+function gcj2bd09(lat, lng) {
     const x_pi = Math.PI * 3000.0 / 180.0;
-    const x = lng - 0.0065;
-    const y = lat - 0.006;
-    const z = Math.sqrt(x * x + y * y) - 0.00002 * Math.sin(y * x_pi);
-    const theta = Math.atan2(y, x) - 0.000003 * Math.cos(x * x_pi);
-    return [z * Math.sin(theta), z * Math.cos(theta)];  // [lat, lng] 高德GCJ-02
+    const z = Math.sqrt(lng*lng + lat*lat) + 0.00002 * Math.sin(lat * x_pi);
+    const theta = Math.atan2(lat, lng) + 0.000003 * Math.cos(lng * x_pi);
+    return [z * Math.sin(theta) + 0.006, z * Math.cos(theta) + 0.0065];  // [lat, lng] BD-09
+}
+// WGS-84 → BD-09（百度地图API用）
+function wgs2bd09(lat, lng) {
+    const g = wgs2gcj(lat, lng);
+    return gcj2bd09(g[0], g[1]);
 }
 
 // ================= 全局状态 =================
@@ -80,8 +113,8 @@ const AppState = {
     navHistory: [],
     config: { homeCity: '黄石市' },
     lastObstacleState: false,
-    // 【修改】起点固定为湖北师范大学教育大楼，导航始终从教育大楼出发（不依赖设备真实GPS）
-    lastGpsPos: { lat: FIXED_GPS_LAT, lng: FIXED_GPS_LNG },
+    // 【修改】起点为设备真实GPS，未定位前为 null（导航需先有定位）
+    lastGpsPos: null,
     navStartTime: null,
     navJustStarted: false,
     voiceSegments: [],
@@ -469,7 +502,7 @@ async function handleMqttMessage(topic, payload) {
                 main: true,
                 vision: hasVisionData,
                 radar: hasRadarData,
-                gps: true,  // 【修改】固定显示GPS在线（假装有定位）
+                gps: hasGpsData,  // 【修改】按真实定位状态显示（不再固定在线）
                 voice: true
             };
             updateModuleStatus(deviceStatus);
@@ -494,13 +527,14 @@ async function handleMqttMessage(topic, payload) {
                 }
             }
 
-            // GPS - 兼容新旧字段名
-            // 【修改】位置/速度/卫星全部固定为湖北师范大学教育大楼，假装有真实定位
+            // GPS - 使用设备真实数据（WGS-84）；无定位时 lat/lng 为 0，不更新地图
             if (msg.gps && msg.gps.lat > 1.0 && msg.gps.lng > 1.0) {
-                updateGPS(FIXED_GPS_LNG, FIXED_GPS_LAT, FIXED_GPS_SPEED);
+                const speedVal = Number(msg.gps.speed) || 0;
+                updateGPS(Number(msg.gps.lng), Number(msg.gps.lat), speedVal);
             }
-            // 【修改】卫星数固定显示
-            updateSatellites(FIXED_GPS_SATELLITES);
+            // 卫星数用真实值（兼容 satellites / sats 字段）
+            const gpsSats = msg.gps ? (Number(msg.gps.satellites) || Number(msg.gps.sats) || 0) : 0;
+            updateSatellites(gpsSats);
 
             // ====== K230 视觉检测数据 ======
             if (hasVisionData) {
@@ -793,15 +827,14 @@ let map, pathPolyline, marker;
 function initMap() {
     const mapEl = document.getElementById('map');
     if (!mapEl) return;
-    // 初始视图固定为湖北师范大学教育大楼（BD-09 → GCJ-02 再画到高德图）
-    const fixedGcj = bd09ToGcj02(FIXED_GPS_LAT, FIXED_GPS_LNG);
-    const defaultCenter = fixedGcj;
-    map = L.map('map', { zoomControl: false }).setView(defaultCenter, 15);
+    // 初始视图用中性中心（真实GPS到位后自动居中）；不再写死具体地点
+    map = L.map('map', { zoomControl: false }).setView(DEFAULT_MAP_CENTER, 5);
     L.tileLayer('https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}', {
         subdomains: ['1', '2', '3', '4'], attribution: '© 高德地图'
     }).addTo(map);
     pathPolyline = L.polyline([], { color: '#2563eb', weight: 4 }).addTo(map);
-    marker = L.circleMarker(defaultCenter, { color: '#2563eb', radius: 6, fillColor: '#fff', fillOpacity: 1, weight: 3 }).addTo(map);
+    // 定位标记先不加入地图，收到首个有效GPS后再显示
+    marker = L.circleMarker(DEFAULT_MAP_CENTER, { color: '#2563eb', radius: 6, fillColor: '#fff', fillOpacity: 1, weight: 3 });
     // 【修复】手机/平板旋转或窗口缩放时容器尺寸变化，让Leaflet重新计算铺满尺寸
     window.addEventListener('resize', () => {
         if (map) map.invalidateSize();
@@ -809,8 +842,8 @@ function initMap() {
 }
 
 function updateGPS(lng, lat, speed) {
-    // 【占位】坐标源是百度BD-09读数：画到高德图用GCJ-02，经纬度文本仍显示原始坐标
-    const gcj = bd09ToGcj02(lat, lng);
+    // 设备GPS是WGS-84：画到高德图用GCJ-02，经纬度文本仍显示原始WGS-84读数
+    const gcj = wgs2gcj(lat, lng);
     const pos = [gcj[0], gcj[1]];
 
     // 更新地图中心（仅在首次接收到有效GPS时）
@@ -818,7 +851,8 @@ function updateGPS(lng, lat, speed) {
         map.setView(pos, 15);
         AppState.gpsInitialized = true;
     }
-
+    // 首个定位：把标记加入地图
+    if (marker && map && !map.hasLayer(marker)) marker.addTo(map);
     if (marker) marker.setLatLng(pos);
     if (pathPolyline) pathPolyline.addLatLng(pos);
     if (map) map.panTo(pos);
@@ -1109,7 +1143,12 @@ async function searchNearestDestination(keyword, currentLat, currentLng) {
 }
 
 async function planRouteToNearest(destination, currentLat, currentLng) {
-    const nearestPlace = await searchNearestDestination(destination, currentLat, currentLng);
+    // 无真实定位无法规划路线
+    if (!currentLat || !currentLng) return null;
+    // 设备GPS是WGS-84，百度地点/路线API用BD-09：先转换，保证起点与目的地在同一坐标系
+    const bd = wgs2bd09(currentLat, currentLng);
+    const bdLat = bd[0], bdLng = bd[1];
+    const nearestPlace = await searchNearestDestination(destination, bdLat, bdLng);
 
     if (!nearestPlace) {
         return null;
@@ -1127,7 +1166,7 @@ async function planRouteToNearest(destination, currentLat, currentLng) {
     }
 
     try {
-        const origin = currentLat && currentLng ? `${currentLat},${currentLng}` : `${FIXED_GPS_LAT},${FIXED_GPS_LNG}`;
+        const origin = `${bdLat},${bdLng}`;
         const destLat = nearestPlace.location.lat;
         const destLng = nearestPlace.location.lng;
 
