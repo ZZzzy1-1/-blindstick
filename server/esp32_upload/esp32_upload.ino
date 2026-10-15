@@ -163,6 +163,7 @@ const char* getPrioName(int p);
 void VoiceRecognitionTask(void* pvParameters);
 String doVoiceRecognition();
 void handleVoiceCommand(const char* text);
+void sendAsrChunks(uint8_t* pcm, size_t totalRead);  // ASR音频分片发送（在MqttTask里调用）
 // ==================== 工具函数实现 ====================
 /**
 * URL编码
@@ -243,6 +244,10 @@ SemaphoreHandle_t ttsRequestMutex = NULL;
 // 【新增】ASR改走MQTT：后端识别结果回传缓冲 + 信号量（MQTT回调→语音任务 跨任务传递）
 String asrResultText = "";
 SemaphoreHandle_t asrResultSem = NULL;
+// 【新增】ASR音频发送队列：PubSubClient/mbedTLS非线程安全，绝不能在语音任务里直接publish
+// （并发mqtt.loop会导致TLS状态损坏、连接丢失），统一交给MqttTask发送
+struct AsrSendJob { uint8_t* pcm; size_t len; };
+QueueHandle_t asrSendQueue = NULL;
 // TTS请求标志的安全访问函数
 inline void setTTSRequesting(bool value) {
 if (ttsRequestMutex != NULL) {
@@ -1282,6 +1287,38 @@ vTaskDelay(10 / portTICK_PERIOD_MS);
 }
 }
 
+// ==================== ASR音频分片发送（只在MqttTask里调用，避免跨任务并发操作PubSubClient）====================
+void sendAsrChunks(uint8_t* pcm, size_t totalRead) {
+    const int ASR_CHUNK = 4000;   // 须小于 mqtt.setBufferSize(8192)
+    int segments = (int)((totalRead + ASR_CHUNK - 1) / ASR_CHUNK);
+    int asrSession = (int)(millis() % 100000);
+    // 1) 会话开始
+    {
+        StaticJsonDocument<128> d;
+        d["type"] = "start"; d["session_id"] = asrSession; d["segments"] = segments;
+        char b[128]; size_t n = serializeJson(d, b, sizeof(b));
+        mqtt.publish("blindstick/asr/control", (const uint8_t*)b, n);
+    }
+    // 2) 逐片发送PCM（原始字节，不上base64）
+    for (int i = 0; i < segments; i++) {
+        int off = i * ASR_CHUNK;
+        int len = (int)totalRead - off;
+        if (len > ASR_CHUNK) len = ASR_CHUNK;
+        char topic[32];
+        snprintf(topic, sizeof(topic), "blindstick/asr/stream/%d", i);
+        mqtt.publish(topic, (const uint8_t*)(pcm + off), len);
+        vTaskDelay(5 / portTICK_PERIOD_MS);
+    }
+    // 3) 会话结束 → 通知后端开始识别
+    {
+        StaticJsonDocument<128> d;
+        d["type"] = "end"; d["session_id"] = asrSession; d["segments"] = segments;
+        char b[128]; size_t n = serializeJson(d, b, sizeof(b));
+        mqtt.publish("blindstick/asr/control", (const uint8_t*)b, n);
+    }
+    Serial.printf("[语音诊断] 已发ASR音频 %d字节/%d片，等待识别结果...\n", (int)totalRead, segments);
+}
+
 // ==================== MQTT 任务（独立任务，避免断网重连阻塞避障循环）====================
 // 【修复】原版 MQTT 重连/收发嵌在 RadarMotorUploadTask 里，mqtt.connect() 是阻塞调用
 // （socket超时10s + TLS握手超时12s），断网时每3秒一次的重连会把避障循环卡死十几秒，电机停摆。
@@ -1308,6 +1345,12 @@ if (mqtt.connected()) {
 mqtt.loop();
 if (getTTSRequesting() && (millis() - tts_request_start_time > TTS_REQUEST_TIMEOUT_MS)) {
 setTTSRequesting(false);
+}
+// 【新增】ASR音频发送：统一在MqttTask里操作PubSubClient（避免语音任务并发导致TLS损坏掉线）
+AsrSendJob asrJob;
+if (asrSendQueue != NULL && xQueueReceive(asrSendQueue, &asrJob, 0) == pdTRUE) {
+    sendAsrChunks(asrJob.pcm, asrJob.len);
+    free(asrJob.pcm);   // pcm缓冲区所有权在此释放
 }
 if (now2 - lastUpload >= UPLOAD_INTERVAL_MS) {
 lastUpload = now2;
@@ -1698,8 +1741,8 @@ String doVoiceRecognition() {
         return "";
     }
 
-    // 【MQTT-ASR】改用MQTT把PCM分片发给后端识别：HTTP在本环境下被拒(connection refused)，
-    // 而MQTT(TTS正在用)稳定可用。后端拼回PCM→百度识别→把文本发到 blindstick/asr/result。
+    // 【MQTT-ASR】把PCM交给MqttTask经MQTT发送（PubSubClient/mbedTLS非线程安全，
+    // 本任务直接publish会与mqtt.loop并发、损坏TLS导致掉线）。后端拼回→百度识别→回发文本。
     if (!mqtt.connected()) {
         free(pcmBuffer);
         Serial.println("[语音诊断] MQTT未连接，跳过识别");
@@ -1709,36 +1752,16 @@ String doVoiceRecognition() {
     if (asrResultSem) xSemaphoreTake(asrResultSem, 0);
     asrResultText = "";
 
-    const int ASR_CHUNK = 4000;   // 须小于 mqtt.setBufferSize(8192)
-    int segments = (int)((totalRead + ASR_CHUNK - 1) / ASR_CHUNK);
-    int asrSession = (int)(millis() % 100000);
-
-    // 1) 会话开始
+    // 所有权移交队列（不free，由MqttTask发完后释放）
     {
-        StaticJsonDocument<128> d;
-        d["type"] = "start"; d["session_id"] = asrSession; d["segments"] = segments;
-        char ctrlBuf[128]; size_t n = serializeJson(d, ctrlBuf, sizeof(ctrlBuf));
-        mqtt.publish("blindstick/asr/control", (const uint8_t*)ctrlBuf, n);
+        AsrSendJob job; job.pcm = pcmBuffer; job.len = totalRead;
+        if (asrSendQueue == NULL || xQueueSend(asrSendQueue, &job, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            free(pcmBuffer);
+            Serial.println("[语音诊断] ASR发送队列满，丢弃本次");
+            return "";
+        }
     }
-    // 2) 逐片发送PCM（原始字节，不上base64，省流量）
-    for (int i = 0; i < segments; i++) {
-        int off = i * ASR_CHUNK;
-        int len = (int)totalRead - off;
-        if (len > ASR_CHUNK) len = ASR_CHUNK;
-        char topic[32];
-        snprintf(topic, sizeof(topic), "blindstick/asr/stream/%d", i);
-        mqtt.publish(topic, (const uint8_t*)(pcmBuffer + off), len);
-        vTaskDelay(5 / portTICK_PERIOD_MS);
-    }
-    // 3) 会话结束 → 通知后端开始识别
-    {
-        StaticJsonDocument<128> d;
-        d["type"] = "end"; d["session_id"] = asrSession; d["segments"] = segments;
-        char ctrlBuf[128]; size_t n = serializeJson(d, ctrlBuf, sizeof(ctrlBuf));
-        mqtt.publish("blindstick/asr/control", (const uint8_t*)ctrlBuf, n);
-    }
-    free(pcmBuffer);
-    Serial.printf("[语音诊断] 已发ASR音频 %d字节/%d片，等待识别结果...\n", (int)totalRead, segments);
+    Serial.printf("[语音诊断] 已提交ASR音频 %d字节，等待识别结果...\n", (int)totalRead);
 
     // 4) 等后端把文本发回（mqtt_callback 收到 blindstick/asr/result 会释放信号量）
     String result = "";
@@ -1823,6 +1846,8 @@ audioMutex = xSemaphoreCreateMutex();
 ttsRequestMutex = xSemaphoreCreateMutex();
 // 【新增】ASR结果信号量（语音任务等待后端识别结果）
 asrResultSem = xSemaphoreCreateBinary();
+// 【新增】ASR发送队列（语音任务→MqttTask，避免跨任务并发操作PubSubClient）
+asrSendQueue = xQueueCreate(2, sizeof(AsrSendJob));
 // 初始化流式TTS
 initStreamingTTS();
 i2s_out_init();
