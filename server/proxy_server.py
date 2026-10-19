@@ -228,7 +228,8 @@ class MQTTAudioSender:
                     # 【修复】移除开机语音跳过逻辑，让所有TTS请求都能正常合成
                     # 开机语音"系统启动成功..."也需要通过代理合成播放
                     # 使用线程异步处理，不阻塞MQTT回调
-                    import threading
+                    # 注意：这里不能写 import threading —— 函数内import会让threading变成局部变量，
+                    # 导致同一函数的ASR分支引用threading时报 UnboundLocalError。用文件顶部的全局导入。
                     t = threading.Thread(
                         target=self.handle_tts_request,
                         args=(text, priority),
