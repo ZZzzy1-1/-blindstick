@@ -17,6 +17,13 @@ import websockets
 import threading
 import queue
 import base64
+import sys
+
+# 【修复】Render 等非终端环境下 stdout 默认块缓冲，print 的 MQTT/ASR 日志会卡在缓冲区看不到
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 # ==================== Config ====================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))

@@ -1857,6 +1857,7 @@ playLocalStartupTone();
 // 【修复】热点DNS常解析不到onrender.com，改用国内公共DNS
 // 【修改】改回DHCP：热点网段会漂移，写死IP反而连不上；K230端已改为UDP自动发现ESP32
 WiFi.mode(WIFI_STA);
+WiFi.setSleep(false);  // 【新增】关闭WiFi省电：避免空闲时进modem sleep导致MQTT掉线/延迟
 WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, IPAddress(223, 5, 5, 5), IPAddress(114, 114, 114, 114));
 // 连接WiFi
 WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
