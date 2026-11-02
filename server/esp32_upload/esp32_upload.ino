@@ -9,6 +9,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 // ==================== 网络参数 ====================
 const char* WIFI_SSID     = "ZYT";
 const char* WIFI_PASSWORD = "zyt123456";
@@ -244,6 +245,10 @@ SemaphoreHandle_t ttsRequestMutex = NULL;
 // 【新增】ASR改走MQTT：后端识别结果回传缓冲 + 信号量（MQTT回调→语音任务 跨任务传递）
 String asrResultText = "";
 SemaphoreHandle_t asrResultSem = NULL;
+// 【诊断】掉线次数与本次复位原因：随传感器报文上报，无需串口即可在浏览器控制台查看
+// reset=brownout 表示供电掉压；task_wdt/panic 表示崩溃；uptime 一直很小=反复重启
+uint16_t mqttDropCount = 0;
+String bootResetReason = "unknown";
 // 【新增】ASR音频发送队列：PubSubClient/mbedTLS非线程安全，绝不能在语音任务里直接publish
 // （并发mqtt.loop会导致TLS状态损坏、连接丢失），统一交给MqttTask发送
 struct AsrSendJob { uint8_t* pcm; size_t len; };
@@ -662,18 +667,17 @@ void processRadarPacket() {
             if (packet_lsn > 1) currentAngle += (diffAngle / (packet_lsn - 1)) * i;
             if (currentAngle >= 360.0f) currentAngle -= 360.0f;
 
-            // 【修复】使用统一的扇区判断逻辑
+            // 【按实测安装方向映射】这套雷达的 60-120° 扇区对应物理右侧、240-300° 对应物理左侧
+            // （与参考测试代码一致；此前"自然映射"会导致左右判断相反、往障碍物方向转）
             // 前方：330-360 或 0-30
             if (currentAngle >= ANG_FRONT_MIN || currentAngle <= ANG_FRONT_MAX) {
                 if (cm < frontDist) frontDist = cm;
             }
-            // 左方：60-120
             else if (currentAngle >= ANG_LEFT_MIN && currentAngle <= ANG_LEFT_MAX) {
-                if (cm < leftDist) leftDist = cm;
-            }
-            // 右方：240-300
-            else if (currentAngle >= ANG_RIGHT_MIN && currentAngle <= ANG_RIGHT_MAX) {
                 if (cm < rightDist) rightDist = cm;
+            }
+            else if (currentAngle >= ANG_RIGHT_MIN && currentAngle <= ANG_RIGHT_MAX) {
+                if (cm < leftDist) leftDist = cm;
             }
         }
     }
@@ -774,7 +778,7 @@ last_retry = now;
 if (WiFi.status() != WL_CONNECTED) return false;
 // 配置MQTT客户端参数
 mqtt.setSocketTimeout(5);  // 【修复】10->5秒：socket读超时太长会饿死IDLE0触发task_wdt（回退时被还原，重新改回）
-mqtt.setKeepAlive(60);
+mqtt.setKeepAlive(120);  // 【修改】心跳 60→120s：慢网络下容忍更大延迟，减少误踢
 // 【修复】MQTT Buffer=8KB：既要容纳TTS音频分片(每片4KB)，又不会像128KB那样吃光内存
 mqtt.setBufferSize(8192);
 espClient.setInsecure();
@@ -1105,6 +1109,11 @@ doc["nav_destination"] = current_destination;  // 【新增】当前导航目的
 doc["nav_step"] = nav_active ? nav_steps[current_step_idx] : "";  // 【新增】当前步骤
 doc["current_step"] = current_step_idx;  // 【新增】当前步骤索引
 doc["nav_steps"] = nav_total_steps;  // 【新增】总步骤数
+// 【诊断】无需串口：浏览器控制台(JSON)即可看到复位原因/信号强度/掉线次数/运行时长
+doc["reset"] = bootResetReason;           // 本次复位原因(brownout=供电掉压)
+doc["uptime"] = millis() / 1000;          // 开机秒数，反复重启时一直很小
+doc["rssi"] = WiFi.RSSI();                // WiFi 信号(dBm)
+doc["mqtt_drops"] = mqttDropCount;        // 累计 MQTT 掉线次数
 JsonObject gps = doc.createNestedObject("gps");
 gps["lat"] = gps_lat;
 gps["lng"] = gps_lng;
@@ -1334,6 +1343,7 @@ static bool mqttPrevState = false;
 bool mqttCurState = mqtt.connected();
 if (mqttPrevState && !mqttCurState) {
 Serial.printf("[MQTT] 掉线! state=%d\n", mqtt.state());
+mqttDropCount++;  // 【诊断】累计掉线次数，随传感器报文上报
 } else if (!mqttPrevState && mqttCurState) {
 Serial.println("[MQTT] 重连成功");
 }
@@ -1783,6 +1793,19 @@ String doVoiceRecognition() {
 void setup() {
 Serial.begin(115200);
 randomSeed(millis());
+// 【诊断】记录本次复位原因（无需串口：会随传感器报文上报到网页）
+switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   bootResetReason = "poweron"; break;
+    case ESP_RST_EXT:       bootResetReason = "ext"; break;
+    case ESP_RST_SW:        bootResetReason = "sw"; break;
+    case ESP_RST_PANIC:     bootResetReason = "panic"; break;
+    case ESP_RST_INT_WDT:   bootResetReason = "int_wdt"; break;
+    case ESP_RST_TASK_WDT:  bootResetReason = "task_wdt"; break;
+    case ESP_RST_WDT:       bootResetReason = "wdt"; break;
+    case ESP_RST_DEEPSLEEP: bootResetReason = "deepsleep"; break;
+    case ESP_RST_BROWNOUT:  bootResetReason = "brownout"; break;
+    default:                bootResetReason = "unknown"; break;
+}
 // ===== PSRAM 初始化（必须在内存分配前完成）=====
 bool psram_ok = psramInit();
 // 如果初始化失败，尝试再次初始化

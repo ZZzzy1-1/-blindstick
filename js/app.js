@@ -343,7 +343,7 @@ const MQTT_CONFIG = {
 let mqttClient = null;
 // 【新增】心跳检测相关变量
 let lastDataTime = 0;
-const HEARTBEAT_INTERVAL = 5000;  // 5秒无数据视为断开
+const HEARTBEAT_INTERVAL = 15000;  // 【修改】15秒无数据才判定断开，容忍稀疏数据/慢网络
 const RECONNECT_INTERVAL = 3000;  // 3秒后重连
 
 // ================= 心跳检测 =================
@@ -403,10 +403,10 @@ function connectMQTT() {
             password: MQTT_CONFIG.password,
             clean: true,
             reconnectPeriod: 3000,  // 【修复】缩短重连间隔到3秒
-            connectTimeout: 10000,
+            connectTimeout: 20000,  // 【修改】10→20s：容忍慢网络下 CONNACK 延迟
             rejectUnauthorized: false,  // 允许自签名证书
             protocolVersion: 4,  // MQTT 3.1.1
-            keepalive: 30  // 【修复】缩短心跳间隔到30秒
+            keepalive: 60  // 【修改】心跳 30→60s，容忍高延迟
         });
         console.log('[MQTT] 正在连接:', url);
     } catch (e) {
